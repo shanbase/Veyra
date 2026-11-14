@@ -49,7 +49,7 @@ import { VoiceRecordingIndicator } from "@/components/chat/VoiceRecordingIndicat
 import { 
   Send, Check, CheckCheck, Clock, MoreVertical, Pencil, X, 
   Trash2, Smile, ArrowLeft, ImagePlus, ArrowDown, Reply,
-  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy
+  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff
 } from "lucide-react";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { signMessageMedia, encodeFile, decodeFile, encodeMusic, decodeMusic } from "@/lib/mediaUrl";
@@ -237,6 +237,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState("");
   const [otherUser, setOtherUser] = useState<Profile | null>(null);
+  const [muted, setMuted] = useState(false);
 
   useEffect(() => {
     const onStatus = (e: Event) => {
@@ -266,6 +267,59 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   const [mediaPreviews, setMediaPreviews] = useState<MediaPreview[]>([]);
   const [gifPickerOpen, setGifPickerOpen] = useState(false);
   
+  // Load the current channel's mute state: conversation_members.muted for
+  // DMs/groups, profiles.global_muted for Global Chat.
+  useEffect(() => {
+    if (!user?.id) { setMuted(false); return; }
+    if (isGlobal) {
+      supabase.from("profiles").select("global_muted").eq("id", user.id).maybeSingle()
+        .then(({ data }) => setMuted(!!data?.global_muted));
+    } else if (isDM && conversationIdProp) {
+      supabase.from("conversation_members").select("muted").eq("conversation_id", conversationIdProp).eq("user_id", user.id).maybeSingle()
+        .then(({ data }) => setMuted(!!data?.muted));
+    } else {
+      setMuted(false);
+    }
+  }, [user?.id, isGlobal, isDM, conversationIdProp]);
+
+  const toggleMute = async () => {
+    if (!user?.id || isAnnouncements) return;
+    const next = !muted;
+    setMuted(next);
+    const { error } = isGlobal
+      ? await supabase.from("profiles").update({ global_muted: next }).eq("id", user.id)
+      : await supabase.from("conversation_members").update({ muted: next }).eq("conversation_id", conversationIdProp!).eq("user_id", user.id);
+    if (error) {
+      setMuted(!next);
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    }
+  };
+
+  // Desktop (Electron) OS notification for incoming messages. Muted channels
+  // are skipped; the main process additionally suppresses alerts while the
+  // window is focused. A ref keeps the realtime callback free of stale state.
+  const notifyDesktopRef = useRef<(payload: unknown) => void>(() => {});
+  notifyDesktopRef.current = (payload: unknown) => {
+    const change = payload as { eventType?: string; new?: Message };
+    const incoming = change?.new;
+    if (change?.eventType !== "INSERT" || !incoming || incoming.sender_id === user?.id) return;
+    if (muted) return;
+    const notify = window.veyraDesktop?.showNotification;
+    if (!notify) return;
+    const senderName = isGlobal
+      ? "Global Chat"
+      : isAnnouncements
+        ? "Announcements"
+        : isGroupConv
+          ? groupMembers.find((m) => m.id === incoming.sender_id)?.display_name
+            || groupMembers.find((m) => m.id === incoming.sender_id)?.username
+            || "Group message"
+          : otherUser?.display_name || otherUser?.username || "New message";
+    const snippet = String(incoming.content || "").replace(/\s+/g, " ").trim().slice(0, 140);
+    const body = snippet || (incoming.image_url ? "Sent an attachment" : "New message");
+    notify(senderName, body);
+  };
+
   const [videoLightboxUrl, setVideoLightboxUrl] = useState<string | null>(null);
   const [openEmojiPopover, setOpenEmojiPopover] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(true);
@@ -677,6 +731,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
           subFilter as any,
           (payload) => {
             void handleMessageRealtimePayload(payload, messageRealtimeDeps);
+            notifyDesktopRef.current(payload);
           }
         )
         .subscribe();
@@ -1779,6 +1834,16 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
           </div>
         )}
         <ChatSearch messages={messages} onJump={scrollToMessage} currentUserId={user?.id} />
+        {!isAnnouncements && (isDM || isGlobal) && (
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => void toggleMute()}
+            title={muted ? "Unmute notifications" : "Mute notifications"}
+          >
+            {muted ? <BellOff className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+          </Button>
+        )}
         {(() => {
           const mentionMsgs = messages.filter(
             (m) =>

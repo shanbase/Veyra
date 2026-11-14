@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { pool } from './db.mjs';
-import { consumeRateLimit } from './redis.mjs';
+import { consumeRateLimit, redisGetJson, redisSetJson, redisDel } from './redis.mjs';
 
 const scrypt = promisify(scryptCallback);
 const COOKIE = 'veyra_session';
@@ -201,19 +201,43 @@ async function createSession(userId, res) {
   setSessionCookie(res, token);
 }
 
+const SESS_CACHE_TTL = 60;
+const sessCacheKey = (tokenHash) => `veyra:v1:sess:${tokenHash}`;
+
+async function cacheSessionRow(tokenHash, row) {
+  const expiresMs = new Date(row.expires_at).getTime();
+  const ttl = Math.min(SESS_CACHE_TTL, Math.max(1, Math.floor((expiresMs - Date.now()) / 1000)));
+  await redisSetJson(sessCacheKey(tokenHash), row, ttl);
+}
+
+async function invalidateSessionHashes(...tokenHashes) {
+  const hashes = [...new Set(tokenHashes.filter(Boolean))];
+  if (hashes.length) await redisDel(...hashes.map(sessCacheKey));
+}
+
 export async function authenticateRequest(req, res, next) {
   const authorization = String(req.headers.authorization || '');
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : cookieValue(req, COOKIE);
   if (!token) return res.status(401).json({ error: 'Authentication required.' });
+  const tokenHash = hashToken(token);
   try {
+    // Session lookups run on every API call; cache them briefly in Redis.
+    // Revocation paths delete the key explicitly, so a revoked session dies
+    // immediately rather than lingering for the TTL.
+    const cached = await redisGetJson(sessCacheKey(tokenHash));
+    if (cached && new Date(cached.expires_at).getTime() > Date.now()) {
+      req.user = { ...cached, user_metadata: { username: cached.username, display_name: cached.display_name } };
+      return next();
+    }
     const [rows] = await pool.execute(
-      `SELECT u.id, u.email, u.email_verified_at, p.username, p.display_name, p.avatar_url
+      `SELECT u.id, u.email, u.email_verified_at, p.username, p.display_name, p.avatar_url, s.expires_at
        FROM auth_sessions s JOIN auth_users u ON u.id = s.user_id
        JOIN profiles p ON p.id = u.id
        WHERE s.token_hash = ? AND s.expires_at > UTC_TIMESTAMP(3) AND u.email_verified_at IS NOT NULL LIMIT 1`,
-      [hashToken(token)],
+      [tokenHash],
     );
     if (!rows.length) return res.status(401).json({ error: 'Invalid or expired session.' });
+    await cacheSessionRow(tokenHash, rows[0]);
     req.user = { ...rows[0], user_metadata: { username: rows[0].username, display_name: rows[0].display_name } };
     next();
   } catch (error) { next(error); }
@@ -421,7 +445,11 @@ export function registerAuthRoutes(app) {
     const bearerToken = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : null;
     const cookieToken = cookieValue(req, COOKIE);
     const tokens = [...new Set([bearerToken, cookieToken].filter(Boolean))];
-    if (tokens.length) await pool.execute(`DELETE FROM auth_sessions WHERE token_hash IN (${tokens.map(() => '?').join(',')})`, tokens.map(hashToken));
+    const hashes = tokens.map(hashToken);
+    if (hashes.length) {
+      await pool.execute(`DELETE FROM auth_sessions WHERE token_hash IN (${hashes.map(() => '?').join(',')})`, hashes);
+      await invalidateSessionHashes(...hashes);
+    }
     res.clearCookie(COOKIE, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/' });
     res.json({ ok: true });
   });
@@ -455,7 +483,9 @@ export function registerAuthRoutes(app) {
     if (!rows.length) return res.status(400).json({ error: 'Reset link is invalid or expired.' });
     await pool.execute('UPDATE auth_users SET password_hash = ? WHERE id = ?', [await passwordHash(password), rows[0].user_id]);
     await pool.execute('DELETE FROM auth_email_tokens WHERE user_id = ? AND purpose = \'reset\'', [rows[0].user_id]);
+    const [stale] = await pool.execute('SELECT token_hash FROM auth_sessions WHERE user_id = ?', [rows[0].user_id]);
     await pool.execute('DELETE FROM auth_sessions WHERE user_id = ?', [rows[0].user_id]);
+    await invalidateSessionHashes(...stale.map((row) => row.token_hash));
     res.clearCookie(COOKIE, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/' });
     res.json({ ok: true });
   });
@@ -466,7 +496,9 @@ export function registerAuthRoutes(app) {
     const [rows] = await pool.execute('SELECT password_hash FROM auth_users WHERE id = ?', [req.user.id]);
     if (!(await passwordMatches(String(req.body?.current_password || ''), rows[0]?.password_hash || ''))) return res.status(400).json({ error: 'Current password is incorrect.' });
     await pool.execute('UPDATE auth_users SET password_hash = ? WHERE id = ?', [await passwordHash(password), req.user.id]);
+    const [stale] = await pool.execute('SELECT token_hash FROM auth_sessions WHERE user_id = ?', [req.user.id]);
     await pool.execute('DELETE FROM auth_sessions WHERE user_id = ?', [req.user.id]);
+    await invalidateSessionHashes(...stale.map((row) => row.token_hash));
     res.clearCookie(COOKIE, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/' });
     res.json({ ok: true, message: 'Password updated. Please sign in again.' });
   });
@@ -493,10 +525,15 @@ export function registerAuthRoutes(app) {
   app.post('/api/auth/sessions/revoke', authenticateRequest, async (req, res) => {
     const currentHash = hashToken(requestSessionToken(req) || '');
     if (req.body?.others === true) {
+      const [stale] = await pool.execute(
+        'SELECT token_hash FROM auth_sessions WHERE user_id = ? AND token_hash <> ?',
+        [req.user.id, currentHash],
+      );
       const [result] = await pool.execute(
         'DELETE FROM auth_sessions WHERE user_id = ? AND token_hash <> ?',
         [req.user.id, currentHash],
       );
+      await invalidateSessionHashes(...stale.map((row) => row.token_hash));
       return res.json({ ok: true, revoked: result.affectedRows });
     }
     const sessionId = String(req.body?.session_id || '');
@@ -507,6 +544,7 @@ export function registerAuthRoutes(app) {
     );
     if (!rows.length) return res.status(404).json({ error: 'Session not found.' });
     await pool.execute('DELETE FROM auth_sessions WHERE id = ? AND user_id = ?', [sessionId, req.user.id]);
+    await invalidateSessionHashes(rows[0].token_hash);
     if (rows[0].token_hash === currentHash) {
       res.clearCookie(COOKIE, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax', path: '/' });
     }

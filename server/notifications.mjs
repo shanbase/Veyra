@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createSign } from 'node:crypto';
 import { pool } from './db.mjs';
 import { enqueueJob } from './queues.mjs';
 
@@ -37,6 +37,93 @@ export async function deliverPushNotification({ server, topic, title, message })
   return publish(server, topic, title, message);
 }
 
+// ---------------------------------------------------------------------------
+// Firebase Cloud Messaging (Android/iOS native push)
+// ---------------------------------------------------------------------------
+// Set FCM_SERVICE_ACCOUNT_JSON to the full service-account JSON downloaded
+// from Firebase Console → Project settings → Service accounts. When unset,
+// FCM delivery is silently skipped.
+
+const b64url = (value) => Buffer.from(value).toString('base64url');
+let fcmConfig;
+let fcmAccessToken;
+let fcmAccessTokenExpiry = 0;
+
+function fcmServiceAccount() {
+  if (fcmConfig !== undefined) return fcmConfig;
+  try {
+    const raw = String(process.env.FCM_SERVICE_ACCOUNT_JSON || '').trim();
+    if (!raw) { fcmConfig = null; return null; }
+    const parsed = JSON.parse(raw);
+    fcmConfig = {
+      projectId: parsed.project_id,
+      clientEmail: parsed.client_email,
+      privateKey: String(parsed.private_key || '').replace(/\\n/g, '\n'),
+    };
+    if (!fcmConfig.projectId || !fcmConfig.clientEmail || !fcmConfig.privateKey) fcmConfig = null;
+  } catch {
+    fcmConfig = null;
+  }
+  return fcmConfig;
+}
+
+async function getFcmAccessToken() {
+  if (fcmAccessToken && Date.now() < fcmAccessTokenExpiry) return fcmAccessToken;
+  const account = fcmServiceAccount();
+  if (!account) return null;
+  const now = Math.floor(Date.now() / 1000);
+  const unsigned = `${b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }))}.${b64url(JSON.stringify({
+    iss: account.clientEmail,
+    scope: 'https://www.googleapis.com/auth/firebase.messaging',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  }))}`;
+  const jwt = `${unsigned}.${createSign('RSA-SHA256').update(unsigned).sign(account.privateKey, 'base64url')}`;
+  const response = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=${encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')}&assertion=${jwt}`,
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.access_token) throw new Error(`FCM auth failed: ${data.error || response.status}`);
+  fcmAccessToken = data.access_token;
+  fcmAccessTokenExpiry = Date.now() + Math.max(60, (Number(data.expires_in) || 3600) - 120) * 1000;
+  return fcmAccessToken;
+}
+
+async function sendFcmNotification(token, title, body, data = {}) {
+  const account = fcmServiceAccount();
+  if (!account || !token) return false;
+  try {
+    const accessToken = await getFcmAccessToken();
+    const response = await fetch(`https://fcm.googleapis.com/v1/projects/${account.projectId}/messages:send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({
+        message: {
+          token,
+          notification: { title, body },
+          data: Object.fromEntries(Object.entries(data).map(([key, value]) => [key, String(value ?? '')])),
+          android: { priority: 'HIGH' },
+        },
+      }),
+    });
+    if (response.ok) return true;
+    const errorBody = await response.json().catch(() => ({}));
+    const code = errorBody?.error?.details?.[0]?.errorCode || '';
+    // Retire dead tokens so we stop paying for failed sends.
+    if (response.status === 404 || code === 'UNREGISTERED' || code === 'INVALID_ARGUMENT') {
+      await pool.execute('UPDATE native_push_tokens SET enabled = FALSE WHERE token = ?', [token]);
+    }
+    console.warn('FCM send failed:', response.status, code || errorBody?.error?.message || 'unknown');
+    return false;
+  } catch (error) {
+    console.warn('FCM send error:', error instanceof Error ? error.message : error);
+    return false;
+  }
+}
+
 export async function sendTestNotification(userId) {
   const [rows] = await pool.execute('SELECT ntfy_server, ntfy_topic FROM notification_preferences WHERE user_id = ? LIMIT 1', [userId]);
   const topic = rows[0]?.ntfy_topic?.trim();
@@ -51,11 +138,25 @@ export async function notifyNewMessage(table, row) {
   const [senderRows] = await pool.execute('SELECT username, display_name FROM profiles WHERE id = ? LIMIT 1', [row.sender_id]);
   const sender = senderRows[0]?.display_name || senderRows[0]?.username || 'Someone';
   const [recipients] = channel === 'dm'
-    ? await pool.execute('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id <> ?', [row.conversation_id, row.sender_id])
-    : await pool.execute('SELECT user_id FROM notification_preferences WHERE user_id <> ?', [row.sender_id]);
+    ? await pool.execute('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id <> ? AND muted = FALSE', [row.conversation_id, row.sender_id])
+    : channel === 'global'
+      ? await pool.execute('SELECT np.user_id FROM notification_preferences np JOIN profiles p ON p.id = np.user_id WHERE np.user_id <> ? AND p.global_muted = FALSE', [row.sender_id])
+      : await pool.execute('SELECT user_id FROM notification_preferences WHERE user_id <> ?', [row.sender_id]);
   const ids = [...new Set(recipients.map((r) => r.user_id))];
   if (!ids.length) return;
   const [prefs] = await pool.execute(`SELECT * FROM notification_preferences WHERE user_id IN (${ids.map(() => '?').join(',')})`, ids);
+  // FCM device tokens for the same recipient set (empty when FCM isn't used).
+  const [tokenRows] = await pool.execute(`SELECT user_id, token FROM native_push_tokens WHERE user_id IN (${ids.map(() => '?').join(',')}) AND enabled = TRUE`, ids);
+  const tokensByUser = new Map();
+  for (const row of tokenRows) {
+    if (!tokensByUser.has(row.user_id)) tokensByUser.set(row.user_id, []);
+    tokensByUser.get(row.user_id).push(row.token);
+  }
+  const fcmData = {
+    channel,
+    conversation_id: row.conversation_id || '',
+    sender_id: row.sender_id,
+  };
   const sent = new Set();
   const channelKey = channel === 'dm' ? `dm:${row.conversation_id}` : channel;
 
@@ -90,5 +191,10 @@ export async function notifyNewMessage(table, row) {
     });
     const accepted = delivered === 'queued' || (delivered !== 'unavailable' && Boolean(result));
     if (accepted) sent.add(dedupeKey);
+    // Native push goes to every registered device for this user, independent
+    // of their ntfy topic configuration.
+    for (const token of tokensByUser.get(pref.user_id) || []) {
+      void sendFcmNotification(token, title, message, fcmData);
+    }
   }
 }

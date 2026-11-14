@@ -1,4 +1,5 @@
 import express from 'express';
+import { createHash } from 'node:crypto';
 import { pool, isPostgres } from './db.mjs';
 import { queryData } from './data.mjs';
 import { callRpc } from './rpc.mjs';
@@ -7,7 +8,7 @@ import { purgeExpiredAttachments, cleanupExpiredAuthArtifacts } from './maintena
 import { authenticateRequest, registerAuthRoutes } from './auth.mjs';
 import { changesFromRpc, changeFromDataRequest, mariaDbRealtimeTopic, publishMariaDbChanges } from './realtime.mjs';
 import { getSupabaseAdmin } from './supabase-admin.mjs';
-import { invalidateReadCache, consumeRateLimit } from './redis.mjs';
+import { invalidateReadCache, consumeRateLimit, redisGetJson, redisSetJson } from './redis.mjs';
 import { assertEncryptionConfig, encryptionEnabled } from './encryption.mjs';
 import { assertQueuesConfig } from './queues.mjs';
 
@@ -221,9 +222,19 @@ export function createApp() {
         );
         if (!members.length) return res.status(403).json({ error: 'You cannot access this conversation media.' });
       }
+      // Signed URLs are bearer credentials but identical for every authorized
+      // viewer of the same object — cache them in Redis for 50 minutes (the
+      // URLs themselves live 60) to avoid a Supabase round-trip per view.
+      const signCacheKey = ({ bucket, path }) =>
+        `veyra:v1:sign:${bucket}:${createHash('sha256').update(path).digest('hex').slice(0, 32)}`;
       const signed = await Promise.all(validated.map(async ({ bucket, path }) => {
+        const key = signCacheKey({ bucket, path });
+        const cached = await redisGetJson(key);
+        if (cached) return { key: `${bucket}/${path}`, url: cached };
         const { data, error } = await storage.storage.from(bucket).createSignedUrl(path, 3600);
-        return { key: `${bucket}/${path}`, url: error ? null : data?.signedUrl || null };
+        const url = error ? null : data?.signedUrl || null;
+        if (url) await redisSetJson(key, url, 3000);
+        return { key: `${bucket}/${path}`, url };
       }));
       if (batch) {
         const urls = {};

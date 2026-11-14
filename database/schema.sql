@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS profiles (
   allow_friend_requests BOOLEAN NOT NULL DEFAULT TRUE,
   announcements_last_read_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   global_mentions_last_read_at DATETIME(3) NULL,
+  global_muted BOOLEAN NOT NULL DEFAULT FALSE,
   custom_status_text VARCHAR(140) NULL,
   custom_status_emoji VARCHAR(32) NULL,
   custom_status_set_at DATETIME(3) NULL,
@@ -105,6 +106,7 @@ CREATE TABLE IF NOT EXISTS conversation_members (
   conversation_id CHAR(36) NOT NULL,
   user_id CHAR(36) NOT NULL,
   role VARCHAR(24) NOT NULL DEFAULT 'member',
+  muted BOOLEAN NOT NULL DEFAULT FALSE,
   joined_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   UNIQUE KEY uq_conversation_member (conversation_id, user_id),
   KEY idx_conversation_members_user (user_id),
@@ -187,8 +189,10 @@ CREATE TABLE IF NOT EXISTS message_reactions (
   emoji VARCHAR(32) NOT NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   UNIQUE KEY uq_message_reaction (message_id, user_id, emoji),
+  KEY idx_message_reactions_message (message_id),
   KEY idx_message_reactions_user (user_id),
-  CONSTRAINT fk_reactions_message FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+  -- message_id is polymorphic: it may reference messages, global_messages,
+  -- or announcement_messages, so no single FK is possible.
   CONSTRAINT fk_reactions_profile FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -319,3 +323,33 @@ CREATE TABLE IF NOT EXISTS native_push_tokens (
   KEY idx_native_push_tokens_user (user_id),
   CONSTRAINT fk_native_push_profile FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ---------------------------------------------------------------------------
+-- 1.2.5 additions (idempotent — safe to re-run on existing databases)
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS dm_pairs (
+  user_low CHAR(36) NOT NULL,
+  user_high CHAR(36) NOT NULL,
+  conversation_id CHAR(36) NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (user_low, user_high),
+  KEY idx_dm_pairs_conversation (conversation_id),
+  CONSTRAINT fk_dm_pairs_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- message_reactions.message_id is polymorphic (messages / global_messages /
+-- announcement_messages); the old messages-only FK must go.
+ALTER TABLE message_reactions DROP FOREIGN KEY IF EXISTS fk_reactions_message;
+ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS global_muted BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Backfill dm_pairs for existing 1:1 conversations so ensureDirectMessage can
+-- dedupe atomically. Only exactly-two-member non-group conversations qualify.
+INSERT IGNORE INTO dm_pairs (user_low, user_high, conversation_id)
+SELECT LEAST(a.user_id, b.user_id), GREATEST(a.user_id, b.user_id), c.id
+FROM conversations c
+JOIN conversation_members a ON a.conversation_id = c.id
+JOIN conversation_members b ON b.conversation_id = c.id AND b.user_id > a.user_id
+WHERE c.is_group = 0
+  AND (SELECT COUNT(*) FROM conversation_members cm WHERE cm.conversation_id = c.id) = 2;

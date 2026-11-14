@@ -8,6 +8,8 @@ const manifestPath = 'android/app/src/main/AndroidManifest.xml';
 const REQUIRED_PERMISSIONS = [
   'android.permission.RECORD_AUDIO',
   'android.permission.MODIFY_AUDIO_SETTINGS',
+  // Required on Android 13+ for FCM push notifications.
+  'android.permission.POST_NOTIFICATIONS',
 ];
 
 const original = await readFile(manifestPath, 'utf8');

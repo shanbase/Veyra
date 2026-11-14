@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, ipcMain, safeStorage } = require('electron');
+const { app, BrowserWindow, shell, ipcMain, safeStorage, Notification } = require('electron');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -235,6 +235,26 @@ ipcMain.on('veyra:update-action', (_event, action) => {
   } else if (action === 'install') {
     installPendingUpdate();
   }
+});
+
+// Native tray/OS notifications for incoming chat messages. The renderer only
+// sends these for messages that should notify (muted channels are filtered
+// client-side); we additionally suppress them while the window is focused so
+// users aren't spammed while actively chatting.
+ipcMain.on('veyra:show-notification', (_event, payload) => {
+  const title = String(payload?.title || 'Veyra').slice(0, 120);
+  const body = String(payload?.body || '').slice(0, 300);
+  if (!body || !Notification.isSupported()) return;
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused() && !mainWindow.isMinimized()) return;
+  const notification = new Notification({ title, body, silent: false });
+  notification.on('click', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+  notification.show();
 });
 
 function createWindow() {
