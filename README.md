@@ -146,13 +146,13 @@ The Node server can host the compiled frontend and API on `PORT` (default `3001`
 
 ## Attachment cleanup and notifications
 
-`SUPABASE_SERVICE_ROLE_KEY` is server-only and powers signed profile uploads, live change broadcasts, and deletion of expired objects from Supabase Storage. To run cleanup from a scheduler, set a long random `PURGE_CRON_SECRET` in the API runtime environment and send it in the `x-cron-secret` header to:
+`SUPABASE_SERVICE_ROLE_KEY` is server-only and powers signed profile uploads, live change broadcasts, and deletion of expired objects from Supabase Storage. Chat attachments are permanent: the cleanup endpoint does not delete media unless `ATTACHMENT_RETENTION_DAYS` is set to a positive number of days in the API environment. To run cleanup from a scheduler anyway, set a long random `PURGE_CRON_SECRET` in the API runtime environment and send it in the `x-cron-secret` header to:
 
 ```text
 POST /api/maintenance/purge-expired-attachments
 ```
 
-The cleanup marks chat attachments older than 14 days as expired and exempts admins. The same authorized call also removes expired sessions, native pairing codes, and email tokens. Without a cron secret, a signed-in `super_admin` can call the endpoint. ntfy server URL and notification preferences are stored in MariaDB; the server restricts outbound ntfy hosts to the configured supported servers.
+When retention is enabled, the cleanup marks chat attachments older than the configured number of days as expired and exempts admins. The same authorized call also removes expired sessions, native pairing codes, and email tokens (these always run regardless of the retention setting). Without a cron secret, a signed-in `super_admin` can call the endpoint. Without a cron secret, a signed-in `super_admin` can call the endpoint. ntfy server URL and notification preferences are stored in MariaDB; the server restricts outbound ntfy hosts to the configured supported servers.
 
 ## Scripts
 

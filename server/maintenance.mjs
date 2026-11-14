@@ -33,8 +33,14 @@ function extractUrl(value) {
 }
 
 export async function purgeExpiredAttachments() {
+  // Attachments are permanent by default. Set ATTACHMENT_RETENTION_DAYS to a
+  // positive number of days to re-enable expiry-based cleanup.
+  const retentionDays = Number(process.env.ATTACHMENT_RETENTION_DAYS || 0);
+  if (!Number.isFinite(retentionDays) || retentionDays <= 0) {
+    return { ok: true, disabled: true };
+  }
   const storage = getSupabaseAdmin();
-  const cutoffDate = new Date(Date.now() - 14 * 86400_000);
+  const cutoffDate = new Date(Date.now() - retentionDays * 86400_000);
   const cutoff = cutoffDate.toISOString();
   const [adminRows] = await pool.query("SELECT user_id FROM user_roles WHERE role IN ('admin','super_admin')");
   const admins = new Set(adminRows.map((row) => row.user_id));
