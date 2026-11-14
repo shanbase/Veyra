@@ -26,7 +26,7 @@ MariaDB, Google OAuth, and Sequenzy credentials stay on the server. The browser 
 - Single-choice and multiple-choice polls.
 - Profiles, custom status, privacy, notifications, and theme settings.
 - Admin tools for member management, analytics, roles, moderation, and logs. Roles (`user`/`admin`/`super_admin`) live in `user_roles` and are enforced server-side; see [docs/admin.md](docs/admin.md) for the permission model and how to grant the first admin.
-- ntfy push notifications and cleanup of old chat attachments.
+- ntfy and Firebase Cloud Messaging push notifications, per-chat muting, and native OS notifications on the Windows desktop app.
 
 ## Setup
 
@@ -152,7 +152,17 @@ The Node server can host the compiled frontend and API on `PORT` (default `3001`
 POST /api/maintenance/purge-expired-attachments
 ```
 
-When retention is enabled, the cleanup marks chat attachments older than the configured number of days as expired and exempts admins. The same authorized call also removes expired sessions, native pairing codes, and email tokens (these always run regardless of the retention setting). Without a cron secret, a signed-in `super_admin` can call the endpoint. Without a cron secret, a signed-in `super_admin` can call the endpoint. ntfy server URL and notification preferences are stored in MariaDB; the server restricts outbound ntfy hosts to the configured supported servers.
+When retention is enabled, the cleanup marks chat attachments older than the configured number of days as expired and exempts admins. The same authorized call also removes expired sessions, native pairing codes, and email tokens (these always run regardless of the retention setting). Without a cron secret, a signed-in `super_admin` can call the endpoint.
+
+### Push notifications
+
+Three delivery paths share the same per-user preferences (`*_mode` off/immediate/digest):
+
+- **ntfy** — users set a topic in Settings → Notifications; the server publishes to the configured `NTFY_SERVER_URL`.
+- **FCM (Android/iOS)** — the app registers its device token into `native_push_tokens` automatically on native builds. To enable server-side delivery, set `FCM_SERVICE_ACCOUNT_JSON` to the Firebase service-account JSON. For Android builds, store the Firebase `google-services.json` contents in the `GOOGLE_SERVICES_JSON` GitHub secret (CI writes it to `android/app/` and `scripts/configure-android-fcm.mjs` applies the Gradle plugin); locally, drop the file into `android/app/` and run the same script. The `POST_NOTIFICATIONS` permission is injected by `scripts/configure-android-permissions.mjs`. Dead tokens are disabled automatically on `UNREGISTERED` errors.
+- **Desktop** — the Electron shell shows native OS notifications for incoming messages while the window is unfocused or minimized; muted chats are filtered before they reach the OS. No extra app is required.
+
+Per-conversation muting (`conversation_members.muted` for DMs/groups, `profiles.global_muted` for Global Chat) silences all push paths while messages stay visible in-app. Without a cron secret, a signed-in `super_admin` can call the endpoint. ntfy server URL and notification preferences are stored in MariaDB; the server restricts outbound ntfy hosts to the configured supported servers.
 
 ## Scripts
 

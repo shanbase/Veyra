@@ -14,6 +14,7 @@
 // manage roles from the Admin Dashboard → Role Management tab.
 import { randomUUID } from 'node:crypto';
 import { pool } from './db.mjs';
+import { invalidateUserRole, closeRedis } from './redis.mjs';
 
 const VALID_ROLES = new Set(['user', 'admin', 'super_admin']);
 const [identifier, roleArg] = process.argv.slice(2);
@@ -45,6 +46,7 @@ try {
           await connection.execute('INSERT INTO user_roles (id, user_id, role) VALUES (?, ?, ?)', [randomUUID(), user.id, role]);
         }
         await connection.commit();
+        await invalidateUserRole(user.id);
         console.log(`${user.username} (${user.id}): role set to ${role === 'none' ? 'none (all roles removed)' : role}.`);
       } catch (error) {
         await connection.rollback();
@@ -59,4 +61,5 @@ try {
   process.exitCode = 1;
 } finally {
   await pool.end();
+  await closeRedis();
 }

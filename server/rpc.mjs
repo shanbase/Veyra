@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { pool, isPostgres } from './db.mjs';
 import { encryptField } from './encryption.mjs';
 import { notifyNewMessage } from './notifications.mjs';
+import { cachedUserRoles } from './redis.mjs';
 
 // Boolean columns are BOOLEAN in PostgreSQL but tinyint(1) in MariaDB; pass
 // the right JS type per dialect (mysql2 wants 0/1, node-postgres wants bool).
@@ -25,6 +26,9 @@ function updateMessageReceiptsSql(read) {
 }
 
 async function adminCheck(userId, connection = pool) {
+  // Inside a transaction the caller's connection must be used; outside one
+  // the role flags come from the Redis-backed cache.
+  if (connection === pool) return (await cachedUserRoles(userId)).admin;
   const [rows] = await connection.execute("SELECT 1 FROM user_roles WHERE user_id = ? AND role IN ('admin','super_admin') LIMIT 1", [userId]);
   return rows.length > 0;
 }
@@ -45,7 +49,8 @@ async function userDmList(userId) {
       (SELECT COUNT(*) FROM messages um WHERE um.conversation_id = c.id AND um.sender_id <> ? AND um.read_at IS NULL) AS unread_count,
       COALESCE((SELECT MAX(lm.created_at) FROM messages lm WHERE lm.conversation_id = c.id), c.created_at) AS last_message_at,
       (SELECT fr.id FROM friend_requests fr WHERE fr.status = 'accepted' AND ((fr.sender_id = ? AND fr.receiver_id = other.user_id) OR (fr.sender_id = other.user_id AND fr.receiver_id = ?)) LIMIT 1) AS friend_request_id,
-      EXISTS(SELECT 1 FROM pinned_conversations pc WHERE pc.user_id = ? AND pc.conversation_id = c.id) AS is_pinned
+      EXISTS(SELECT 1 FROM pinned_conversations pc WHERE pc.user_id = ? AND pc.conversation_id = c.id) AS is_pinned,
+      mine.muted AS muted
      FROM conversations c
      JOIN conversation_members mine ON mine.conversation_id = c.id AND mine.user_id = ?
      JOIN conversation_members other ON other.conversation_id = c.id AND other.user_id <> ?
@@ -64,6 +69,7 @@ async function userGroupList(userId) {
       (SELECT COUNT(*) FROM messages um WHERE um.conversation_id = c.id AND um.sender_id <> ? AND um.read_at IS NULL) AS unread_count,
       COALESCE((SELECT MAX(lm.created_at) FROM messages lm WHERE lm.conversation_id = c.id), c.created_at) AS last_message_at,
       EXISTS(SELECT 1 FROM pinned_conversations pc WHERE pc.user_id = ? AND pc.conversation_id = c.id) AS is_pinned,
+      mine.muted AS muted,
       (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', p.id, 'username', p.username, 'display_name', p.display_name, 'avatar_url', p.avatar_url))
          FROM conversation_members cm JOIN profiles p ON p.id = cm.user_id WHERE cm.conversation_id = c.id) AS member_previews
      FROM conversations c JOIN conversation_members mine ON mine.conversation_id = c.id AND mine.user_id = ?
@@ -243,12 +249,27 @@ export async function ensureDirectMessage(userId, otherId) {
   if (blocked.length) throw new Error('This conversation is unavailable.');
   const [friendship] = await pool.execute("SELECT id FROM friend_requests WHERE status = 'accepted' AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)) LIMIT 1", [userId, otherId, otherId, userId]);
   if (!friendship.length) throw new Error('You can only message accepted friends.');
-  const [existing] = await pool.execute(`SELECT cm.conversation_id FROM conversation_members cm JOIN conversation_members other ON other.conversation_id = cm.conversation_id JOIN conversations c ON c.id = cm.conversation_id WHERE cm.user_id = ? AND other.user_id = ? AND c.is_group = 0 LIMIT 1`, [userId, otherId]);
+  // Fast path: an existing DM for this pair.
+  const [low, high] = [userId, otherId].sort();
+  const [existing] = await pool.execute('SELECT conversation_id FROM dm_pairs WHERE user_low = ? AND user_high = ?', [low, high]);
   if (existing.length) return existing[0].conversation_id;
+  // Atomic claim: dm_pairs' primary key guarantees exactly one concurrent
+  // caller wins the insert; losers read the winner's conversation_id. The
+  // INSERT ... waits on the winner's row lock, so the follow-up SELECT sees
+  // the committed pair row.
   const id = randomUUID();
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
+    const [claim] = await connection.execute(
+      'INSERT IGNORE INTO dm_pairs (user_low, user_high, conversation_id) VALUES (?, ?, ?)',
+      [low, high, id],
+    );
+    if (!claim.affectedRows) {
+      const [pair] = await connection.execute('SELECT conversation_id FROM dm_pairs WHERE user_low = ? AND user_high = ?', [low, high]);
+      await connection.commit();
+      return pair[0].conversation_id;
+    }
     await connection.execute('INSERT INTO conversations (id, is_group, created_by) VALUES (?, ?, ?)', [id, boolParam(false), userId]);
     await connection.execute('INSERT INTO conversation_members (id, conversation_id, user_id, role) VALUES (?, ?, ?, ?), (?, ?, ?, ?)', [randomUUID(), id, userId, 'member', randomUUID(), id, otherId, 'member']);
     await connection.commit();

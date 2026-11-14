@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { pool, isPostgres } from './db.mjs';
 import { ensureDirectMessage } from './rpc.mjs';
 import { notifyNewMessage } from './notifications.mjs';
-import { cachedRead, invalidateReadCache } from './redis.mjs';
+import { cachedRead, invalidateReadCache, redisGetJson, redisSetJson, cachedUserRoles, invalidateUserRole } from './redis.mjs';
 import { decryptRowsForTable, encryptRowForTable } from './encryption.mjs';
 
 const TABLES = new Set([
@@ -17,8 +17,18 @@ const columnCache = new Map();
 async function columnsFor(table) {
   if (!TABLES.has(table)) throw new Error('Unknown table.');
   if (!columnCache.has(table)) {
+    // Schema metadata is stable — share it through Redis so every serverless
+    // instance doesn't pay 19 SHOW COLUMNS queries on cold start.
+    const cacheKey = `veyra:v1:cols:${isPostgres ? 'pg' : 'my'}:${table}`;
+    const cached = await redisGetJson(cacheKey);
+    if (cached && typeof cached === 'object') {
+      columnCache.set(table, new Map(Object.entries(cached)));
+      return columnCache.get(table);
+    }
     const [rows] = await pool.query(`SHOW COLUMNS FROM \`${table}\``);
-    columnCache.set(table, new Map(rows.map((row) => [row.Field, row.Type])));
+    const columns = new Map(rows.map((row) => [row.Field, row.Type]));
+    columnCache.set(table, columns);
+    await redisSetJson(cacheKey, Object.fromEntries(columns), 3600);
   }
   return columnCache.get(table);
 }
@@ -55,16 +65,11 @@ function normalizeRowTemporalValues(row, columns) {
 }
 
 async function isAdmin(userId) {
-  const [rows] = await pool.execute(
-    "SELECT role FROM user_roles WHERE user_id = ? AND role IN ('admin','super_admin') LIMIT 1",
-    [userId],
-  );
-  return rows.length > 0;
+  return (await cachedUserRoles(userId)).admin;
 }
 
 async function isSuperAdmin(userId) {
-  const [rows] = await pool.execute("SELECT 1 FROM user_roles WHERE user_id = ? AND role = 'super_admin' LIMIT 1", [userId]);
-  return rows.length > 0;
+  return (await cachedUserRoles(userId)).super;
 }
 
 function membershipExists(userId, conversationColumn = 'conversation_id') {
@@ -109,7 +114,9 @@ async function policy(table, userId, operation) {
       : { sql: `(user_id = ? AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = t.conversation_id AND c.created_by = ?)) OR EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = t.conversation_id AND mine.user_id = ? AND mine.role IN ('owner','admin'))`, args: [userId, userId, userId] };
     if (admin) return { sql: '1 = 1', args: [] };
     if (operation === 'select') return { sql: `(${membershipExists(userId)} OR user_id = ?)`, args: [userId, userId] };
-    return { sql: `EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = t.conversation_id AND mine.user_id = ? AND mine.role IN ('owner','admin'))`, args: [userId] };
+    // Members may update their own row (e.g. toggling `muted`); sensitive
+    // columns (role, ids, joined_at) are blocked by protectedColumns anyway.
+    return { sql: `user_id = ? OR EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = t.conversation_id AND mine.user_id = ? AND mine.role IN ('owner','admin'))`, args: [userId, userId] };
   }
   if (table === 'friend_requests') {
     if (admin) return { sql: '1 = 1', args: [] };
@@ -123,8 +130,11 @@ async function policy(table, userId, operation) {
       : { sql: `sender_id = ? AND ${membershipExists(userId)}`, args: [userId, userId] };
   if (table === 'message_reactions') {
     if (admin) return { sql: '1 = 1', args: [] };
+    // message_id is polymorphic: a reaction is visible when the target is a DM
+    // message in a conversation the user belongs to, or any global/announcement
+    // message (those channels are readable by everyone).
     return operation === 'select'
-      ? { sql: `EXISTS (SELECT 1 FROM messages m JOIN conversation_members cm ON cm.conversation_id = m.conversation_id WHERE m.id = t.message_id AND cm.user_id = ?)`, args: [userId] }
+      ? { sql: `(EXISTS (SELECT 1 FROM messages m JOIN conversation_members cm ON cm.conversation_id = m.conversation_id WHERE m.id = t.message_id AND cm.user_id = ?) OR EXISTS (SELECT 1 FROM global_messages g WHERE g.id = t.message_id) OR EXISTS (SELECT 1 FROM announcement_messages a WHERE a.id = t.message_id))`, args: [userId] }
       : { sql: 'user_id = ?', args: [userId] };
   }
   if (table === 'polls') {
@@ -271,6 +281,7 @@ async function queryDataUncached(userId, payload) {
     if (['messages', 'global_messages', 'announcement_messages'].includes(table)) {
       for (const row of inputRows) void notifyNewMessage(table, row).catch((error) => console.error('Notification delivery failed:', error));
     }
+    if (table === 'user_roles') await invalidateUserRole(...rows.map((row) => row.user_id));
     return { data: payload.single ? rows[0] ?? null : rows, count: rows.length };
   }
 
@@ -282,7 +293,7 @@ async function queryDataUncached(userId, payload) {
     const protectedColumns = new Set(['id']);
     const protectedByTable = {
       profiles: ['id'], user_roles: ['user_id'], conversations: ['created_by', 'is_group'],
-      conversation_members: ['conversation_id', 'user_id', 'role'], friend_requests: ['sender_id', 'receiver_id'],
+      conversation_members: ['conversation_id', 'user_id', 'role', 'joined_at'], friend_requests: ['sender_id', 'receiver_id'],
       messages: ['conversation_id', 'sender_id'], global_messages: ['sender_id'],
       announcement_messages: ['sender_id'], message_reactions: ['message_id', 'user_id'],
       blocked_users: ['blocker_id', 'blocked_id'], pinned_conversations: ['user_id', 'conversation_id'],
@@ -295,7 +306,13 @@ async function queryDataUncached(userId, payload) {
     const friendRows = table === 'friend_requests' && patch.status === 'accepted'
       ? (await pool.execute(`SELECT sender_id, receiver_id FROM \`${table}\` t WHERE ${whereSql}`, whereArgs))[0]
       : [];
+    // user_roles updates need the affected user_ids up front so the cached
+    // role flags can be invalidated (the UPDATE itself returns no rows).
+    const roleUserIds = table === 'user_roles'
+      ? (await pool.execute(`SELECT user_id FROM \`${table}\` t WHERE ${whereSql}`, whereArgs))[0].map((row) => row.user_id)
+      : [];
     const [result] = await pool.execute(`UPDATE \`${table}\` t SET ${keys.map((key) => `\`${key}\` = ?`).join(', ')} WHERE ${whereSql}`, [...keys.map((key) => patch[key]), ...whereArgs]);
+    if (roleUserIds.length) await invalidateUserRole(...roleUserIds);
     for (const friendship of friendRows) await ensureDirectMessage(friendship.sender_id, friendship.receiver_id);
     return { data: payload.returning ? await fetchSelection(table, requested, whereSql, whereArgs) : null, count: result.affectedRows };
   }
@@ -308,6 +325,12 @@ async function queryDataUncached(userId, payload) {
     const ids = rows.map((row) => row.id);
     const before = payload.returning ? await fetchByIds(table, ids, requested, columns) : null;
     await pool.execute(`DELETE FROM \`${table}\` WHERE id IN (${ids.map(() => '?').join(',')})`, ids);
+    // message_reactions.message_id is polymorphic with no FK — clean up
+    // reactions for deleted messages explicitly.
+    if (['messages', 'global_messages', 'announcement_messages'].includes(table)) {
+      await pool.execute(`DELETE FROM message_reactions WHERE message_id IN (${ids.map(() => '?').join(',')})`, ids);
+    }
+    if (table === 'user_roles') await invalidateUserRole(...rows.map((row) => row.user_id));
     return { data: before, count: ids.length, realtimeRows: rows };
   }
 }
@@ -354,7 +377,11 @@ async function canInsert(table, row, userId, access) {
   if (table === 'message_reactions') {
     if (row.user_id !== userId) return false;
     const [message] = await pool.execute('SELECT 1 FROM messages m JOIN conversation_members cm ON cm.conversation_id = m.conversation_id WHERE m.id = ? AND cm.user_id = ? LIMIT 1', [row.message_id, userId]);
-    return message.length > 0;
+    if (message.length) return true;
+    // Global chat and announcements are readable by everyone, so anyone may
+    // react to their messages.
+    const [publicMessage] = await pool.execute('SELECT 1 FROM global_messages WHERE id = ? UNION ALL SELECT 1 FROM announcement_messages WHERE id = ? LIMIT 1', [row.message_id, row.message_id]);
+    return publicMessage.length > 0;
   }
   if (table === 'polls') {
     if (row.created_by !== userId || !['dm', 'global', 'announcement'].includes(row.channel)) return false;

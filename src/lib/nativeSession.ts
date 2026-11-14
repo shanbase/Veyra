@@ -13,6 +13,7 @@ declare global {
       setSessionToken(token: string): Promise<void>;
       clearSessionToken(): Promise<void>;
       onPairCallback(callback: (url: string) => void): void;
+      showNotification?(title: string, body: string): void;
     };
   }
 }

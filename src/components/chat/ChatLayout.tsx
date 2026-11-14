@@ -4,6 +4,7 @@ import { useAuth } from "@/hooks/useAuth";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { FriendsList } from "@/components/chat/FriendsList";
 import { ChatView } from "@/components/chat/ChatView";
+import { registerNativePush } from "@/lib/pushNotifications";
 
 type ActivePane = "global" | "announcements" | "dm" | "list";
 
@@ -17,6 +18,11 @@ export default function ChatLayout() {
   useEffect(() => {
     if (!loading && !user) navigate("/auth");
   }, [user, loading, navigate]);
+
+  // Register for native push (FCM on Android) once signed in.
+  useEffect(() => {
+    if (user?.id) void registerNativePush(user.id);
+  }, [user?.id]);
 
   // Lock body scroll while inside the chat shell so only the message list scrolls.
   useEffect(() => {

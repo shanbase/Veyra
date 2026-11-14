@@ -23,7 +23,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { toast } from "@/hooks/use-toast";
-import { UserPlus, Check, X, Settings, Globe, Megaphone, MoreVertical, UserMinus, Loader2, Shield, ShieldAlert, Pin, PinOff, Users, Plus } from "lucide-react";
+import { UserPlus, Check, X, Settings, Globe, Megaphone, MoreVertical, UserMinus, Loader2, Shield, ShieldAlert, Pin, PinOff, Users, Plus, BellOff, Bell } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { useNavigate } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
@@ -43,6 +43,7 @@ interface Profile {
   custom_status_text?: string | null;
   custom_status_emoji?: string | null;
   custom_status_expires_at?: string | null;
+  global_muted?: boolean | null;
 }
 
 interface FriendRequest {
@@ -62,6 +63,7 @@ interface Conversation {
   friend_request_id?: string;
   last_message_at?: string;
   is_pinned?: boolean;
+  muted?: boolean;
 }
 
 interface GroupEntry {
@@ -72,6 +74,7 @@ interface GroupEntry {
   unread_count: number;
   last_message_at: string | null;
   is_pinned: boolean;
+  muted?: boolean;
   member_previews: GroupAvatarMember[];
 }
 
@@ -102,7 +105,7 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
     if (!user) return;
     supabase
       .from("profiles")
-      .select("id, username, display_name, avatar_url, status, custom_status_text, custom_status_emoji, custom_status_expires_at")
+      .select("id, username, display_name, avatar_url, status, custom_status_text, custom_status_emoji, custom_status_expires_at, global_muted")
       .eq("id", user.id)
       .maybeSingle()
       .then(({ data }) => {
@@ -170,6 +173,7 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
       unread_count: Number(row.unread_count ?? 0),
       last_message_at: row.last_message_at ?? null,
       is_pinned: !!row.is_pinned,
+      muted: !!row.muted,
       member_previews: Array.isArray(row.member_previews) ? row.member_previews : [],
     }));
     setGroups(mapped);
@@ -271,6 +275,7 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
       last_message_at: row.last_message_at,
       friend_request_id: row.friend_request_id ?? undefined,
       is_pinned: !!row.is_pinned,
+      muted: !!row.muted,
       other_user: row.other_user_id
         ? {
             id: row.other_user_id,
@@ -313,6 +318,23 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
         .from("pinned_conversations")
         .insert({ user_id: user.id, conversation_id: conv.id });
       if (error) toast({ title: "Error", description: error.message, variant: "destructive" });
+    }
+  };
+
+  const toggleMute = async (convId: string, currentlyMuted: boolean) => {
+    if (!user) return;
+    const next = !currentlyMuted;
+    setConversations((prev) => prev.map((c) => (c.id === convId ? { ...c, muted: next } : c)));
+    setGroups((prev) => prev.map((g) => (g.id === convId ? { ...g, muted: next } : g)));
+    const { error } = await supabase
+      .from("conversation_members")
+      .update({ muted: next })
+      .eq("conversation_id", convId)
+      .eq("user_id", user.id);
+    if (error) {
+      setConversations((prev) => prev.map((c) => (c.id === convId ? { ...c, muted: currentlyMuted } : c)));
+      setGroups((prev) => prev.map((g) => (g.id === convId ? { ...g, muted: currentlyMuted } : g)));
+      toast({ title: "Error", description: error.message, variant: "destructive" });
     }
   };
 
@@ -648,11 +670,16 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
         <Separator className="my-2" />
         <Button
           variant="outline"
-          className="w-full justify-start gap-2"
+          className="w-full justify-between"
           onClick={() => navigate("/global-chat")}
         >
-          <Globe className="h-4 w-4" />
-          Global Chat
+          <span className="flex items-center gap-2">
+            <Globe className="h-4 w-4" />
+            Global Chat
+          </span>
+          {myProfile?.global_muted && (
+            <BellOff className="h-4 w-4 text-muted-foreground" />
+          )}
         </Button>
       </div>
 
@@ -706,6 +733,9 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
                         </p>
                         {g.is_pinned && (
                           <Pin className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                        )}
+                        {g.muted && (
+                          <BellOff className="h-3 w-3 text-muted-foreground flex-shrink-0" />
                         )}
                       </div>
                       <p className="text-xs text-muted-foreground flex items-center gap-1">
@@ -767,6 +797,9 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
                     {conv.is_pinned && (
                       <Pin className="h-3 w-3 text-muted-foreground" />
                     )}
+                    {conv.muted && (
+                      <BellOff className="h-3 w-3 text-muted-foreground" />
+                    )}
                     {conv.unread_count && conv.unread_count > 0 ? (
                       <Badge variant="default" className="h-5 min-w-5 flex items-center justify-center rounded-full px-1.5 text-xs">
                         {conv.unread_count > 99 ? "99+" : conv.unread_count}
@@ -809,6 +842,23 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
                               <>
                                 <Pin className="h-4 w-4 mr-2" />
                                 Pin to top
+                              </>
+                            )}
+                          </Button>
+                          <Button
+                            variant="outline"
+                            className="w-full mb-2"
+                            onClick={() => toggleMute(conv.id, !!conv.muted)}
+                          >
+                            {conv.muted ? (
+                              <>
+                                <Bell className="h-4 w-4 mr-2" />
+                                Unmute notifications
+                              </>
+                            ) : (
+                              <>
+                                <BellOff className="h-4 w-4 mr-2" />
+                                Mute notifications
                               </>
                             )}
                           </Button>

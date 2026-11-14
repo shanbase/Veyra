@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { pool } from './db.mjs';
-import { acknowledgeRealtimeBatch, enqueueRealtimeBatch, pendingRealtimeBatches } from './redis.mjs';
+import { acknowledgeRealtimeBatch, enqueueRealtimeBatch, pendingRealtimeBatches, redisGetJson, redisSetJson } from './redis.mjs';
 
 const PUBLIC_TOPIC = 'veyra-public-mariadb';
 const SAFE_KEYS = new Set([
@@ -59,10 +59,21 @@ function cleanColumns(values) {
 async function conversationMembers(conversationId, cache) {
   if (!conversationId) return [];
   if (!cache.has(conversationId)) {
-    cache.set(conversationId, pool.execute(
-      'SELECT user_id FROM conversation_members WHERE conversation_id = ?',
-      [conversationId],
-    ).then(([rows]) => rows.map((row) => row.user_id)));
+    // Member lists change rarely; share them across serverless instances for
+    // 20s. A brand-new member may miss live broadcasts for up to that window
+    // but always sees full history on load, so this is safe.
+    cache.set(conversationId, (async () => {
+      const redisKey = `veyra:v1:cmembers:${conversationId}`;
+      const cached = await redisGetJson(redisKey);
+      if (Array.isArray(cached)) return cached;
+      const [rows] = await pool.execute(
+        'SELECT user_id FROM conversation_members WHERE conversation_id = ?',
+        [conversationId],
+      );
+      const ids = rows.map((row) => row.user_id);
+      await redisSetJson(redisKey, ids, 20);
+      return ids;
+    })());
   }
   return cache.get(conversationId);
 }
@@ -82,6 +93,15 @@ async function recipientsFor(change, actorId, membershipCache) {
     if (messageId) {
       const [rows] = await pool.execute('SELECT conversation_id FROM messages WHERE id = ? LIMIT 1', [messageId]);
       conversationId = rows[0]?.conversation_id;
+      if (conversationId == null) {
+        // Reactions are polymorphic — a miss in `messages` may still be a
+        // global or announcement message, which are public channels.
+        const [publicRows] = await pool.execute(
+          'SELECT id FROM global_messages WHERE id = ? UNION ALL SELECT id FROM announcement_messages WHERE id = ? LIMIT 1',
+          [messageId, messageId],
+        );
+        if (publicRows.length) return { keys, users: [], isPublic: true };
+      }
     }
   } else if (['polls', 'poll_votes', 'poll_options'].includes(change.table)) {
     const pollId = keys.poll_id || (change.table === 'polls' ? keys.id : null);

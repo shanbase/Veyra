@@ -9,4 +9,5 @@ contextBridge.exposeInMainWorld('veyraDesktop', {
     const listener = (_event, url) => callback(url);
     ipcRenderer.on('veyra:pair-callback', listener);
   },
+  showNotification: (title, body) => ipcRenderer.send('veyra:show-notification', { title, body }),
 });

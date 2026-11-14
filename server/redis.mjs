@@ -142,6 +142,69 @@ export async function acknowledgeRealtimeBatch(id) {
   catch (error) { console.warn('Redis realtime acknowledgement failed:', error.message); }
 }
 
+// Generic JSON helpers for small auxiliary caches (schema metadata, admin
+// flags, member lists, signed URLs, sessions). Every helper degrades to a
+// no-op/null when Redis is unavailable so callers always have a DB fallback.
+export async function redisGetJson(key) {
+  const redis = await readyClient();
+  if (!redis) return null;
+  try {
+    const raw = await redis.get(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch (error) {
+    console.warn('Redis get failed:', error.message);
+    redisDisabledUntil = Date.now() + 2000;
+    return null;
+  }
+}
+
+export async function redisSetJson(key, value, ttlSeconds) {
+  const redis = await readyClient();
+  if (!redis) return;
+  try { await redis.set(key, JSON.stringify(value), { EX: ttlSeconds }); }
+  catch (error) {
+    console.warn('Redis set failed:', error.message);
+    redisDisabledUntil = Date.now() + 2000;
+  }
+}
+
+export async function redisDel(...keys) {
+  const redis = await readyClient();
+  if (!redis || !keys.length) return;
+  try { await redis.del(keys); }
+  catch (error) {
+    console.warn('Redis delete failed:', error.message);
+    redisDisabledUntil = Date.now() + 2000;
+  }
+}
+
+const ROLE_TTL_SECONDS = 300;
+
+// Admin/super-admin flags are read on nearly every API request. Cache them
+// per user; writes to user_roles invalidate the specific users' keys (see
+// invalidateUserRole) so changes propagate immediately.
+export async function cachedUserRoles(userId) {
+  const key = `veyra:v1:roles:${userId}`;
+  const cached = await redisGetJson(key);
+  if (cached && typeof cached.admin === 'boolean' && typeof cached.super === 'boolean') return cached;
+  // Lazy import: pulling db.mjs in at module load would keep scripts/tests
+  // that only need Redis helpers alive on an open DB pool.
+  const { pool } = await import('./db.mjs');
+  const [rows] = await pool.execute('SELECT role FROM user_roles WHERE user_id = ?', [userId]);
+  const roles = { admin: false, super: false };
+  for (const row of rows) {
+    if (row.role === 'admin') roles.admin = true;
+    if (row.role === 'super_admin') roles.super = true;
+  }
+  await redisSetJson(key, roles, ROLE_TTL_SECONDS);
+  return roles;
+}
+
+export async function invalidateUserRole(...userIds) {
+  const ids = [...new Set(userIds.filter(Boolean))];
+  if (ids.length) await redisDel(...ids.map((id) => `veyra:v1:roles:${id}`));
+}
+
 export async function invalidateReadCache(table) {
   const redis = await readyClient();
   if (!redis) return;
