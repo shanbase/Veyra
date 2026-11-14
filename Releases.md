@@ -2,6 +2,25 @@
 
 GitHub Releases are the public update source for the Windows desktop and Android apps. A release is created by pushing a semantic version tag in the form `vMAJOR.MINOR.PATCH`, for example `v1.2.0`. The release workflow builds both apps, attaches their installers, generates `latest.json`, and publishes the release. Pull request and branch builds do not publish releases.
 
+## Veyra 1.2.5
+
+Feature release on top of 1.2.4:
+
+- **Reactions on every surface:** emoji reactions now work on Global Chat and Announcements, not just DMs and groups. `message_reactions` supports all three message tables and live updates broadcast correctly.
+- **Duplicate DM fix:** accepting a friend request (or opening `get_or_create_dm`) can no longer create two conversations for the same pair — a new `dm_pairs` table makes conversation creation atomic.
+- **Mute any chat:** per-conversation mute for DMs and groups, plus a Global Chat mute toggle. Muted chats stay visible but stop all notifications. Bell-off indicators appear in the sidebar; toggles live in the chat header and DM menu.
+- **Push notifications without extra apps:** Android registers for Firebase Cloud Messaging automatically (`@capacitor/push-notifications` + `FCM_SERVICE_ACCOUNT_JSON` server-side; dead tokens are retired automatically). The Windows desktop app shows native OS notifications for incoming messages while unfocused — click to jump back in.
+- **Redis does more heavy lifting:** auth sessions are cached (60s, instant invalidation on logout/password change/revoke), admin role flags are cached per user, schema metadata and conversation member lists are shared across serverless instances, and signed media URLs are cached for 50 minutes — fewer round-trips to the database on every request.
+- **Performance:** new indexes on `message_reactions(message_id)` and `messages(reply_to_id)`; message history loading is unchanged.
+- **Attachments are permanent:** the 14-day attachment expiry is removed. Images, videos, voice notes, and files are kept forever unless `ATTACHMENT_RETENTION_DAYS` is explicitly set.
+- **PostgreSQL fixes:** the `client.query() already executing` deprecation warning is resolved, and the PostgreSQL schema gained the new tables/columns (`dm_pairs`, `muted`, `global_muted`).
+
+### Downloads (once published)
+
+- Windows: `Veyra1.2.5.exe`
+- Android: `AndroidVeyra1.2.5.apk`
+- Update metadata: `latest.json`
+
 ## Veyra 1.2.4
 
 Hotfix release on top of 1.2.3:
