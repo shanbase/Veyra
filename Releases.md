@@ -2,6 +2,24 @@
 
 GitHub Releases are the public update source for the Windows desktop and Android apps. A release is created by pushing a semantic version tag in the form `vMAJOR.MINOR.PATCH`, for example `v1.2.0`. The release workflow builds both apps, attaches their installers, generates `latest.json`, and publishes the release. Pull request and branch builds do not publish releases.
 
+## Veyra 1.2.7
+
+Security-hardening and scale release on top of 1.2.6:
+
+- **Write-path lockdown:** the generic data API no longer lets users forge receipt timestamps (`read_at`/`delivered_at`), rewrite reply links, or backdate messages; bulk updates/deletes/inserts are capped at 200 rows per request and filter sizes are bounded.
+- **Realtime scales past 200 members:** conversation-scoped tables (messages, reactions, polls) now broadcast on per-conversation topics instead of fanning out to every member's user topic, so large groups get live updates for all members. Sidebar unread badges still refresh via lightweight activity pings.
+- **Rate limits without Redis:** `/api/data`, profile uploads, and chat uploads now fall back to an in-memory limiter when `REDIS_URL` is unset; pairing, email-verify, and password-reset endpoints gained rate limits.
+- **Push token ownership:** an FCM token is bound to the newest account that registers it, fixing push delivery when two accounts share one device.
+- **Infra errors no longer leak:** database connection failures return a generic 503 instead of raw driver messages.
+- **Group cap:** groups are limited to 500 members.
+- **Content-Security-Policy** header added to all responses.
+
+### Downloads (once published)
+
+- Windows: `Veyra1.2.7.exe`
+- Android: `AndroidVeyra1.2.7.apk`
+- Update metadata: `latest.json`
+
 ## Veyra 1.2.6
 
 Fixes and hardening release on top of 1.2.5:

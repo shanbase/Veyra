@@ -3,6 +3,9 @@ import { apiFetch } from '@/lib/nativeSession';
 
 const PUBLIC_TOPIC = 'veyra-public-mariadb';
 const PUBLIC_TABLES = new Set(['global_messages', 'announcement_messages']);
+// Mirrors CONVERSATION_TABLES in server/realtime.mjs — these tables are
+// broadcast on per-conversation topics instead of per-user topics.
+const CONVERSATION_TABLES = new Set(['messages', 'message_reactions', 'polls', 'poll_options', 'poll_votes']);
 
 export type MariaDbChange = {
   schema: string;
@@ -35,6 +38,8 @@ let userTopic: string | null = null;
 let userTopicRequest: Promise<void> | null = null;
 let userChannel: RealtimeChannel | null = null;
 let publicChannel: RealtimeChannel | null = null;
+const convChannels = new Map<string, RealtimeChannel>();
+const convTopicRequests = new Map<string, Promise<void>>();
 let releaseTimer: ReturnType<typeof setTimeout> | undefined;
 let identityRevision = 0;
 
@@ -114,6 +119,39 @@ function openChannel(topic: string, publicOnly: boolean) {
   return channel;
 }
 
+function subscriberConversationId(subscriber: Subscriber): string | null {
+  const table = subscriber.filter.table;
+  if (table && table !== '*' && !CONVERSATION_TABLES.has(table)) return null;
+  const match = String(subscriber.filter.filter || '').match(/^conversation_id=(?:eq|is)\.(.+)$/i);
+  if (!match) return null;
+  return match[1].replace(/^"|"$/g, '') || null;
+}
+
+async function ensureConversationChannel(conversationId: string) {
+  if (convChannels.has(conversationId) || convTopicRequests.has(conversationId)) return;
+  const request = (async () => {
+    try {
+      const response = await apiFetch(`/api/realtime/topic?conversation_id=${encodeURIComponent(conversationId)}`);
+      const result = await response.json() as { topic?: string };
+      if (!response.ok || !result.topic) return;
+      if (!subscribers.size || ![...subscribers].some((s) => subscriberConversationId(s) === conversationId)) return;
+      convChannels.set(conversationId, openChannel(result.topic, false));
+    } catch (error) {
+      console.warn('Could not initialize conversation live updates:', error instanceof Error ? error.message : 'network error');
+    } finally {
+      convTopicRequests.delete(conversationId);
+    }
+  })();
+  convTopicRequests.set(conversationId, request);
+}
+
+function releaseConversationChannel(conversationId: string) {
+  const channel = convChannels.get(conversationId);
+  if (!channel) return;
+  convChannels.delete(conversationId);
+  void authClient.removeChannel(channel);
+}
+
 function ensurePublicChannel() {
   if (!publicChannel && [...subscribers].some(({ filter }) => {
     const table = filter.table;
@@ -149,6 +187,10 @@ export function setMariaDbRealtimeUserId(nextUserId: string | null) {
   userId = nextUserId;
   userTopic = null;
   identityRevision++;
+  // Conversation topics are membership-scoped, not user-scoped — drop them so
+  // a different account cannot keep listening to the previous user's chats.
+  for (const conversationId of [...convChannels.keys()]) releaseConversationChannel(conversationId);
+  convTopicRequests.clear();
   if (userChannel) {
     const previous = userChannel;
     userChannel = null;
@@ -163,6 +205,8 @@ export function subscribeMariaDbChanges(filter: ChangeFilter, callback: Subscrib
   const subscriber = { filter, callback };
   subscribers.add(subscriber);
   ensurePublicChannel();
+  const conversationId = subscriberConversationId(subscriber);
+  if (conversationId) void ensureConversationChannel(conversationId);
   if (userId) {
     if (userTopic && !userChannel) userChannel = openChannel(userTopic, false);
     else void ensureUserTopic();
@@ -170,15 +214,26 @@ export function subscribeMariaDbChanges(filter: ChangeFilter, callback: Subscrib
 
   return () => {
     subscribers.delete(subscriber);
-    if (subscribers.size || releaseTimer) return;
-    releaseTimer = setTimeout(() => {
-      releaseTimer = undefined;
-      if (subscribers.size) return;
-      const channels = [userChannel, publicChannel].filter(Boolean) as RealtimeChannel[];
-      userChannel = null;
-      publicChannel = null;
-      userTopic = null;
-      channels.forEach((channel) => void authClient.removeChannel(channel));
-    }, 20_000);
+    if (!subscribers.size) {
+      if (releaseTimer) return;
+      releaseTimer = setTimeout(() => {
+        releaseTimer = undefined;
+        if (subscribers.size) return;
+        const channels = [userChannel, publicChannel, ...convChannels.values()].filter(Boolean) as RealtimeChannel[];
+        userChannel = null;
+        publicChannel = null;
+        userTopic = null;
+        convChannels.clear();
+        convTopicRequests.clear();
+        channels.forEach((channel) => void authClient.removeChannel(channel));
+      }, 20_000);
+      return;
+    }
+    // Drop conversation channels no remaining subscriber needs so hopping
+    // between chats does not accumulate websocket channels.
+    const needed = new Set([...subscribers].map(subscriberConversationId).filter(Boolean) as string[]);
+    for (const id of [...convChannels.keys()]) {
+      if (!needed.has(id)) releaseConversationChannel(id);
+    }
   };
 }

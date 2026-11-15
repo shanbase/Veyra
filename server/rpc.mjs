@@ -282,10 +282,15 @@ export async function ensureDirectMessage(userId, otherId) {
 
 const getOrCreateDm = ensureDirectMessage;
 
+// Groups are capped so fan-out work (notifications, member lists, realtime
+// recipient resolution) stays bounded per message.
+const MAX_GROUP_MEMBERS = 500;
+
 async function createGroupChat(userId, name, memberIds) {
   if (!String(name || '').trim()) throw new Error('Group name is required.');
   const uniqueIds = [...new Set([userId, ...memberIds])];
   if (uniqueIds.length < 2) throw new Error('A group chat needs at least one other member.');
+  if (uniqueIds.length > MAX_GROUP_MEMBERS) throw new Error(`Groups are limited to ${MAX_GROUP_MEMBERS} members.`);
   const connection = await pool.getConnection();
   const id = randomUUID();
   try {
@@ -322,7 +327,13 @@ async function renameGroup(userId, conv, name) {
 
 async function addGroupMembers(userId, conv, userIds) {
   await requireGroupAdmin(userId, conv);
-  for (const member of [...new Set(userIds)]) {
+  const [existingRows] = await pool.execute('SELECT user_id FROM conversation_members WHERE conversation_id = ?', [conv]);
+  const existing = new Set(existingRows.map((row) => row.user_id));
+  const additions = [...new Set(userIds)].filter((id) => id !== userId && !existing.has(id));
+  if (existing.size + additions.length > MAX_GROUP_MEMBERS) {
+    throw new Error(`Groups are limited to ${MAX_GROUP_MEMBERS} members.`);
+  }
+  for (const member of additions) {
     const [friendship] = await pool.execute("SELECT 1 FROM friend_requests WHERE status = 'accepted' AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)) LIMIT 1", [userId, member, member, userId]);
     if (!friendship.length) throw new Error('You can only add accepted friends to a group.');
     const [blocked] = await pool.execute('SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1', [userId, member, member, userId]);

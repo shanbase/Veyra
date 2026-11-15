@@ -82,10 +82,9 @@ function mariaRealtimeChannel(name: string) {
 export const supabase = new Proxy(authClient, {
   get(target, property, receiver) {
     if (property === 'from') return (table: string) => fromMariaDB(table);
-    if (property === 'rpc') return (name: string, args?: Record<string, unknown>) =>
-      name === 'get_user_sessions' || name === 'revoke_user_session'
-        ? authClient.rpc(name as never, args as never)
-        : rpcMariaDB(name, args);
+    // Session management RPCs are rejected server-side with a clear error;
+    // route them through the data API like everything else.
+    if (property === 'rpc') return (name: string, args?: Record<string, unknown>) => rpcMariaDB(name, args);
     if (property === 'channel') return (name: string) => mariaRealtimeChannel(name);
     if (property === 'functions') return functionsClient;
     const value = Reflect.get(target, property, target);
