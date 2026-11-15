@@ -8,7 +8,28 @@ const isProduction = process.env.NODE_ENV === 'production';
 // Altare/other PaaS inject PORT automatically; 3001 is the local default.
 const port = Number(process.env.PORT || process.env.APP_PORT || 3001);
 
-const app = createApp();
+// Startup diagnostics — env VALUES are never logged, only presence, so the
+// deploy console shows what is configured without leaking secrets.
+console.log('Veyra starting:', JSON.stringify({
+  node: process.version,
+  nodeEnv: process.env.NODE_ENV || '(unset)',
+  port,
+  useMariadb: process.env.USE_MARIADB ?? '(default true)',
+  hasMariadbConfig: Boolean(process.env.MARIADB_USER && process.env.MARIADB_DATABASE),
+  hasPostgresConfig: Boolean(process.env.POSTGRES_USER && process.env.POSTGRES_DATABASE),
+  hasSupabaseUrl: Boolean(process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL),
+  hasServiceKey: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+  hasEncryptionKey: Boolean(process.env.MESSAGE_ENCRYPTION_KEY),
+  hasAppUrl: Boolean(process.env.APP_URL),
+}));
+
+let app;
+try {
+  app = createApp();
+} catch (error) {
+  console.error('Veyra failed to initialize:', error);
+  process.exit(1);
+}
 
 if (isProduction) {
   const distPath = fileURLToPath(new URL('../dist', import.meta.url));
