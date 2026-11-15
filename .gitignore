@@ -11,3 +11,5 @@ release/
 AGENTS.md
 veyra-34b8f-firebase-adminsdk-fbsvc-bd880cd9d2.json
 google-services.json
+
+startup-debug.log
