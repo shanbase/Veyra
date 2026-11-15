@@ -6,7 +6,7 @@ import { callRpc } from './rpc.mjs';
 import { sendTestNotification, deliverPushNotification } from './notifications.mjs';
 import { purgeExpiredAttachments, cleanupExpiredAuthArtifacts } from './maintenance.mjs';
 import { authenticateRequest, registerAuthRoutes } from './auth.mjs';
-import { changesFromRpc, changeFromDataRequest, mariaDbRealtimeTopic, publishMariaDbChanges } from './realtime.mjs';
+import { changesFromRpc, changeFromDataRequest, mariaDbRealtimeTopic, mariaDbConversationTopic, publishMariaDbChanges } from './realtime.mjs';
 import { getSupabaseAdmin } from './supabase-admin.mjs';
 import { invalidateReadCache, consumeRateLimit, redisGetJson, redisSetJson } from './redis.mjs';
 import { assertEncryptionConfig, encryptionEnabled } from './encryption.mjs';
@@ -16,6 +16,37 @@ const MAX_PROFILE_IMAGE_BYTES = 25 * 1024 * 1024;
 const PROFILE_UPLOAD_TYPES = new Set(['image/jpeg', 'image/gif']);
 const CHAT_UPLOAD_BUCKETS = new Set(['chat-images', 'chat-videos', 'chat-voice']);
 const MAX_CHAT_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+// In-memory fixed-window fallback for rate limits when Redis is not
+// configured, mirroring auth.mjs's allowRequest buckets.
+const localRateBuckets = new Map();
+function consumeLocalRateLimit(key, limit, windowMs) {
+  const now = Date.now();
+  if (localRateBuckets.size > 10000) {
+    for (const [bucketKey, bucket] of localRateBuckets) {
+      if (bucket.until <= now) localRateBuckets.delete(bucketKey);
+    }
+  }
+  const bucket = localRateBuckets.get(key);
+  if (!bucket || bucket.until <= now) {
+    localRateBuckets.set(key, { count: 1, until: now + windowMs });
+    return { allowed: true };
+  }
+  bucket.count++;
+  return { allowed: bucket.count <= limit };
+}
+
+async function consumeRequestRateLimit(key, limit, windowMs) {
+  const shared = await consumeRateLimit(key, limit, windowMs);
+  if (shared) return shared;
+  return consumeLocalRateLimit(key, limit, windowMs);
+}
+
+const INFRA_ERROR_CODES = new Set(['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'ECONNRESET', 'EPIPE', 'PROTOCOL_CONNECTION_LOST', 'ECONNABORTED']);
+function isInfraError(error) {
+  return INFRA_ERROR_CODES.has(error?.code)
+    || /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|pool|timeout|connect/i.test(String(error?.message || ''));
+}
 
 export function createApp() {
   const app = express();
@@ -43,6 +74,23 @@ export function createApp() {
     res.set('Referrer-Policy', 'strict-origin-when-cross-origin');
     // Voice messages need the microphone; nothing else is required.
     res.set('Permissions-Policy', 'camera=(), microphone=(self), geolocation=()');
+    // Broad-by-design CSP: the app talks to Supabase (realtime/storage),
+    // GIPHY, hCaptcha, and the configured API origin, so connect/img/media
+    // stay permissive while scripts and frames are locked down.
+    res.set('Content-Security-Policy', [
+      "default-src 'self'",
+      "script-src 'self' https://js.hcaptcha.com https://*.hcaptcha.com",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob: https:",
+      "media-src 'self' blob: https:",
+      "font-src 'self' data:",
+      "connect-src 'self' https: wss:",
+      "frame-src https://*.hcaptcha.com",
+      "worker-src 'self' blob:",
+      "object-src 'none'",
+      "base-uri 'self'",
+      "frame-ancestors 'none'",
+    ].join('; '));
     if (process.env.NODE_ENV === 'production' && String(process.env.APP_URL || '').startsWith('https://')) {
       res.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
     }
@@ -108,8 +156,9 @@ export function createApp() {
   });
   app.post('/api/data', async (req, res) => {
     try {
-      // Generous per-user ceiling; only enforced when Redis is configured.
-      const limited = await consumeRateLimit(`data:${req.user.id}`, 600, 60_000);
+      // Generous per-user ceiling; Redis-backed when configured, in-memory
+      // otherwise so the query engine always has a throughput bound.
+      const limited = await consumeRequestRateLimit(`data:${req.user.id}`, 600, 60_000);
       if (limited && !limited.allowed) {
         return res.status(429).json({ error: 'Too many requests. Please slow down and try again.' });
       }
@@ -126,7 +175,11 @@ export function createApp() {
         console.error('Data request failed:', error);
         return res.status(500).json({ error: 'The server could not complete the request.' });
       }
-      const status = /not allowed|unknown table|unsupported/i.test(error.message) ? 403 : 400;
+      if (isInfraError(error)) {
+        console.error('Data request infrastructure failure:', error);
+        return res.status(503).json({ error: 'The service is temporarily unavailable. Please try again.' });
+      }
+      const status = /not allowed|unknown table|unsupported|too many/i.test(error.message) ? 403 : 400;
       res.status(status).json({ error: error.message || 'Database request failed.' });
     }
   });
@@ -147,6 +200,10 @@ export function createApp() {
         console.error('RPC request failed:', error);
         return res.status(500).json({ error: 'The server could not complete the request.' });
       }
+      if (isInfraError(error)) {
+        console.error('RPC request infrastructure failure:', error);
+        return res.status(503).json({ error: 'The service is temporarily unavailable. Please try again.' });
+      }
       const status = /not allowed|admin access|unsupported|only the|must be|access required/i.test(error.message) ? 403 : 400;
       res.status(status).json({ error: error.message || 'Database action failed.' });
     }
@@ -155,9 +212,22 @@ export function createApp() {
     try { res.json(await sendTestNotification(req.user.id)); }
     catch (error) { res.status(400).json({ ok: false, error: error.message }); }
   });
-  app.get('/api/realtime/topic', (req, res) => {
-    try { res.json({ topic: mariaDbRealtimeTopic(req.user.id) }); }
-    catch (error) { res.status(503).json({ error: error.message || 'Live updates are not configured.' }); }
+  app.get('/api/realtime/topic', async (req, res) => {
+    try {
+      const conversationId = String(req.query.conversation_id || '');
+      if (conversationId) {
+        // Conversation topics are only handed to actual members — the topic
+        // name itself is an HMAC, but membership is still verified so a leaked
+        // id cannot subscribe a non-member to live message traffic.
+        const [members] = await pool.execute(
+          'SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ? LIMIT 1',
+          [conversationId, req.user.id],
+        );
+        if (!members.length) return res.status(403).json({ error: 'Not a member of this conversation.' });
+        return res.json({ topic: mariaDbConversationTopic(conversationId) });
+      }
+      res.json({ topic: mariaDbRealtimeTopic(req.user.id) });
+    } catch (error) { res.status(503).json({ error: error.message || 'Live updates are not configured.' }); }
   });
   app.post('/api/storage/profile-upload', async (req, res) => {
     const { bucket, contentType, size } = req.body || {};
@@ -167,6 +237,10 @@ export function createApp() {
       return res.status(413).json({ error: 'Maximum file size is 25 MB.' });
     }
 
+    const limited = await consumeRequestRateLimit(`profile-upload:${req.user.id}`, 60, 60_000);
+    if (limited && !limited.allowed) {
+      return res.status(429).json({ error: 'Too many uploads. Please slow down and try again.' });
+    }
     try {
       const path = `${req.user.id}/${bucket === 'avatars' ? 'avatar' : 'banner'}`;
       const { data, error } = await getSupabaseAdmin().storage.from(bucket).createSignedUploadUrl(path, { upsert: true });
@@ -197,7 +271,7 @@ export function createApp() {
       );
       if (!members.length) return res.status(403).json({ error: 'You cannot upload media to this conversation.' });
     }
-    const limited = await consumeRateLimit(`chat-upload:${req.user.id}`, 120, 60_000);
+    const limited = await consumeRequestRateLimit(`chat-upload:${req.user.id}`, 120, 60_000);
     if (limited && !limited.allowed) {
       return res.status(429).json({ error: 'Too many uploads. Please slow down and try again.' });
     }

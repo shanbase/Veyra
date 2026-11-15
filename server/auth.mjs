@@ -21,6 +21,13 @@ async function allowRequest(req, res, name, limit = 10, windowMs = 15 * 60 * 100
   }
   const key = `${name}:${identity}`;
   const now = Date.now();
+  // Evict expired buckets opportunistically so the map cannot grow forever
+  // on long-lived self-hosted instances.
+  if (rateBuckets.size > 10000) {
+    for (const [bucketKey, bucket] of rateBuckets) {
+      if (bucket.until <= now) rateBuckets.delete(bucketKey);
+    }
+  }
   const bucket = rateBuckets.get(key);
   if (!bucket || bucket.until <= now) {
     rateBuckets.set(key, { count: 1, until: now + windowMs });
@@ -245,6 +252,7 @@ export async function authenticateRequest(req, res, next) {
 
 export function registerAuthRoutes(app) {
   app.post('/api/auth/native/pair/start', async (req, res) => {
+    if (!await allowRequest(req, res, 'native-pair-start', 30, 60 * 60 * 1000)) return;
     const clientId = String(req.body?.clientId || '');
     if (!['android', 'desktop'].includes(clientId)) return res.status(400).json({ error: 'Unsupported app type.' });
     const code = randomToken();
@@ -480,6 +488,7 @@ export function registerAuthRoutes(app) {
   });
 
   app.post('/api/auth/verify', async (req, res) => {
+    if (!await allowRequest(req, res, 'verify', 30, 60 * 60 * 1000)) return;
     const token = String(req.body?.token || '');
     const [rows] = await pool.execute("SELECT id, user_id FROM auth_email_tokens WHERE token_hash = ? AND purpose = 'confirm' AND expires_at > UTC_TIMESTAMP(3) LIMIT 1", [hashToken(token)]);
     if (!rows.length) return res.status(400).json({ error: 'Verification link is invalid or expired.' });
@@ -489,6 +498,7 @@ export function registerAuthRoutes(app) {
   });
 
   app.post('/api/auth/reset-password', async (req, res) => {
+    if (!await allowRequest(req, res, 'reset-password', 30, 60 * 60 * 1000)) return;
     const token = String(req.body?.token || '');
     const password = String(req.body?.password || '');
     if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });

@@ -403,7 +403,12 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     load();
     const ch = supabase
       .channel(`polls-index:${channel}:${conversationIdProp || "all"}`)
-      .on("postgres_changes", { event: "*", schema: "public", table: "polls" }, load)
+      .on("postgres_changes", {
+        event: "*",
+        schema: "public",
+        table: "polls",
+        ...(isDM && conversationIdProp ? { filter: `conversation_id=eq.${conversationIdProp}` } : {}),
+      }, load)
       .subscribe();
     return () => {
       cancelled = true;
@@ -788,6 +793,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
             event: "*",
             schema: "public",
             table: "message_reactions",
+            ...(isDM && conversationIdProp ? { filter: `conversation_id=eq.${conversationIdProp}` } : {}),
           },
           (payload) => {
             handleReactionRealtimePayload(payload, reactionRealtimeDeps);

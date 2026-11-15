@@ -80,6 +80,10 @@ export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {})
   const response = await fetch(input, request);
   if (token && response.status === 401) {
     await clearNativeSessionToken();
+    // Let useAuth know the native session is gone so the UI drops to the
+    // signed-out state instead of looking logged in until the next /me call.
+    // Only fires while a token existed, so it cannot loop.
+    window.dispatchEvent(new CustomEvent('veyra-auth-changed'));
     headers.delete('Authorization');
     return fetch(input, request);
   }

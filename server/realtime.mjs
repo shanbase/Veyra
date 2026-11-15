@@ -26,6 +26,20 @@ export function mariaDbRealtimeTopic(userId) {
   return `veyra-user-${digest}`;
 }
 
+// High-frequency, conversation-scoped tables broadcast to one topic per
+// conversation instead of fanning out to every member's user topic. The topic
+// name is an HMAC of the conversation id, so it is unguessable but stable;
+// clients receive it from GET /api/realtime/topic?conversation_id= after a
+// membership check.
+const CONVERSATION_TABLES = new Set(['messages', 'message_reactions', 'polls', 'poll_options', 'poll_votes']);
+
+export function mariaDbConversationTopic(conversationId) {
+  const key = serviceKey();
+  if (!key) throw new Error('Set SUPABASE_SERVICE_ROLE_KEY on the API server to enable live updates.');
+  const digest = createHmac('sha256', key).update(`veyra-conv:${conversationId}`).digest('base64url').slice(0, 32);
+  return `veyra-conv-${digest}`;
+}
+
 function collectKeys(...sources) {
   const keys = {};
   const visit = (value) => {
@@ -136,7 +150,7 @@ async function recipientsFor(change, actorId, membershipCache) {
   }
   if (change.table === 'conversation_members' && keys.user_id) users.add(keys.user_id);
 
-  return { keys, users: [...users].slice(0, 200), isPublic: false };
+  return { keys, users: [...users].slice(0, 1000), isPublic: false };
 }
 
 export async function publishMariaDbChanges(changes, actorId) {
@@ -187,8 +201,41 @@ export async function publishMariaDbChanges(changes, actorId) {
         ...(record ? { record } : {}),
         refresh: true,
       };
-      const topics = scope.isPublic ? [PUBLIC_TOPIC] : scope.users.map(mariaDbRealtimeTopic);
+      // Conversation-scoped changes go to the shared conversation topic so a
+      // large group costs one broadcast instead of one per member. Everything
+      // else (friend requests, membership, profiles, roles) still fans out to
+      // per-user topics so non-members learn about the change.
+      const convId = scope.keys.conversation_id;
+      const useConvTopic = !scope.isPublic && convId != null && CONVERSATION_TABLES.has(change.table);
+      const topics = scope.isPublic
+        ? [PUBLIC_TOPIC]
+        : useConvTopic
+          ? [mariaDbConversationTopic(String(convId))]
+          : scope.users.map(mariaDbRealtimeTopic);
       for (const topic of topics) messages.push({ topic, event: 'db-change', payload });
+      // Sidebar unread badges subscribe to these tables without a
+      // conversation filter on the per-user topic. Send members a minimal
+      // activity ping — no row keys, so conversation-filtered subscribers
+      // ignore it while unfiltered ones still trigger a list refresh.
+      if (useConvTopic) {
+        const ping = {
+          schema: 'public',
+          table: change.table,
+          eventType: change.eventType || '*',
+          operation: change.operation,
+          keys: {},
+          // Keep the real column list: unfiltered subscribers (sidebar unread
+          // badges) inspect it to distinguish receipt updates from content
+          // changes. Row keys stay empty so conversation filters reject it.
+          columns: change.columns || [],
+          actor_id: actorId,
+          refresh: true,
+          activity: true,
+        };
+        for (const memberId of scope.users) {
+          messages.push({ topic: mariaDbRealtimeTopic(memberId), event: 'db-change', payload: ping });
+        }
+      }
     }
   } catch (error) {
     console.warn('Could not prepare MariaDB live update:', error instanceof Error ? error.message : 'database error');

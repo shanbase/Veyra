@@ -149,7 +149,6 @@ async function policy(table, userId, operation) {
     const extra = table === 'poll_options' && operation !== 'select' ? ' AND p.created_by = ?' : '';
     return { sql: `EXISTS (SELECT 1 FROM polls p WHERE p.id = t.poll_id AND (p.conversation_id IS NULL OR EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = p.conversation_id AND cm.user_id = ?))${extra})`, args: extra ? [userId, userId] : [userId] };
   }
-  if (table === 'friend_requests') return { sql: '(sender_id = ? OR receiver_id = ?)', args: [userId, userId] };
   if (owner[table]) {
     const cols = owner[table];
     return { sql: admin && table === 'user_roles' ? '1 = 1' : `(${cols.map((col) => `${col} = ?`).join(' OR ')})`, args: admin && table === 'user_roles' ? [] : cols.map(() => userId) };
@@ -167,10 +166,16 @@ function escapeLike(value) {
     .replaceAll('*', '%');
 }
 
+const MAX_FILTERS = 25;
+const MAX_IN_VALUES = 200;
+const MAX_OR_LENGTH = 500;
+
 function filterSql(filters, columns) {
   const parts = [];
   const args = [];
-  for (const filter of filters || []) {
+  if (!Array.isArray(filters)) filters = [];
+  if (filters.length > MAX_FILTERS) throw new Error('Too many filters.');
+  for (const filter of filters) {
     const col = identifier(filter.column, columns);
     switch (filter.op) {
       case 'eq': parts.push(`${col} = ?`); args.push(normalizeTemporalValue(filter.value, columns.get(filter.column))); break;
@@ -181,6 +186,7 @@ function filterSql(filters, columns) {
       case 'lte': parts.push(`${col} <= ?`); args.push(normalizeTemporalValue(filter.value, columns.get(filter.column))); break;
       case 'in': {
         if (!Array.isArray(filter.value) || !filter.value.length) parts.push('1 = 0');
+        else if (filter.value.length > MAX_IN_VALUES) throw new Error('Too many values in filter.');
         else {
           parts.push(`${col} IN (${filter.value.map(() => '?').join(',')})`);
           args.push(...filter.value.map((value) => normalizeTemporalValue(value, columns.get(filter.column))));
@@ -194,9 +200,13 @@ function filterSql(filters, columns) {
           // `IS ?` is not valid PostgreSQL; IS NOT DISTINCT FROM covers all types.
           parts.push(`${col} IS NOT DISTINCT FROM ?`);
           args.push(normalizeTemporalValue(filter.value, columns.get(filter.column)));
-        } else {
+        } else if (/^(?:tinyint\(1\)|boolean)/i.test(columns.get(filter.column) || '')) {
+          // MariaDB `IS` only accepts boolean/NULL literals — tinyint(1) and
+          // boolean columns can take a real comparison value.
           parts.push(`${col} IS ?`);
           args.push(normalizeTemporalValue(filter.value, columns.get(filter.column)));
+        } else {
+          throw new Error('Unsupported IS filter value for this column.');
         }
         break;
       case 'ilike': parts.push(`LOWER(${col}) LIKE LOWER(?)`); args.push(escapeLike(filter.value)); break;
@@ -208,6 +218,7 @@ function filterSql(filters, columns) {
 
 function parseOr(raw, columns) {
   if (!raw) return { sql: '', args: [] };
+  if (String(raw).length > MAX_OR_LENGTH) throw new Error('OR filter is too long.');
   const clauses = String(raw).split(',');
   const args = [];
   const sql = clauses.map((clause) => {
@@ -262,6 +273,7 @@ async function queryDataUncached(userId, payload) {
 
   if (operation === 'insert' || operation === 'upsert') {
     const inputRows = (Array.isArray(payload.values) ? payload.values : [payload.values]).filter(Boolean);
+    if (inputRows.length > MAX_WRITE_ROWS) throw new Error('Too many rows in one request.');
     if (!inputRows.length) return { data: [], count: 0 };
     const inserted = [];
     for (const input of inputRows) {
@@ -276,6 +288,12 @@ async function queryDataUncached(userId, payload) {
       const updateKeys = operation === 'upsert' ? keys.filter((key) => key !== 'id' && key !== 'user_id') : [];
       const insertSql = `INSERT INTO \`${table}\` (${keys.map((key) => `\`${key}\``).join(', ')}) VALUES (${keys.map(() => '?').join(', ')})${operation === 'upsert' && updateKeys.length ? ` ON DUPLICATE KEY UPDATE ${updateKeys.map((key) => `\`${key}\` = VALUES(\`${key}\`)`).join(', ')}` : ''}`;
       const insertArgs = keys.map((key) => storedRow[key]);
+      // An FCM token identifies a device, not an account: when a different
+      // user registers a token this device already used, retire the old
+      // account's row so one device never receives two accounts' pushes.
+      if (table === 'native_push_tokens' && typeof row.token === 'string' && row.token) {
+        await pool.execute('UPDATE native_push_tokens SET enabled = FALSE WHERE token = ? AND user_id <> ?', [row.token, userId]);
+      }
       if (table === 'poll_votes') {
         // Single-choice votes delete-then-insert; both must be atomic or two
         // concurrent votes on different options can both land.
@@ -314,10 +332,15 @@ async function queryDataUncached(userId, payload) {
     if (!keys.length) return { data: [], count: 0 };
     const protectedColumns = new Set(['id']);
     const protectedByTable = {
-      profiles: ['id'], user_roles: ['user_id'], conversations: ['created_by', 'is_group'],
+      profiles: ['id', 'created_at'], user_roles: ['user_id'], conversations: ['created_by', 'is_group', 'created_at'],
       conversation_members: ['conversation_id', 'user_id', 'role', 'joined_at'], friend_requests: ['sender_id', 'receiver_id'],
-      messages: ['conversation_id', 'sender_id'], global_messages: ['sender_id'],
-      announcement_messages: ['sender_id'], message_reactions: ['message_id', 'user_id'],
+      // Receipt timestamps and thread linkage are server-managed: a sender
+      // must not be able to forge read/delivered state or rewrite replies.
+      // Content/edited_at/pin fields stay writable — the composer uses them.
+      messages: ['conversation_id', 'sender_id', 'read_at', 'delivered_at', 'reply_to_id', 'created_at'],
+      global_messages: ['sender_id', 'reply_to_id', 'created_at'],
+      announcement_messages: ['sender_id', 'reply_to_id', 'created_at'],
+      message_reactions: ['message_id', 'user_id'],
       blocked_users: ['blocker_id', 'blocked_id'], pinned_conversations: ['user_id', 'conversation_id'],
       polls: ['created_by', 'conversation_id'], poll_options: ['poll_id'],
       poll_votes: ['poll_id', 'option_id', 'user_id'], notification_preferences: ['user_id'],
@@ -326,6 +349,10 @@ async function queryDataUncached(userId, payload) {
     for (const column of protectedByTable[table] || []) protectedColumns.add(column);
     if (keys.some((key) => protectedColumns.has(key))) throw new Error('This field cannot be changed.');
     if (MESSAGE_TABLES.has(table) && !messagePayloadAllowed(patch)) throw new Error('Message content is too large.');
+    // UPDATE has no LIMIT in the policy-scoped WHERE; cap the blast radius so
+    // one request cannot rewrite every row the policy happens to allow.
+    const [matched] = await pool.execute(`SELECT COUNT(*) AS total FROM \`${table}\` t WHERE ${whereSql}`, whereArgs);
+    if (Number(matched[0]?.total || 0) > MAX_WRITE_ROWS) throw new Error('Too many rows match this update.');
     const friendRows = table === 'friend_requests' && patch.status === 'accepted'
       ? (await pool.execute(`SELECT sender_id, receiver_id FROM \`${table}\` t WHERE ${whereSql}`, whereArgs))[0]
       : [];
@@ -345,13 +372,16 @@ async function queryDataUncached(userId, payload) {
     // notification_preferences / notification_digest_state) delete directly
     // by the policy-scoped WHERE instead of an id IN (...) list.
     if (!columns.has('id')) {
+      const [matched] = await pool.execute(`SELECT COUNT(*) AS total FROM \`${table}\` t WHERE ${whereSql}`, whereArgs);
+      if (Number(matched[0]?.total || 0) > MAX_WRITE_ROWS) throw new Error('Too many rows match this delete.');
       const before = payload.returning ? await fetchSelection(table, requested, whereSql, whereArgs) : null;
       const [result] = await pool.execute(`DELETE FROM \`${table}\` AS t WHERE ${whereSql}`, whereArgs);
       return { data: before, count: result.affectedRows ?? 0 };
     }
     const realtimeColumns = ['id', 'user_id', 'conversation_id', 'message_id', 'poll_id', 'option_id', 'sender_id', 'receiver_id', 'blocker_id', 'blocked_id', 'group_id']
       .filter((column) => columns.has(column));
-    const [rows] = await pool.execute(`SELECT ${realtimeColumns.map((column) => `t.\`${column}\``).join(', ')} FROM \`${table}\` t WHERE ${whereSql}`, whereArgs);
+    const [rows] = await pool.execute(`SELECT ${realtimeColumns.map((column) => `t.\`${column}\``).join(', ')} FROM \`${table}\` t WHERE ${whereSql} LIMIT ${MAX_WRITE_ROWS + 1}`, whereArgs);
+    if (rows.length > MAX_WRITE_ROWS) throw new Error('Too many rows match this delete.');
     if (!rows.length) return { data: payload.returning ? [] : null, count: 0 };
     const ids = rows.map((row) => row.id);
     const before = payload.returning ? await fetchByIds(table, ids, requested, columns) : null;
@@ -387,6 +417,7 @@ export async function queryData(userId, payload) {
 // clients but must never accept unbounded LONGTEXT payloads.
 const MAX_MESSAGE_CONTENT = 8000;
 const MAX_MESSAGE_MEDIA_META = 65535;
+const MAX_WRITE_ROWS = 200;
 const MESSAGE_TABLES = new Set(['messages', 'global_messages', 'announcement_messages']);
 
 function messagePayloadAllowed(row) {
