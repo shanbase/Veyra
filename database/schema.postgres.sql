@@ -345,7 +345,7 @@ DECLARE
 BEGIN
   FOREACH tbl IN ARRAY ARRAY[
     'auth_users', 'profiles', 'conversations', 'friend_requests', 'messages',
-    'global_messages', 'announcement_messages', 'polls', 'servers',
+    'global_messages', 'announcement_messages', 'polls',
     'notification_preferences', 'native_push_tokens'
   ]
   LOOP
@@ -436,6 +436,10 @@ CREATE TABLE IF NOT EXISTS servers (
   CONSTRAINT fk_servers_owner FOREIGN KEY (owner_id) REFERENCES profiles(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_servers_owner ON servers (owner_id);
+
+DROP TRIGGER IF EXISTS trg_servers_touch_updated_at ON servers;
+CREATE TRIGGER trg_servers_touch_updated_at BEFORE UPDATE ON servers
+  FOR EACH ROW EXECUTE FUNCTION veyra_touch_updated_at();
 
 CREATE TABLE IF NOT EXISTS server_roles (
   id VARCHAR(36) NOT NULL PRIMARY KEY,
