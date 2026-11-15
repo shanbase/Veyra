@@ -17,12 +17,18 @@ import React from "react";
  *  - \\x escapes
  */
 
+interface MentionContext {
+  roles?: Record<string, { name: string; color?: string | null }>;
+  channels?: Record<string, string>;
+}
+
 interface MessageMarkdownProps {
   content: string;
   isOwn?: boolean;
   className?: string;
   /** Lowercased username of the viewer — used to color @mentions red when they target you. */
   myUsername?: string | null;
+  mentionContext?: MentionContext;
 }
 
 
@@ -88,7 +94,7 @@ function Spoiler({ children }: { children: React.ReactNode }) {
 /**
  * Parse inline markdown into React nodes.
  */
-function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?: string | null, depth = 0): InlineNode[] {
+function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?: string | null, mentionContext?: MentionContext, depth = 0): InlineNode[] {
   // Nested wrappers recurse — cap depth so pathological input like
   // ****… can't overflow the stack; beyond the cap render as plain text.
   if (depth > 24) return [text];
@@ -126,17 +132,48 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
       const ch = text[i + 1];
       return { length: 2, node: <React.Fragment key={makeKey(keyPrefix + "-esc", nodeIdx++)}>{ch}</React.Fragment> };
     }
-    // @mention / @everyone — word-boundary aware
+    // Structured server mentions: <@&role_id> and <#channel_id>
+    if (text[i] === "<") {
+      const structured = text.slice(i).match(/^<@&([0-9a-fA-F-]{36})>|^<#([0-9a-fA-F-]{36})>/);
+      if (structured) {
+        const full = structured[0];
+        if (structured[1]) {
+          const role = mentionContext?.roles?.[structured[1]];
+          return {
+            length: full.length,
+            node: (
+              <span
+                key={makeKey(keyPrefix + "-role", nodeIdx++)}
+                className="rounded px-1 font-medium"
+                style={{ backgroundColor: role?.color ? `${role.color}33` : "rgba(88,101,242,0.2)", color: role?.color || "#5865f2" }}
+              >
+                @{role?.name || "role"}
+              </span>
+            ),
+          };
+        }
+        const channelName = mentionContext?.channels?.[structured[2]];
+        return {
+          length: full.length,
+          node: (
+            <span key={makeKey(keyPrefix + "-channel", nodeIdx++)} className="rounded bg-primary/20 px-1 font-medium text-primary">
+              #{channelName || "channel"}
+            </span>
+          ),
+        };
+      }
+    }
+    // @mention / @everyone / @here — word-boundary aware
     if (
       text[i] === "@" &&
       (i === 0 || !/[A-Za-z0-9_]/.test(text[i - 1]))
     ) {
       const rest = text.slice(i + 1);
-      const m = rest.match(/^(everyone|[A-Za-z0-9_]{2,32})(?![A-Za-z0-9_])/);
+      const m = rest.match(/^(everyone|here|[A-Za-z0-9_]{2,32})(?![A-Za-z0-9_])/);
       if (m) {
         const name = m[1];
         const lower = name.toLowerCase();
-        const isEveryone = lower === "everyone";
+        const isEveryone = lower === "everyone" || lower === "here";
         const isMe =
           isEveryone || (!!myUsername && lower === myUsername.toLowerCase());
         const cls = isMe
@@ -184,7 +221,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
           length: end - i + 2,
           node: (
             <Spoiler key={makeKey(keyPrefix + "-spoil", nodeIdx++)}>
-              {parseInline(inner, isOwn, keyPrefix + "-spoilbody-" + nodeIdx, myUsername, depth + 1)}
+              {parseInline(inner, isOwn, keyPrefix + "-spoilbody-" + nodeIdx, myUsername, mentionContext, depth + 1)}
             </Spoiler>
           ),
         };
@@ -200,7 +237,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
             length: full.length,
             node: (
               <React.Fragment key={makeKey(keyPrefix + "-unsafe", nodeIdx++)}>
-                {parseInline(label, isOwn, keyPrefix + "-unsafelbl-" + nodeIdx, myUsername, depth + 1)}
+                {parseInline(label, isOwn, keyPrefix + "-unsafelbl-" + nodeIdx, myUsername, mentionContext, depth + 1)}
               </React.Fragment>
             ),
           };
@@ -209,7 +246,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
           length: full.length,
           node: renderLink(
             url,
-            parseInline(label, isOwn, keyPrefix + "-linklbl-" + nodeIdx, myUsername, depth + 1),
+            parseInline(label, isOwn, keyPrefix + "-linklbl-" + nodeIdx, myUsername, mentionContext, depth + 1),
             isOwn,
             makeKey(keyPrefix + "-link", nodeIdx++)
           ),
@@ -286,7 +323,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
           if (inner.length === 0) continue;
           return {
             length: end + w.close.length - i,
-            node: w.wrap(parseInline(inner, isOwn, keyPrefix + "-wbody-" + nodeIdx, myUsername, depth + 1)),
+            node: w.wrap(parseInline(inner, isOwn, keyPrefix + "-wbody-" + nodeIdx, myUsername, mentionContext, depth + 1)),
           };
         }
       }
@@ -301,7 +338,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
             length: end - i + 1,
             node: (
               <em key={makeKey(keyPrefix + "-iu", nodeIdx++)}>
-                {parseInline(inner, isOwn, keyPrefix + "-iubody-" + nodeIdx, myUsername, depth + 1)}
+                {parseInline(inner, isOwn, keyPrefix + "-iubody-" + nodeIdx, myUsername, mentionContext, depth + 1)}
               </em>
             ),
           };
@@ -452,12 +489,12 @@ function parseBlocks(content: string): Block[] {
   return blocks;
 }
 
-function renderInlineWithBreaks(text: string, isOwn: boolean, keyPrefix: string, myUsername?: string | null): React.ReactNode[] {
+function renderInlineWithBreaks(text: string, isOwn: boolean, keyPrefix: string, myUsername?: string | null, mentionContext?: MentionContext): React.ReactNode[] {
   const lines = text.split("\n");
   const out: React.ReactNode[] = [];
   lines.forEach((ln, idx) => {
     if (idx > 0) out.push(<br key={`${keyPrefix}-br-${idx}`} />);
-    const parsed = parseInline(ln, isOwn, `${keyPrefix}-ln${idx}`, myUsername);
+    const parsed = parseInline(ln, isOwn, `${keyPrefix}-ln${idx}`, myUsername, mentionContext);
     parsed.forEach((n, j) => {
       if (typeof n === "string") out.push(<React.Fragment key={`${keyPrefix}-t${idx}-${j}`}>{n}</React.Fragment>);
       else out.push(n);
@@ -466,7 +503,7 @@ function renderInlineWithBreaks(text: string, isOwn: boolean, keyPrefix: string,
   return out;
 }
 
-export function MessageMarkdown({ content, isOwn = false, className, myUsername }: MessageMarkdownProps) {
+export function MessageMarkdown({ content, isOwn = false, className, myUsername, mentionContext }: MessageMarkdownProps) {
   const blocks = React.useMemo(() => parseBlocks(content), [content]);
 
 
@@ -484,14 +521,14 @@ export function MessageMarkdown({ content, isOwn = false, className, myUsername 
             const Tag = (`h${block.level}` as unknown) as keyof JSX.IntrinsicElements;
             return (
               <Tag key={key} className={sizes[block.level]}>
-                {parseInline(block.text, isOwn, key, myUsername)}
+                {parseInline(block.text, isOwn, key, myUsername, mentionContext)}
               </Tag>
             );
           }
           case "subtext":
             return (
               <p key={key} className="text-xs opacity-70">
-                {parseInline(block.text, isOwn, key, myUsername)}
+                {parseInline(block.text, isOwn, key, myUsername, mentionContext)}
               </p>
             );
           case "quote":
@@ -500,14 +537,14 @@ export function MessageMarkdown({ content, isOwn = false, className, myUsername 
                 key={key}
                 className="border-l-2 border-current/40 pl-2 opacity-90 break-words [overflow-wrap:anywhere]"
               >
-                {renderInlineWithBreaks(block.lines.join("\n"), isOwn, key, myUsername)}
+                {renderInlineWithBreaks(block.lines.join("\n"), isOwn, key, myUsername, mentionContext)}
               </blockquote>
             );
           case "ul":
             return (
               <ul key={key} className="list-disc list-inside space-y-0.5">
                 {block.items.map((item, j) => (
-                  <li key={`${key}-li-${j}`}>{parseInline(item, isOwn, `${key}-li-${j}`, myUsername)}</li>
+                  <li key={`${key}-li-${j}`}>{parseInline(item, isOwn, `${key}-li-${j}`, myUsername, mentionContext)}</li>
                 ))}
               </ul>
             );
@@ -515,7 +552,7 @@ export function MessageMarkdown({ content, isOwn = false, className, myUsername 
             return (
               <ol key={key} className="list-decimal list-inside space-y-0.5">
                 {block.items.map((item, j) => (
-                  <li key={`${key}-li-${j}`}>{parseInline(item, isOwn, `${key}-li-${j}`, myUsername)}</li>
+                  <li key={`${key}-li-${j}`}>{parseInline(item, isOwn, `${key}-li-${j}`, myUsername, mentionContext)}</li>
                 ))}
               </ol>
             );
@@ -538,7 +575,7 @@ export function MessageMarkdown({ content, isOwn = false, className, myUsername 
             if (text.trim() === "") return null;
             return (
               <p key={key} className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
-                {renderInlineWithBreaks(text, isOwn, key, myUsername)}
+                {renderInlineWithBreaks(text, isOwn, key, myUsername, mentionContext)}
               </p>
             );
           }

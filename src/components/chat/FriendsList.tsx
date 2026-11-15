@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
 import { useUserRole } from "@/hooks/useUserRole";
@@ -7,11 +7,6 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -22,49 +17,77 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { toast } from "@/hooks/use-toast";
-import { UserPlus, Check, X, Settings, Globe, Megaphone, MoreVertical, UserMinus, Loader2, Shield, ShieldAlert, Pin, PinOff, Users, Plus, BellOff, Bell } from "lucide-react";
-import { Separator } from "@/components/ui/separator";
+import {
+  BellOff,
+  Check,
+  Globe,
+  Loader2,
+  Megaphone,
+  MoreVertical,
+  Pin,
+  Plus,
+  Settings,
+  Shield,
+  ShieldAlert,
+  UserMinus,
+  UserPlus,
+  UserX,
+  Users,
+  X,
+} from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { Badge } from "@/components/ui/badge";
 import { UserProfileDialog } from "@/components/profile/UserProfileDialog";
 import { markAnnouncementsRead } from "@/lib/announcements";
-import { getCachedDmList, setCachedDmList } from "@/lib/chatCache";
 import { isStatusActive } from "@/lib/customStatus";
 import { CreateGroupDialog } from "@/components/chat/CreateGroupDialog";
 import { GroupAvatar, type GroupAvatarMember } from "@/components/chat/GroupAvatar";
 
-interface Profile {
+type FriendTab = "online" | "all" | "pending" | "blocked" | "add";
+
+interface ProfileLike {
   id: string;
   username: string;
   display_name: string | null;
   avatar_url: string | null;
-  status: string | null;
+  status?: string | null;
   custom_status_text?: string | null;
   custom_status_emoji?: string | null;
   custom_status_expires_at?: string | null;
-  global_muted?: boolean | null;
 }
 
-interface FriendRequest {
+interface Friend extends ProfileLike {
+  friendship_id: string;
+  conversation_id: string | null;
+  unread_count: number;
+  last_message_at: string | null;
+  last_message_preview: string | null;
+  is_pinned: boolean;
+  muted: boolean;
+}
+
+interface FriendRequestRow {
   id: string;
+  direction: "incoming" | "outgoing";
   sender_id: string;
   receiver_id: string;
-  status: string;
-  sender?: Profile;
-  receiver?: Profile;
+  other_user_id: string;
+  other_username: string;
+  other_display_name: string | null;
+  other_avatar_url: string | null;
+  other_status: string | null;
+  other_custom_status_text: string | null;
+  other_custom_status_emoji: string | null;
+  other_custom_status_expires_at: string | null;
 }
 
-interface Conversation {
-  id: string;
-  is_group: boolean;
-  other_user?: Profile;
-  unread_count?: number;
-  friend_request_id?: string;
-  last_message_at?: string;
-  is_pinned?: boolean;
-  muted?: boolean;
-}
+type BlockedUser = ProfileLike;
 
 interface GroupEntry {
   id: string;
@@ -83,944 +106,505 @@ interface FriendsListProps {
   selectedConversationId: string | null;
 }
 
+const TABS: { id: FriendTab; label: string }[] = [
+  { id: "online", label: "Online" },
+  { id: "all", label: "All" },
+  { id: "pending", label: "Pending" },
+  { id: "blocked", label: "Blocked" },
+  { id: "add", label: "Add Friend" },
+];
+
 export function FriendsList({ onSelectConversation, selectedConversationId }: FriendsListProps) {
-  const { user, signOut } = useAuth();
+  const { user } = useAuth();
   const { isAdmin, isSuperAdmin } = useUserRole();
   const navigate = useNavigate();
   const { onlineUsers } = useGlobalPresence();
-  const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([]);
-  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [tab, setTab] = useState<FriendTab>("online");
+  const [friends, setFriends] = useState<Friend[]>([]);
+  const [requests, setRequests] = useState<FriendRequestRow[]>([]);
+  const [blocked, setBlocked] = useState<BlockedUser[]>([]);
   const [groups, setGroups] = useState<GroupEntry[]>([]);
-  const sidebarRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [myProfile, setMyProfile] = useState<ProfileLike | null>(null);
   const [searchUsername, setSearchUsername] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [showUnfriendDialog, setShowUnfriendDialog] = useState<Conversation | null>(null);
-  const [unfriending, setUnfriending] = useState(false);
-  const [unreadAnnouncementCount, setUnreadAnnouncementCount] = useState(0);
-  const [myProfile, setMyProfile] = useState<Profile | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [unfriendTarget, setUnfriendTarget] = useState<Friend | null>(null);
   const [profileOpenUserId, setProfileOpenUserId] = useState<string | null>(null);
   const [showCreateGroup, setShowCreateGroup] = useState(false);
+  const [unreadAnnouncementCount, setUnreadAnnouncementCount] = useState(0);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const refreshSocial = async () => {
+    if (!user) return;
+    const [friendResult, requestResult, blockedResult, groupResult] = await Promise.allSettled([
+      supabase.rpc("get_friends"),
+      supabase.rpc("get_friend_requests"),
+      supabase.rpc("get_blocked_users"),
+      supabase.rpc("get_user_group_list"),
+    ]);
+    if (friendResult.status === "fulfilled" && !friendResult.value.error) {
+      setFriends((friendResult.value.data || []) as Friend[]);
+    }
+    if (requestResult.status === "fulfilled" && !requestResult.value.error) {
+      setRequests((requestResult.value.data || []) as FriendRequestRow[]);
+    }
+    if (blockedResult.status === "fulfilled" && !blockedResult.value.error) {
+      setBlocked((blockedResult.value.data || []) as BlockedUser[]);
+    }
+    if (groupResult.status === "fulfilled" && !groupResult.value.error) {
+      setGroups(((groupResult.value.data || []) as any[]).map((row) => ({
+        id: row.conversation_id,
+        name: row.name ?? null,
+        member_count: Number(row.member_count ?? 0),
+        my_role: row.my_role,
+        unread_count: Number(row.unread_count ?? 0),
+        last_message_at: row.last_message_at ?? null,
+        is_pinned: !!row.is_pinned,
+        muted: !!row.muted,
+        member_previews: Array.isArray(row.member_previews) ? row.member_previews : [],
+      })));
+    }
+  };
+
+  const scheduleRefresh = () => {
+    if (refreshTimerRef.current) return;
+    refreshTimerRef.current = setTimeout(() => {
+      refreshTimerRef.current = null;
+      void refreshSocial();
+    }, 150);
+  };
 
   useEffect(() => {
     if (!user) return;
+    void refreshSocial();
     supabase
       .from("profiles")
       .select("id, username, display_name, avatar_url, status, custom_status_text, custom_status_emoji, custom_status_expires_at, global_muted")
       .eq("id", user.id)
       .maybeSingle()
-      .then(({ data }) => {
-        if (data) setMyProfile(data as Profile);
-      });
-  }, [user]);
+      .then(({ data }) => data && setMyProfile(data as ProfileLike));
 
-  useEffect(() => {
-    const onStatus = (e: Event) => {
-      const d = (e as CustomEvent).detail;
-      if (!d || !user || d.userId !== user.id) return;
-      setMyProfile((p) =>
-        p
-          ? {
-              ...p,
-              custom_status_text: d.custom_status_text,
-              custom_status_emoji: d.custom_status_emoji,
-              custom_status_expires_at: d.custom_status_expires_at,
-            }
-          : p,
-      );
+    const social = supabase
+      .channel(`social-sidebar:${user.id}`)
+      .on("postgres_changes", { event: "*", schema: "public", table: "friend_requests" }, scheduleRefresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "blocked_users" }, scheduleRefresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "messages" }, scheduleRefresh)
+      .on("postgres_changes", { event: "*", schema: "public", table: "conversation_members" }, scheduleRefresh)
+      .subscribe();
+    return () => {
+      if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+      supabase.removeChannel(social);
     };
-    window.addEventListener("custom-status-updated", onStatus);
-    return () => window.removeEventListener("custom-status-updated", onStatus);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
-
-
-  const fetchUnreadAnnouncements = async () => {
-    if (!user) return;
-
-    // Read last-read timestamp from the user's profile (syncs across devices)
-    const { data: profile } = await supabase
-      .from("profiles")
-      .select("announcements_last_read_at")
-      .eq("id", user.id)
-      .maybeSingle();
-
-    const lastRead = profile?.announcements_last_read_at;
-
-    let query = supabase
-      .from("announcement_messages")
-      .select("*", { count: "exact", head: true });
-
-    if (lastRead) {
-      query = query.gt("created_at", lastRead);
-    }
-
-    const { count } = await query;
-    setUnreadAnnouncementCount(count || 0);
-  };
-
-  const fetchGroups = async () => {
-    if (!user) return;
-    const { data, error } = await supabase.rpc("get_user_group_list");
-    if (error) {
-      console.error("Error fetching groups:", error);
-      return;
-    }
-    const mapped: GroupEntry[] = (data || []).map((row: any) => ({
-      id: row.conversation_id,
-      name: row.name ?? null,
-      member_count: Number(row.member_count ?? 0),
-      my_role: row.my_role,
-      unread_count: Number(row.unread_count ?? 0),
-      last_message_at: row.last_message_at ?? null,
-      is_pinned: !!row.is_pinned,
-      muted: !!row.muted,
-      member_previews: Array.isArray(row.member_previews) ? row.member_previews : [],
-    }));
-    setGroups(mapped);
-  };
-
   useEffect(() => {
-    if (user) {
-      // Hydrate from cache instantly so the sidebar renders without waiting
-      // on the network, then refresh in the background.
-      const cached = getCachedDmList<Conversation>(user.id);
-      if (cached && cached.length > 0) setConversations(cached);
-      fetchFriendRequests();
-      fetchConversations();
-      fetchGroups();
-      fetchUnreadAnnouncements();
-    }
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent).detail || {};
+      const removedUserId = detail.otherUserId as string | undefined;
+      if (removedUserId) {
+        setFriends((prev) => prev.filter((friend) => friend.id !== removedUserId));
+      }
+      void refreshSocial();
+    };
+    window.addEventListener("friend-removed", handler);
+    return () => window.removeEventListener("friend-removed", handler);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user]);
 
-  // Keep the cached DM list in sync with any local mutations (pin toggles,
-  // unfriend, unread updates from realtime, etc.).
   useEffect(() => {
     if (!user) return;
-    const h = setTimeout(() => setCachedDmList(user.id, conversations), 300);
-    return () => clearTimeout(h);
-  }, [user, conversations]);
-
-  // Subscribe to new announcements
-  useEffect(() => {
-    if (!user) return;
-
+    const loadAnnouncements = async () => {
+      const { data: profile } = await supabase
+        .from("profiles")
+        .select("announcements_last_read_at")
+        .eq("id", user.id)
+        .maybeSingle();
+      let query = supabase.from("announcement_messages").select("*", { count: "exact", head: true });
+      if (profile?.announcements_last_read_at) query = query.gt("created_at", profile.announcements_last_read_at);
+      const { count } = await query;
+      setUnreadAnnouncementCount(count || 0);
+    };
+    void loadAnnouncements();
     const channel = supabase
       .channel("announcements-unread")
-      .on(
-        "postgres_changes",
-        {
-          event: "INSERT",
-          schema: "public",
-          table: "announcement_messages",
-        },
-        () => {
-          fetchUnreadAnnouncements();
-        }
-      )
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "announcement_messages" }, () => void loadAnnouncements())
       .subscribe();
-
+    const readHandler = () => setUnreadAnnouncementCount(0);
+    window.addEventListener("announcements-read", readHandler);
     return () => {
       supabase.removeChannel(channel);
+      window.removeEventListener("announcements-read", readHandler);
     };
   }, [user]);
 
-  // Clear announcement badge when read from another component (e.g. ChatView)
-  useEffect(() => {
-    const handler = () => setUnreadAnnouncementCount(0);
-    window.addEventListener("announcements-read", handler);
-    return () => window.removeEventListener("announcements-read", handler);
-  }, []);
+  const visibleFriends = useMemo(() => {
+    if (tab === "online") return friends.filter((friend) => onlineUsers.has(friend.id));
+    return friends;
+  }, [friends, onlineUsers, tab]);
 
-  const fetchFriendRequests = async () => {
-    if (!user) return;
+  const isOnline = (userId: string) => onlineUsers.has(userId);
+  const displayName = (profile: ProfileLike | null | undefined) => profile?.display_name || profile?.username || "Unknown";
 
-    const { data, error } = await supabase
-      .from("friend_requests")
-      .select("*")
-      .eq("status", "pending")
-      .eq("receiver_id", user.id);
-
-    if (error) {
-      console.error("Error fetching friend requests:", error);
+  const openFriend = async (friend: Friend) => {
+    if (friend.conversation_id) {
+      onSelectConversation(friend.conversation_id);
       return;
     }
-
-    // One batched profile lookup instead of a query per request.
-    const senderIds = [...new Set((data || []).map((request) => request.sender_id))];
-    const { data: senderProfiles } = senderIds.length
-      ? await supabase.from("profiles").select("*").in("id", senderIds)
-      : { data: [] };
-    const senderById = new Map((senderProfiles || []).map((profile: any) => [profile.id, profile]));
-    const requestsWithProfiles = (data || []).map((request) => ({
-      ...request,
-      sender: senderById.get(request.sender_id) ?? null,
-    }));
-
-    setFriendRequests(requestsWithProfiles);
-  };
-
-  const fetchFriendRequestsRef = useRef(fetchFriendRequests);
-  fetchFriendRequestsRef.current = fetchFriendRequests;
-
-  // Live friend-request updates. The server only sends friend_requests
-  // events to the request's sender and receiver, so no client filter is
-  // needed — any event here concerns this user.
-  useEffect(() => {
-    if (!user) return;
-    const channel = supabase
-      .channel(`friend-requests:${user.id}`)
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "friend_requests" },
-        () => {
-          void fetchFriendRequestsRef.current();
-        }
-      )
-      .subscribe();
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [user]);
-
-  const fetchConversations = async () => {
-    if (!user) return;
-
-    const { data, error } = await supabase.rpc("get_user_dm_list");
-    if (error) {
-      console.error("Error fetching conversations:", error);
-      return;
-    }
-
-    const mapped: Conversation[] = (data || []).map((row: any) => ({
-      id: row.conversation_id,
-      is_group: false,
-      unread_count: Number(row.unread_count ?? 0),
-      last_message_at: row.last_message_at,
-      friend_request_id: row.friend_request_id ?? undefined,
-      is_pinned: !!row.is_pinned,
-      muted: !!row.muted,
-      other_user: row.other_user_id
-        ? {
-            id: row.other_user_id,
-            username: row.other_username,
-            display_name: row.other_display_name,
-            avatar_url: row.other_avatar_url,
-            status: row.other_status,
-            custom_status_text: row.other_custom_status_text ?? null,
-            custom_status_emoji: row.other_custom_status_emoji ?? null,
-            custom_status_expires_at: row.other_custom_status_expires_at ?? null,
-          }
-        : undefined,
-    }));
-
-    setConversations(mapped);
-    if (user) setCachedDmList(user.id, mapped);
-  };
-
-  const togglePin = async (conv: Conversation) => {
-    if (!user) return;
-    // optimistic update
-    setConversations((prev) => {
-      const updated = prev.map((c) => (c.id === conv.id ? { ...c, is_pinned: !c.is_pinned } : c));
-      return [...updated].sort((a, b) => {
-        if (!!b.is_pinned !== !!a.is_pinned) return b.is_pinned ? 1 : -1;
-        const ta = a.last_message_at ? new Date(a.last_message_at).getTime() : 0;
-        const tb = b.last_message_at ? new Date(b.last_message_at).getTime() : 0;
-        return tb - ta;
-      });
-    });
-    if (conv.is_pinned) {
-      const { error } = await supabase
-        .from("pinned_conversations")
-        .delete()
-        .eq("user_id", user.id)
-        .eq("conversation_id", conv.id);
-      if (error) toast({ title: "Error", description: error.message, variant: "destructive" });
-    } else {
-      const { error } = await supabase
-        .from("pinned_conversations")
-        .insert({ user_id: user.id, conversation_id: conv.id });
-      if (error) toast({ title: "Error", description: error.message, variant: "destructive" });
-    }
-  };
-
-  const toggleMute = async (convId: string, currentlyMuted: boolean) => {
-    if (!user) return;
-    const next = !currentlyMuted;
-    setConversations((prev) => prev.map((c) => (c.id === convId ? { ...c, muted: next } : c)));
-    setGroups((prev) => prev.map((g) => (g.id === convId ? { ...g, muted: next } : g)));
-    const { error } = await supabase
-      .from("conversation_members")
-      .update({ muted: next })
-      .eq("conversation_id", convId)
-      .eq("user_id", user.id);
-    if (error) {
-      setConversations((prev) => prev.map((c) => (c.id === convId ? { ...c, muted: currentlyMuted } : c)));
-      setGroups((prev) => prev.map((g) => (g.id === convId ? { ...g, muted: currentlyMuted } : g)));
+    setBusyId(friend.id);
+    try {
+      const { data, error } = await supabase.rpc("get_or_create_dm", { _other_user_id: friend.id });
+      if (error) throw error;
+      const conversationId = data as unknown as string;
+      await refreshSocial();
+      onSelectConversation(conversationId);
+    } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const sendRequest = async () => {
+    const username = searchUsername.trim();
+    if (!user || !username) return;
+    setBusyId("add-friend");
+    try {
+      const { data, error } = await supabase.rpc("send_friend_request", { _username: username });
+      if (error) throw error;
+      const status = (data as any)?.status;
+      toast({
+        title: status === "already_friends" ? "You're already friends" : status?.startsWith("pending") ? "Request already pending" : "Friend request sent!",
+      });
+      setSearchUsername("");
+      await refreshSocial();
+    } catch (error: any) {
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const respondRequest = async (request: FriendRequestRow, accept: boolean) => {
+    setBusyId(request.id);
+    try {
+      const { error } = await supabase.rpc("respond_friend_request", { _friendship_id: request.id, _accept: accept });
+      if (error) throw error;
+      toast({ title: accept ? "Friend added!" : "Request declined" });
+      await refreshSocial();
+    } catch (error: any) {
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const cancelRequest = async (request: FriendRequestRow) => {
+    setBusyId(request.id);
+    try {
+      const { error } = await supabase.rpc("cancel_friend_request", { _friendship_id: request.id });
+      if (error) throw error;
+      await refreshSocial();
+    } catch (error: any) {
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    } finally {
+      setBusyId(null);
     }
   };
 
   const unfriend = async () => {
-    if (!showUnfriendDialog || !user) return;
-    setUnfriending(true);
-
+    if (!unfriendTarget) return;
+    setBusyId(unfriendTarget.id);
     try {
-      // Find and delete the friend request
-      const otherId = showUnfriendDialog.other_user?.id;
-      if (otherId) {
-        const { error } = await supabase
-          .from("friend_requests")
-          .delete()
-          .or(`and(sender_id.eq.${user.id},receiver_id.eq.${otherId}),and(sender_id.eq.${otherId},receiver_id.eq.${user.id})`);
-
-        if (error) throw error;
-      }
-
-      // Remove from conversations
-      await supabase
-        .from("conversation_members")
-        .delete()
-        .eq("conversation_id", showUnfriendDialog.id)
-        .eq("user_id", user.id);
-
-      toast({ title: "Unfriended successfully" });
-      setConversations((prev) =>
-        prev.filter(
-          (conv) => conv.id !== showUnfriendDialog.id && conv.other_user?.id !== otherId,
-        ),
-      );
-      window.dispatchEvent(
-        new CustomEvent("friend-removed", {
-          detail: {
-            otherUserId: showUnfriendDialog.other_user?.id,
-            conversationId: showUnfriendDialog.id,
-          },
-        }),
-      );
-      setShowUnfriendDialog(null);
-    } catch (error: any) {
-      toast({ title: "Error", description: error.message, variant: "destructive" });
-    } finally {
-      setUnfriending(false);
-    }
-  };
-
-  // Subscribe to message changes to update unread counts (DMs + groups)
-  useEffect(() => {
-    if (!user) return;
-
-    const channel = supabase
-      .channel("unread-messages")
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "messages",
-        },
-        (payload) => {
-          const change = payload as unknown as {
-            refresh?: boolean;
-            eventType?: string;
-            actor_id?: string;
-            columns?: string[];
-          };
-          if (change.refresh && change.eventType === 'UPDATE') {
-            if (!change.columns?.includes('read_at') || change.actor_id !== user.id) return;
-          }
-          if (!sidebarRefreshTimerRef.current) {
-            sidebarRefreshTimerRef.current = setTimeout(() => {
-              sidebarRefreshTimerRef.current = null;
-              fetchConversations();
-              fetchGroups();
-            }, 100);
-          }
-        }
-      )
-      .subscribe();
-
-    return () => {
-      if (sidebarRefreshTimerRef.current) clearTimeout(sidebarRefreshTimerRef.current);
-      sidebarRefreshTimerRef.current = null;
-      supabase.removeChannel(channel);
-    };
-  }, [user]);
-
-  // Live-refresh groups AND the DM list when membership changes — accepting
-  // a friend request inserts conversation_members rows for the new DM, so
-  // without this the conversation only appears after a full reload.
-  useEffect(() => {
-    if (!user) return;
-    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
-    const refresh = () => {
-      if (refreshTimer) return;
-      refreshTimer = setTimeout(() => {
-        refreshTimer = null;
-        void fetchConversations();
-        void fetchGroups();
-      }, 150);
-    };
-    const ch = supabase
-      .channel("group-membership-sidebar")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "conversation_members" },
-        refresh,
-      )
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "conversations" },
-        refresh,
-      )
-      .subscribe();
-    return () => {
-      if (refreshTimer) clearTimeout(refreshTimer);
-      supabase.removeChannel(ch);
-    };
-  }, [user]);
-
-  // Refresh when a friend is removed elsewhere (e.g. UserProfileDialog)
-  useEffect(() => {
-    let refreshTimer: number | null = null;
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent).detail || {};
-      const removedConvId = detail.conversationId as string | null | undefined;
-      const removedUserId = detail.otherUserId as string | null | undefined;
-      setConversations((prev) =>
-        prev.filter(
-          (conv) =>
-            (!removedConvId || conv.id !== removedConvId) &&
-            (!removedUserId || conv.other_user?.id !== removedUserId),
-        ),
-      );
-      fetchFriendRequests();
-      if (refreshTimer) window.clearTimeout(refreshTimer);
-      refreshTimer = window.setTimeout(fetchConversations, 1000);
-    };
-    window.addEventListener("friend-removed", handler);
-    return () => {
-      window.removeEventListener("friend-removed", handler);
-      if (refreshTimer) window.clearTimeout(refreshTimer);
-    };
-  }, []);
-
-  const sendFriendRequest = async () => {
-    if (!user || !searchUsername.trim()) return;
-    setLoading(true);
-
-    try {
-      const { data: targetUser, error: findError } = await supabase
-        .from("profiles")
-        .select("*")
-        .eq("username", searchUsername.trim())
-        .single();
-
-      if (findError || !targetUser) {
-        toast({ title: "User not found", variant: "destructive" });
-        return;
-      }
-
-      if (targetUser.id === user.id) {
-        toast({ title: "You can't add yourself", variant: "destructive" });
-        return;
-      }
-
-      const { data: existingRequest } = await supabase
-        .from("friend_requests")
-        .select("*")
-        .or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`)
-        .or(`sender_id.eq.${targetUser.id},receiver_id.eq.${targetUser.id}`);
-
-      // Only block if there's a pending or accepted relationship — a
-      // previously rejected/cancelled row shouldn't prevent re-adding.
-      const blocking = existingRequest?.find(
-        (r) =>
-          ((r.sender_id === user.id && r.receiver_id === targetUser.id) ||
-            (r.sender_id === targetUser.id && r.receiver_id === user.id)) &&
-          (r.status === "pending" || r.status === "accepted"),
-      );
-
-      if (blocking) {
-        toast({
-          title: blocking.status === "accepted"
-            ? "You're already friends"
-            : "Friend request already pending",
-          variant: "destructive",
-        });
-        return;
-      }
-
-      // Clear any stale reverse-direction row so the unique constraint
-      // can't block a fresh request after a prior rejection / unfriend.
-      await supabase
-        .from("friend_requests")
-        .delete()
-        .eq("sender_id", targetUser.id)
-        .eq("receiver_id", user.id);
-
-      const { error } = await supabase
-        .from("friend_requests")
-        .upsert(
-          { sender_id: user.id, receiver_id: targetUser.id, status: "pending" },
-          { onConflict: "sender_id,receiver_id" },
-        );
-
+      const { data, error } = await supabase.rpc("unfriend", { _friendship_id: unfriendTarget.friendship_id });
       if (error) throw error;
-
-      toast({ title: "Friend request sent!" });
-      setSearchUsername("");
+      const result = data as any;
+      window.dispatchEvent(new CustomEvent("friend-removed", {
+        detail: { otherUserId: result?.other_user_id || unfriendTarget.id, conversationId: result?.conversation_id || unfriendTarget.conversation_id },
+      }));
+      toast({ title: "Unfriended" });
+      setUnfriendTarget(null);
+      await refreshSocial();
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
     } finally {
-      setLoading(false);
+      setBusyId(null);
     }
   };
 
-  const handleFriendRequest = async (requestId: string, accept: boolean) => {
-    const { error } = await supabase
-      .from("friend_requests")
-      .update({ status: accept ? "accepted" : "rejected" })
-      .eq("id", requestId);
-
-    if (error) {
+  const blockUser = async (target: ProfileLike) => {
+    setBusyId(target.id);
+    try {
+      const { data, error } = await supabase.rpc("block_user", { _other_id: target.id });
+      if (error) throw error;
+      window.dispatchEvent(new CustomEvent("friend-removed", { detail: { otherUserId: target.id, conversationId: (data as any)?.conversation_id || null } }));
+      window.dispatchEvent(new CustomEvent("user-blocked", { detail: { userId: target.id } }));
+      toast({ title: "User blocked" });
+      await refreshSocial();
+    } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
-      return;
-    }
-
-    toast({ title: accept ? "Friend added!" : "Request declined" });
-    fetchFriendRequests();
-    if (accept) {
-      setTimeout(fetchConversations, 500);
+    } finally {
+      setBusyId(null);
     }
   };
 
-  const isUserOnline = (userId: string) => onlineUsers.has(userId);
+  const unblockUser = async (target: BlockedUser) => {
+    setBusyId(target.id);
+    try {
+      const { error } = await supabase.rpc("unblock_user", { _other_id: target.id });
+      if (error) throw error;
+      window.dispatchEvent(new CustomEvent("user-unblocked", { detail: { userId: target.id } }));
+      await refreshSocial();
+    } catch (error: any) {
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const friendRow = (friend: Friend) => {
+    const online = isOnline(friend.id);
+    return (
+      <div
+        key={friend.id}
+        className={`flex items-center gap-3 p-2 rounded-lg transition-colors ${
+          friend.conversation_id === selectedConversationId ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"
+        }`}
+      >
+        <button type="button" onClick={() => void openFriend(friend)} className="flex items-center gap-3 flex-1 min-w-0 text-left">
+          <div className="relative flex-shrink-0">
+            <Avatar className="h-10 w-10">
+              <AvatarImage src={friend.avatar_url || undefined} />
+              <AvatarFallback>{friend.username?.[0]?.toUpperCase() || "?"}</AvatarFallback>
+            </Avatar>
+            <span className={`absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-sidebar ${online ? "bg-green-500" : "bg-muted-foreground"}`} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <p className="font-medium text-sidebar-foreground truncate">{displayName(friend)}</p>
+              {friend.is_pinned && <Pin className="h-3 w-3 text-muted-foreground flex-shrink-0" />}
+              {friend.muted && <BellOff className="h-3 w-3 text-muted-foreground flex-shrink-0" />}
+            </div>
+            <p className="text-xs text-muted-foreground truncate">
+              {online ? "Online" : friend.last_message_preview || "Offline"}
+            </p>
+          </div>
+        </button>
+        {friend.unread_count > 0 && (
+          <Badge variant="default" className="h-5 min-w-5 flex items-center justify-center rounded-full px-1.5 text-xs flex-shrink-0">
+            {friend.unread_count > 99 ? "99+" : friend.unread_count}
+          </Badge>
+        )}
+        <Popover>
+          <PopoverTrigger asChild>
+            <Button size="icon" variant="ghost" className="h-8 w-8" onClick={(event) => event.stopPropagation()}>
+              <MoreVertical className="h-4 w-4" />
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent className="w-56 p-2" align="end">
+            <Button variant="outline" className="w-full justify-start mb-2" onClick={() => setProfileOpenUserId(friend.id)}>View profile</Button>
+            <Button variant="outline" className="w-full justify-start mb-2" onClick={() => void openFriend(friend)}>Message</Button>
+            <Button variant="outline" className="w-full justify-start mb-2" onClick={() => void blockUser(friend)}>Block</Button>
+            <Button variant="destructive" className="w-full justify-start" onClick={() => setUnfriendTarget(friend)}>
+              <UserMinus className="h-4 w-4 mr-2" /> Unfriend
+            </Button>
+          </PopoverContent>
+        </Popover>
+      </div>
+    );
+  };
+
+  const requestRow = (request: FriendRequestRow) => (
+    <div key={request.id} className="flex items-center gap-3 p-2 rounded-lg bg-sidebar-accent/60">
+      <button type="button" onClick={() => setProfileOpenUserId(request.other_user_id)} className="flex items-center gap-3 flex-1 min-w-0 text-left">
+        <Avatar className="h-10 w-10">
+          <AvatarImage src={request.other_avatar_url || undefined} />
+          <AvatarFallback>{request.other_username?.[0]?.toUpperCase() || "?"}</AvatarFallback>
+        </Avatar>
+        <div className="min-w-0">
+          <p className="font-medium text-sidebar-foreground truncate">{request.other_display_name || request.other_username}</p>
+          <p className="text-xs text-muted-foreground">{request.direction === "incoming" ? "Incoming request" : "Outgoing request"}</p>
+        </div>
+      </button>
+      {request.direction === "incoming" ? (
+        <div className="flex gap-1">
+          <Button size="icon" variant="ghost" className="h-8 w-8" disabled={busyId === request.id} onClick={() => void respondRequest(request, true)} aria-label="Accept friend request">
+            <Check className="h-4 w-4 text-green-500" />
+          </Button>
+          <Button size="icon" variant="ghost" className="h-8 w-8" disabled={busyId === request.id} onClick={() => void respondRequest(request, false)} aria-label="Decline friend request">
+            <X className="h-4 w-4 text-destructive" />
+          </Button>
+        </div>
+      ) : (
+        <Button size="sm" variant="ghost" disabled={busyId === request.id} onClick={() => void cancelRequest(request)}>Cancel</Button>
+      )}
+    </div>
+  );
 
   return (
     <div className="flex flex-col h-full bg-transparent">
-      <div className="p-4">
-        <h2 className="text-lg font-semibold text-sidebar-foreground mb-3">Veyra</h2>
-        <div className="flex gap-2">
-          <Input
-            placeholder="Add friend by username"
-            value={searchUsername}
-            onChange={(e) => setSearchUsername(e.target.value)}
-            className="text-sm"
-            onKeyDown={(e) => e.key === "Enter" && sendFriendRequest()}
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
-            name="friend-search"
-            id="friend-search"
-            data-lpignore="true"
-            data-form-type="other"
-          />
-          <Button size="icon" onClick={sendFriendRequest} disabled={loading} aria-label="Send friend request">
-            <UserPlus className="h-4 w-4" />
+      <div className="px-4 pt-4 pb-2">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-lg font-semibold text-sidebar-foreground">Veyra</h2>
+          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => navigate("/settings")} aria-label="Settings">
+            <Settings className="h-4 w-4" />
           </Button>
         </div>
-      </div>
-
-      {friendRequests.length > 0 && (
-        <div className="p-4">
-          <h3 className="text-sm font-medium text-sidebar-foreground mb-2">
-            Friend Requests ({friendRequests.length})
-          </h3>
-          <div className="space-y-2">
-            {friendRequests.map((request) => (
-              <div
-                key={request.id}
-                className="flex items-center justify-between p-2 rounded-lg bg-sidebar-accent"
-              >
-                <div className="flex items-center gap-2">
-                  <div className="relative">
-                    <Avatar className="h-8 w-8">
-                      <AvatarImage src={request.sender?.avatar_url || undefined} />
-                      <AvatarFallback>
-                        {request.sender?.username?.[0]?.toUpperCase() || "?"}
-                      </AvatarFallback>
-                    </Avatar>
-                    {request.sender && isUserOnline(request.sender.id) && (
-                      <span className="absolute bottom-0 right-0 h-2.5 w-2.5 rounded-full bg-green-500 border-2 border-sidebar-accent" />
-                    )}
-                  </div>
-                  <span className="text-sm text-sidebar-accent-foreground">
-                    {request.sender?.display_name || request.sender?.username}
-                  </span>
-                </div>
-                <div className="flex gap-1">
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="h-7 w-7"
-                    onClick={() => handleFriendRequest(request.id, true)}
-                    aria-label="Accept friend request"
-                  >
-                    <Check className="h-4 w-4 text-green-500" />
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="h-7 w-7"
-                    onClick={() => handleFriendRequest(request.id, false)}
-                    aria-label="Decline friend request"
-                  >
-                    <X className="h-4 w-4 text-destructive" />
-                  </Button>
-                </div>
-              </div>
-            ))}
-          </div>
+        <div className="flex gap-1 overflow-x-auto pb-1">
+          {TABS.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setTab(item.id)}
+              className={`px-3 py-1.5 rounded-md text-sm whitespace-nowrap transition-colors ${
+                tab === item.id ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium" : "text-muted-foreground hover:bg-sidebar-accent/50"
+              }`}
+            >
+              {item.label}
+              {item.id === "pending" && requests.length > 0 ? ` (${requests.length})` : ""}
+            </button>
+          ))}
         </div>
-      )}
+      </div>
 
-      {/* Announcements & Global Chat Buttons */}
       <div className="px-4 py-2 space-y-2">
-        <Button
-          variant="outline"
-          className="w-full justify-between"
-          onClick={() => {
-            if (user?.id) {
-              setUnreadAnnouncementCount(0);
-              void markAnnouncementsRead(user.id).catch((error) =>
-                console.error("Error marking announcements as read:", error),
-              );
-            }
-            navigate("/announcements");
-          }}
-        >
-          <span className="flex items-center gap-2">
-            <Megaphone className="h-4 w-4" />
-            Announcements
-          </span>
-          {unreadAnnouncementCount > 0 && (
-            <Badge variant="default" className="h-5 min-w-5 flex items-center justify-center rounded-full px-1.5 text-xs">
-              {unreadAnnouncementCount > 99 ? "99+" : unreadAnnouncementCount}
-            </Badge>
-          )}
+        <Button variant="outline" className="w-full justify-between" onClick={() => { setUnreadAnnouncementCount(0); if (user?.id) void markAnnouncementsRead(user.id).catch(() => {}); navigate("/announcements"); }}>
+          <span className="flex items-center gap-2"><Megaphone className="h-4 w-4" /> Announcements</span>
+          {unreadAnnouncementCount > 0 && <Badge className="h-5 min-w-5 rounded-full px-1.5 text-xs">{unreadAnnouncementCount > 99 ? "99+" : unreadAnnouncementCount}</Badge>}
         </Button>
-        <Separator className="my-2" />
-        <Button
-          variant="outline"
-          className="w-full justify-between"
-          onClick={() => navigate("/global-chat")}
-        >
-          <span className="flex items-center gap-2">
-            <Globe className="h-4 w-4" />
-            Global Chat
-          </span>
-          {myProfile?.global_muted && (
-            <BellOff className="h-4 w-4 text-muted-foreground" />
-          )}
+        <Button variant="outline" className="w-full justify-between" onClick={() => navigate("/global-chat")}>
+          <span className="flex items-center gap-2"><Globe className="h-4 w-4" /> Global Chat</span>
+          {(myProfile as any)?.global_muted && <BellOff className="h-4 w-4 text-muted-foreground" />}
         </Button>
       </div>
 
-      <div className="flex-1 overflow-hidden flex flex-col">
-        <ScrollArea className="flex-1">
-          <div className="px-2 pb-2">
-            <div className="flex items-center justify-between px-2 pt-3 pb-1">
-              <h3 className="text-sm font-medium text-sidebar-foreground">Groups</h3>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-7 px-2 text-xs"
-                onClick={() => setShowCreateGroup(true)}
-                title="Create group"
-                aria-label="Create new group chat"
-              >
-                <Plus className="h-3.5 w-3.5 mr-1" />
-                New
-              </Button>
+      <ScrollArea className="flex-1">
+        <div className="px-2 pb-2">
+          {tab === "add" ? (
+            <div className="p-3 space-y-3">
+              <div>
+                <h3 className="text-sm font-semibold text-sidebar-foreground">Add Friend</h3>
+                <p className="text-xs text-muted-foreground mt-1">Enter a username to send a friend request.</p>
+              </div>
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Username"
+                  value={searchUsername}
+                  onChange={(event) => setSearchUsername(event.target.value)}
+                  onKeyDown={(event) => event.key === "Enter" && void sendRequest()}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                />
+                <Button size="icon" onClick={() => void sendRequest()} disabled={busyId === "add-friend"} aria-label="Send friend request">
+                  {busyId === "add-friend" ? <Loader2 className="h-4 w-4 animate-spin" /> : <UserPlus className="h-4 w-4" />}
+                </Button>
+              </div>
             </div>
-
-            {groups.length === 0 ? (
-              <p className="text-xs text-muted-foreground text-center py-2 px-3">
-                No groups yet.
-              </p>
-            ) : (
-              groups.map((g) => {
-                const displayName =
-                  g.name && g.name.trim().length > 0
-                    ? g.name
-                    : g.member_previews
-                        .map((m) => m.display_name || m.username || "Member")
-                        .slice(0, 3)
-                        .join(", ");
-                return (
-                  <button
-                    key={g.id}
-                    type="button"
-                    onClick={() => onSelectConversation(g.id)}
-                    className={`flex items-center gap-3 p-3 rounded-lg transition-colors w-full text-left ${
-                      selectedConversationId === g.id
-                        ? "bg-sidebar-accent"
-                        : "hover:bg-sidebar-accent/50"
-                    }`}
-                  >
-                    <GroupAvatar members={g.member_previews} name={g.name} />
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <p className="font-medium text-sidebar-foreground truncate">
-                          {displayName}
-                        </p>
-                        {g.is_pinned && (
-                          <Pin className="h-3 w-3 text-muted-foreground flex-shrink-0" />
-                        )}
-                        {g.muted && (
-                          <BellOff className="h-3 w-3 text-muted-foreground flex-shrink-0" />
-                        )}
-                      </div>
-                      <p className="text-xs text-muted-foreground flex items-center gap-1">
-                        <Users className="h-3 w-3" />
-                        {g.member_count} {g.member_count === 1 ? "member" : "members"}
-                      </p>
-                    </div>
-                    {g.unread_count > 0 && (
-                      <Badge variant="default" className="h-5 min-w-5 flex items-center justify-center rounded-full px-1.5 text-xs flex-shrink-0">
-                        {g.unread_count > 99 ? "99+" : g.unread_count}
-                      </Badge>
-                    )}
-                  </button>
-                );
-              })
-            )}
-
-            <h3 className="text-sm font-medium text-sidebar-foreground px-2 pt-4 pb-1">
-              Direct Messages
-            </h3>
-            {conversations.map((conv) => {
-              const isOnline = conv.other_user && isUserOnline(conv.other_user.id);
-              return (
-                <div
-                  key={conv.id}
-                  className={`flex items-center gap-3 p-3 rounded-lg transition-colors ${
-                    selectedConversationId === conv.id
-                      ? "bg-sidebar-accent"
-                      : "hover:bg-sidebar-accent/50"
-                  }`}
-                >
-                  <button
-                    onClick={() => onSelectConversation(conv.id)}
-                    className="flex items-center gap-3 flex-1 min-w-0"
-                  >
-                    <div className="relative flex-shrink-0">
-                      <Avatar className="h-10 w-10">
-                        <AvatarImage src={conv.other_user?.avatar_url || undefined} />
-                        <AvatarFallback>
-                          {conv.other_user?.username?.[0]?.toUpperCase() || "?"}
-                        </AvatarFallback>
-                      </Avatar>
-                      <span
-                        className={`absolute bottom-0 right-0 h-3 w-3 rounded-full border-2 border-sidebar ${
-                          isOnline ? "bg-green-500" : "bg-muted-foreground"
-                        }`}
-                      />
-                    </div>
-                    <div className="text-left flex-1 min-w-0">
-                      <p className="font-medium text-sidebar-foreground truncate">
-                        {conv.other_user?.display_name || conv.other_user?.username || "Unknown"}
-                      </p>
-                      <p className="text-xs text-muted-foreground">
-                        {isOnline ? "Online" : "Offline"}
-                      </p>
-                    </div>
-                  </button>
-                  <div className="flex items-center gap-1 flex-shrink-0">
-                    {conv.is_pinned && (
-                      <Pin className="h-3 w-3 text-muted-foreground" />
-                    )}
-                    {conv.muted && (
-                      <BellOff className="h-3 w-3 text-muted-foreground" />
-                    )}
-                    {conv.unread_count && conv.unread_count > 0 ? (
-                      <Badge variant="default" className="h-5 min-w-5 flex items-center justify-center rounded-full px-1.5 text-xs">
-                        {conv.unread_count > 99 ? "99+" : conv.unread_count}
-                      </Badge>
-                    ) : null}
-                    <Popover>
-                      <PopoverTrigger asChild>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-8 w-8"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <MoreVertical className="h-4 w-4" />
-                        </Button>
-                      </PopoverTrigger>
-                      <PopoverContent className="w-64 p-0" align="end">
-                        <div className="p-4">
-                          <div className="flex items-center gap-3 mb-3">
-                            <Avatar className="h-12 w-12">
-                              <AvatarImage src={conv.other_user?.avatar_url || undefined} />
-                              <AvatarFallback>{conv.other_user?.username?.[0]?.toUpperCase() || "?"}</AvatarFallback>
-                            </Avatar>
-                            <div className="flex-1 min-w-0">
-                              <p className="font-semibold truncate">{conv.other_user?.display_name || conv.other_user?.username}</p>
-                              <p className="text-sm text-muted-foreground truncate">@{conv.other_user?.username}</p>
-                            </div>
-                          </div>
-                          <Button
-                            variant="outline"
-                            className="w-full mb-2"
-                            onClick={() => togglePin(conv)}
-                          >
-                            {conv.is_pinned ? (
-                              <>
-                                <PinOff className="h-4 w-4 mr-2" />
-                                Unpin
-                              </>
-                            ) : (
-                              <>
-                                <Pin className="h-4 w-4 mr-2" />
-                                Pin to top
-                              </>
-                            )}
-                          </Button>
-                          <Button
-                            variant="outline"
-                            className="w-full mb-2"
-                            onClick={() => toggleMute(conv.id, !!conv.muted)}
-                          >
-                            {conv.muted ? (
-                              <>
-                                <Bell className="h-4 w-4 mr-2" />
-                                Unmute notifications
-                              </>
-                            ) : (
-                              <>
-                                <BellOff className="h-4 w-4 mr-2" />
-                                Mute notifications
-                              </>
-                            )}
-                          </Button>
-                          <Button 
-                            variant="destructive" 
-                            className="w-full" 
-                            onClick={() => setShowUnfriendDialog(conv)}
-                          >
-                            <UserMinus className="h-4 w-4 mr-2" />
-                            Unfriend
-                          </Button>
-                        </div>
-                      </PopoverContent>
-                    </Popover>
+          ) : tab === "pending" ? (
+            <div className="space-y-2 p-1">
+              <h3 className="text-sm font-medium text-sidebar-foreground px-2 pt-2">Friend Requests</h3>
+              {requests.length === 0 ? <p className="text-xs text-muted-foreground text-center py-6">No pending requests.</p> : requests.map(requestRow)}
+            </div>
+          ) : tab === "blocked" ? (
+            <div className="space-y-2 p-1">
+              <h3 className="text-sm font-medium text-sidebar-foreground px-2 pt-2">Blocked Users</h3>
+              {blocked.length === 0 ? <p className="text-xs text-muted-foreground text-center py-6">No blocked users.</p> : blocked.map((target) => (
+                <div key={target.id} className="flex items-center gap-3 p-2 rounded-lg bg-sidebar-accent/60">
+                  <div className="flex items-center gap-3 flex-1 min-w-0">
+                    <Avatar className="h-10 w-10"><AvatarImage src={target.avatar_url || undefined} /><AvatarFallback>{target.username?.[0]?.toUpperCase() || "?"}</AvatarFallback></Avatar>
+                    <div className="min-w-0"><p className="font-medium text-sidebar-foreground truncate">{displayName(target)}</p><p className="text-xs text-muted-foreground">@{target.username}</p></div>
                   </div>
+                  <Button size="sm" variant="outline" disabled={busyId === target.id} onClick={() => void unblockUser(target)}>Unblock</Button>
                 </div>
-              );
-            })}
-            {conversations.length === 0 && (
-              <p className="text-sm text-muted-foreground text-center py-8 px-3">
-                No friends yet. Add someone above!
-              </p>
-            )}
-          </div>
-        </ScrollArea>
-      </div>
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-1 p-1">
+              <h3 className="text-sm font-medium text-sidebar-foreground px-2 pt-2">{tab === "online" ? "Online" : "All Friends"}</h3>
+              {visibleFriends.length === 0 ? (
+                <p className="text-xs text-muted-foreground text-center py-6 px-3">{tab === "online" ? "No friends online." : "No friends yet. Use Add Friend to get started."}</p>
+              ) : visibleFriends.map(friendRow)}
+            </div>
+          )}
 
-      {/* Admin Dashboard Link - shows for admins */}
+          <div className="flex items-center justify-between px-2 pt-4 pb-1">
+            <h3 className="text-sm font-medium text-sidebar-foreground">Groups</h3>
+            <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => setShowCreateGroup(true)}>
+              <Plus className="h-3.5 w-3.5 mr-1" /> New
+            </Button>
+          </div>
+          {groups.length === 0 ? (
+            <p className="text-xs text-muted-foreground text-center py-2 px-3">No groups yet.</p>
+          ) : groups.map((group) => {
+            const name = group.name?.trim() || group.member_previews.map((member) => member.display_name || member.username || "Member").slice(0, 3).join(", ");
+            return (
+              <button
+                key={group.id}
+                type="button"
+                onClick={() => onSelectConversation(group.id)}
+                className={`flex items-center gap-3 p-2 rounded-lg transition-colors w-full text-left ${group.id === selectedConversationId ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/50"}`}
+              >
+                <GroupAvatar members={group.member_previews} name={group.name} />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <p className="font-medium text-sidebar-foreground truncate">{name}</p>
+                    {group.is_pinned && <Pin className="h-3 w-3 text-muted-foreground flex-shrink-0" />}
+                    {group.muted && <BellOff className="h-3 w-3 text-muted-foreground flex-shrink-0" />}
+                  </div>
+                  <p className="text-xs text-muted-foreground flex items-center gap-1"><Users className="h-3 w-3" />{group.member_count} members</p>
+                </div>
+                {group.unread_count > 0 && <Badge className="h-5 min-w-5 rounded-full px-1.5 text-xs flex-shrink-0">{group.unread_count > 99 ? "99+" : group.unread_count}</Badge>}
+              </button>
+            );
+          })}
+        </div>
+      </ScrollArea>
+
       {isAdmin && (
         <div className="px-4 py-2">
-          <Button
-            variant="outline"
-            className="w-full justify-start gap-2"
-            onClick={() => navigate("/admin")}
-          >
-            {isSuperAdmin ? (
-              <ShieldAlert className="h-4 w-4 text-destructive" />
-            ) : (
-              <Shield className="h-4 w-4" />
-            )}
+          <Button variant="outline" className="w-full justify-start gap-2" onClick={() => navigate("/admin")}>
+            {isSuperAdmin ? <ShieldAlert className="h-4 w-4 text-destructive" /> : <Shield className="h-4 w-4" />}
             Admin Dashboard
-            {isSuperAdmin && (
-              <Badge variant="destructive" className="ml-auto text-[10px]">
-                Super
-              </Badge>
-            )}
+            {isSuperAdmin && <Badge variant="destructive" className="ml-auto text-[10px]">Super</Badge>}
           </Button>
         </div>
       )}
 
-      {/* Unfriend Dialog */}
-      <AlertDialog open={!!showUnfriendDialog} onOpenChange={() => setShowUnfriendDialog(null)}>
+      <div className="p-3">
+        <div className="flex items-center gap-2 rounded-2xl border border-sidebar-border bg-sidebar-accent/60 backdrop-blur p-2 shadow-sm">
+          <button type="button" onClick={() => user && setProfileOpenUserId(user.id)} className="block rounded-full focus:outline-none flex-shrink-0" aria-label="Open profile">
+            <Avatar className="h-8 w-8"><AvatarImage src={(myProfile as any)?.avatar_url || undefined} /><AvatarFallback>{(myProfile as any)?.username?.[0]?.toUpperCase() || user?.email?.[0]?.toUpperCase() || "?"}</AvatarFallback></Avatar>
+          </button>
+          <button type="button" onClick={() => user && setProfileOpenUserId(user.id)} className="flex flex-col flex-1 min-w-0 rounded-xl px-1 py-1 hover:bg-sidebar-accent transition-colors text-left">
+            <span className="text-sm font-medium text-sidebar-foreground truncate">{displayName(myProfile)}</span>
+            {isStatusActive(myProfile as any) && <span className="text-xs text-muted-foreground truncate">{(myProfile as any)?.custom_status_emoji ? `${(myProfile as any).custom_status_emoji} ` : ""}{(myProfile as any)?.custom_status_text}</span>}
+          </button>
+        </div>
+      </div>
+
+      <UserProfileDialog userId={profileOpenUserId} onOpenChange={(open) => !open && setProfileOpenUserId(null)} />
+
+      <AlertDialog open={!!unfriendTarget} onOpenChange={(open) => !open && setUnfriendTarget(null)}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>
-              Unfriend {showUnfriendDialog?.other_user?.display_name || showUnfriendDialog?.other_user?.username}?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              This will remove them from your friends list. You can send a new friend request later.
-            </AlertDialogDescription>
+            <AlertDialogTitle>Unfriend {unfriendTarget ? displayName(unfriendTarget) : "user"}?</AlertDialogTitle>
+            <AlertDialogDescription>This removes the friendship. Existing direct-message history is preserved for both people.</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={unfriending}>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={unfriend}
-              disabled={unfriending}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {unfriending ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-              Unfriend
+            <AlertDialogCancel disabled={!!busyId}>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void unfriend()} disabled={!!busyId} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
+              {busyId ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : <UserX className="h-4 w-4 mr-2" />} Unfriend
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
 
-      <div className="p-3">
-        <div className="flex items-center gap-2 rounded-2xl border border-sidebar-border bg-sidebar-accent/60 backdrop-blur p-2 shadow-sm">
-          <button
-            type="button"
-            onClick={() => user && setProfileOpenUserId(user.id)}
-            className="block rounded-full focus:outline-none flex-shrink-0"
-            aria-label="Open profile"
-          >
-            <Avatar className="h-8 w-8 flex-shrink-0">
-              <AvatarImage src={myProfile?.avatar_url || undefined} />
-              <AvatarFallback>
-                {myProfile?.username?.[0]?.toUpperCase() || user?.email?.[0]?.toUpperCase() || "?"}
-              </AvatarFallback>
-            </Avatar>
-          </button>
-          <button
-            type="button"
-            onClick={() => user && setProfileOpenUserId(user.id)}
-            className="flex flex-col flex-1 min-w-0 rounded-xl px-1 py-1 hover:bg-sidebar-accent transition-colors focus:outline-none text-left"
-          >
-            <span className="text-sm font-medium text-sidebar-foreground truncate">
-              {myProfile?.display_name || myProfile?.username || "Profile"}
-            </span>
-            {isStatusActive(myProfile) && (
-              <span className="text-xs text-muted-foreground truncate">
-                {myProfile?.custom_status_emoji ? `${myProfile.custom_status_emoji} ` : ""}
-                {myProfile?.custom_status_text}
-              </span>
-            )}
-          </button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8 text-muted-foreground flex-shrink-0"
-            onClick={() => navigate("/settings")}
-            aria-label="Settings"
-          >
-            <Settings className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
-
-
-      <UserProfileDialog
-        userId={profileOpenUserId}
-        onOpenChange={(open) => !open && setProfileOpenUserId(null)}
-      />
-
       <CreateGroupDialog
         open={showCreateGroup}
         onOpenChange={setShowCreateGroup}
         onCreated={(id) => {
-          fetchGroups();
+          void refreshSocial();
           onSelectConversation(id);
         }}
       />

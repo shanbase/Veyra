@@ -1,12 +1,12 @@
 # Veyra
 
-Veyra is a real-time messaging app built with React, Vite, TypeScript, Tailwind CSS, and shadcn/ui. It supports private and group chats, global chat, announcements, profiles, moderation, media sharing, voice messages, polls, mentions, reactions, and notifications.
+Veyra is a real-time messaging app built with React, Vite, TypeScript, Tailwind CSS, and shadcn/ui. It supports private and group chats, user-created servers with channels/roles/invites, a Discord-style friends experience, global chat, announcements, profiles, moderation, media sharing, voice messages, polls, mentions, reactions, and notifications.
 
 Desktop and Android installers are built and released through GitHub Actions. See [Releases.md](Releases.md) for versioning, publishing, signing, and update behavior.
 
 ## Architecture
 
-- **MariaDB** stores the 19 messaging and product data tables plus the authentication tables for users, sessions, email tokens, and Google identities.
+- **MariaDB** stores the messaging, product, friend-graph, and server tables plus the authentication tables for users, sessions, email tokens, and Google identities.
 - **MariaDB and the Node API** manage accounts, password hashes, sessions, email verification, and password recovery.
 - **Sequenzy** sends account verification and password reset emails through its transactional API.
 - **Supabase Storage** stores avatars, banners, chat images, videos, and voice messages.
@@ -21,7 +21,8 @@ MariaDB, Google OAuth, and Sequenzy credentials stay on the server. The browser 
 
 - Email signup, verified email login, password reset, and password changes.
 - Google sign-in backed by the same MariaDB account and session tables.
-- Direct messages, group membership and roles, global chat, and announcements.
+- Direct messages, group membership and roles, user-created servers with text channels/categories/roles/invites/moderation, global chat, and announcements.
+- A normalized friends graph with Online/All/Pending/Blocked/Add Friend views, friend requests, blocking, unfriend flows, and server member mentions.
 - Replies, edits, emoji reactions, markdown, mentions, files, images, video, music cards, and voice messages.
 - Single-choice and multiple-choice polls.
 - Profiles, custom status, privacy, notifications, and theme settings.
@@ -79,7 +80,7 @@ In Supabase Dashboard:
 
    | Bucket | Access | Contents |
    | --- | --- | --- |
-   | `avatars` | Public read | Profile and group avatars |
+   | `avatars` | Public read | Profile/group avatars, server icons, and server banners |
    | `banners` | Public read | Profile banners |
    | `chat-images` | Private | Chat images and files |
    | `chat-videos` | Private | Chat videos |

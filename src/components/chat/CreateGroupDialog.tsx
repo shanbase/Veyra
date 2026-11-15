@@ -47,42 +47,18 @@ export function CreateGroupDialog({ open, onOpenChange, onCreated }: CreateGroup
     setLoading(true);
 
     (async () => {
-      const { data: rows, error } = await supabase
-        .from("friend_requests")
-        .select("sender_id, receiver_id")
-        .eq("status", "accepted")
-        .or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`);
-
+      const { data, error } = await supabase.rpc("get_friends");
       if (error) {
         toast({ title: "Couldn't load friends", description: error.message, variant: "destructive" });
         setLoading(false);
         return;
       }
-
-      const otherIds = Array.from(
-        new Set(
-          (rows ?? [])
-            .map((r) => (r.sender_id === user.id ? r.receiver_id : r.sender_id))
-            .filter((id): id is string => !!id),
-        ),
-      );
-
-      if (otherIds.length === 0) {
-        setFriends([]);
-        setLoading(false);
-        return;
-      }
-
-      const { data: profiles, error: pErr } = await supabase
-        .from("profiles")
-        .select("id, username, display_name, avatar_url")
-        .in("id", otherIds);
-
-      if (pErr) {
-        toast({ title: "Couldn't load profiles", description: pErr.message, variant: "destructive" });
-      }
-
-      setFriends((profiles ?? []) as FriendProfile[]);
+      setFriends(((data || []) as any[]).map((friend) => ({
+        id: friend.id,
+        username: friend.username,
+        display_name: friend.display_name ?? null,
+        avatar_url: friend.avatar_url ?? null,
+      })));
       setLoading(false);
     })();
   }, [open, user]);

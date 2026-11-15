@@ -719,6 +719,48 @@ export type Database = {
         }
         Relationships: []
       }
+      server_bans: {
+        Row: Record<string, any>
+        Insert: Record<string, any>
+        Update: Record<string, any>
+        Relationships: []
+      }
+      server_categories: {
+        Row: Record<string, any>
+        Insert: Record<string, any>
+        Update: Record<string, any>
+        Relationships: []
+      }
+      server_channels: {
+        Row: Record<string, any>
+        Insert: Record<string, any>
+        Update: Record<string, any>
+        Relationships: []
+      }
+      server_invites: {
+        Row: Record<string, any>
+        Insert: Record<string, any>
+        Update: Record<string, any>
+        Relationships: []
+      }
+      server_members: {
+        Row: Record<string, any>
+        Insert: Record<string, any>
+        Update: Record<string, any>
+        Relationships: []
+      }
+      server_roles: {
+        Row: Record<string, any>
+        Insert: Record<string, any>
+        Update: Record<string, any>
+        Relationships: []
+      }
+      servers: {
+        Row: Record<string, any>
+        Insert: Record<string, any>
+        Update: Record<string, any>
+        Relationships: []
+      }
       user_roles: {
         Row: {
           created_at: string
@@ -863,6 +905,44 @@ export type Database = {
         Args: { _conv: string; _new_owner: string }
         Returns: undefined
       }
+      ban_member: { Args: Record<string, unknown>; Returns: Json }
+      block_user: { Args: Record<string, unknown>; Returns: Json }
+      cancel_friend_request: { Args: Record<string, unknown>; Returns: Json }
+      create_category: { Args: Record<string, unknown>; Returns: Json }
+      create_channel: { Args: Record<string, unknown>; Returns: Json }
+      create_invite: { Args: Record<string, unknown>; Returns: Json }
+      create_poll: { Args: Record<string, unknown>; Returns: Json }
+      create_role: { Args: Record<string, unknown>; Returns: Json }
+      create_server: { Args: Record<string, unknown>; Returns: Json }
+      delete_category: { Args: Record<string, unknown>; Returns: Json }
+      delete_channel: { Args: Record<string, unknown>; Returns: Json }
+      delete_role: { Args: Record<string, unknown>; Returns: Json }
+      delete_server: { Args: Record<string, unknown>; Returns: Json }
+      get_blocked_users: { Args: never; Returns: Json }
+      get_friend_requests: { Args: never; Returns: Json }
+      get_friends: { Args: never; Returns: Json }
+      get_my_servers: { Args: never; Returns: Json }
+      get_server_view: { Args: Record<string, unknown>; Returns: Json }
+      join_server_by_code: { Args: Record<string, unknown>; Returns: Json }
+      kick_member: { Args: Record<string, unknown>; Returns: Json }
+      leave_server: { Args: Record<string, unknown>; Returns: Json }
+      list_bans: { Args: Record<string, unknown>; Returns: Json }
+      list_invites: { Args: Record<string, unknown>; Returns: Json }
+      reorder_channels: { Args: Record<string, unknown>; Returns: Json }
+      reorder_roles: { Args: Record<string, unknown>; Returns: Json }
+      respond_friend_request: { Args: Record<string, unknown>; Returns: Json }
+      revoke_invite: { Args: Record<string, unknown>; Returns: Json }
+      send_friend_request: { Args: Record<string, unknown>; Returns: Json }
+      set_member_nickname: { Args: Record<string, unknown>; Returns: Json }
+      set_server_member_role: { Args: Record<string, unknown>; Returns: Json }
+      timeout_member: { Args: Record<string, unknown>; Returns: Json }
+      unban_member: { Args: Record<string, unknown>; Returns: Json }
+      unblock_user: { Args: Record<string, unknown>; Returns: Json }
+      unfriend: { Args: Record<string, unknown>; Returns: Json }
+      update_category: { Args: Record<string, unknown>; Returns: Json }
+      update_channel: { Args: Record<string, unknown>; Returns: Json }
+      update_role: { Args: Record<string, unknown>; Returns: Json }
+      update_server: { Args: Record<string, unknown>; Returns: Json }
       unregister_native_push_token: {
         Args: { p_token: string }
         Returns: undefined

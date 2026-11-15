@@ -49,6 +49,7 @@ if (isPostgres) {
 const BOOLEAN_COLUMNS = [
   'allow_friend_requests', 'announcement_custom_enabled', 'dm_custom_enabled',
   'enabled', 'global_custom_enabled', 'is_group', 'is_pinned',
+  'administrator', 'hoist', 'is_default', 'is_readonly', 'mentionable', 'muted',
   'multiple_choice', 'username_set',
 ];
 
@@ -65,7 +66,7 @@ const UPSERT_CONFLICT = {
   blocked_users: 'blocker_id, blocked_id',
   conversation_members: 'conversation_id, user_id',
   conversations: 'id',
-  friend_requests: 'sender_id, receiver_id',
+  friend_requests: 'user_low, user_high',
   global_messages: 'id',
   message_reactions: 'message_id, user_id, emoji',
   messages: 'id',
@@ -78,6 +79,13 @@ const UPSERT_CONFLICT = {
   poll_votes: 'poll_id, option_id, user_id',
   polls: 'id',
   profiles: 'id',
+  server_bans: 'server_id, user_id',
+  server_categories: 'id',
+  server_channels: 'id',
+  server_invites: 'code',
+  server_members: 'server_id, user_id',
+  server_roles: 'id',
+  servers: 'id',
   user_roles: 'user_id, role',
 };
 
