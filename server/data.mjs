@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { pool, isPostgres } from './db.mjs';
-import { ensureDirectMessage } from './rpc.mjs';
+import { ensureDirectMessage, friendPair } from './dm.mjs';
 import { notifyNewMessage } from './notifications.mjs';
+import { canPostInServerChannel, getServerMemberContext, serverChannelForConversation } from './permissions.mjs';
 import { cachedRead, invalidateReadCache, redisGetJson, redisSetJson, cachedUserRoles, invalidateUserRole } from './redis.mjs';
 import { decryptRowsForTable, encryptRowForTable } from './encryption.mjs';
 
@@ -10,7 +11,9 @@ const TABLES = new Set([
   'conversations', 'friend_requests', 'global_messages', 'message_reactions',
   'messages', 'native_push_tokens', 'notification_digest_state',
   'notification_preferences', 'notification_trigger_events', 'pinned_conversations',
-  'poll_options', 'poll_votes', 'polls', 'profiles', 'user_roles',
+  'poll_options', 'poll_votes', 'polls', 'profiles', 'server_bans', 'server_categories',
+  'server_channels', 'server_invites', 'server_members', 'server_roles', 'servers',
+  'user_roles',
 ]);
 const columnCache = new Map();
 
@@ -76,6 +79,29 @@ function membershipExists(userId, conversationColumn = 'conversation_id') {
   return `EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = t.${conversationColumn} AND cm.user_id = ?)`;
 }
 
+async function serverIdsWithPermission(userId, permission) {
+  const [members] = await pool.execute('SELECT server_id FROM server_members WHERE user_id = ?', [userId]);
+  const ids = [];
+  for (const member of members) {
+    const context = await getServerMemberContext(userId, member.server_id);
+    if (context?.permissions.has(permission)) ids.push(member.server_id);
+  }
+  return ids;
+}
+
+async function viewableServerIds(userId) {
+  return serverIdsWithPermission(userId, 'view_channel');
+}
+
+function serverConversationAccessSql(serverIds, conversationColumn = 't.conversation_id') {
+  if (!serverIds.length) return { sql: '1 = 0', args: [] };
+  const placeholders = serverIds.map(() => '?').join(', ');
+  return {
+    sql: `${conversationColumn} IN (SELECT sc.conversation_id FROM server_channels sc WHERE sc.server_id IN (${placeholders}))`,
+    args: serverIds,
+  };
+}
+
 async function policy(table, userId, operation) {
   const admin = await isAdmin(userId);
   const owner = {
@@ -103,53 +129,156 @@ async function policy(table, userId, operation) {
     ? { sql: '1 = 1', args: [] }
     : { sql: 'sender_id = ?', args: [userId] };
   if (table === 'conversations') {
-    if (operation === 'insert') return { sql: 'created_by = ?', args: [userId] };
-    if (admin) return { sql: '1 = 1', args: [] };
-    if (operation === 'select') return { sql: membershipExists(userId), args: [userId] };
+    if (operation === 'insert') return { sql: `created_by = ? AND (kind IS NULL OR kind <> 'server')`, args: [userId] };
+    if (operation === 'select') {
+      const serverIds = await viewableServerIds(userId);
+      const serverAccess = serverConversationAccessSql(serverIds, 't.id');
+      if (admin) {
+        return {
+          sql: `(t.kind IS NULL OR t.kind <> 'server') OR (t.kind = 'server' AND ${serverAccess.sql})`,
+          args: [...serverAccess.args],
+        };
+      }
+      return {
+        sql: `((t.kind IS NULL OR t.kind <> 'server') AND ${membershipExists(userId)}) OR (t.kind = 'server' AND ${serverAccess.sql})`,
+        args: [userId, ...serverAccess.args],
+      };
+    }
+    if (admin) return { sql: `t.kind <> 'server'`, args: [] };
     return { sql: `EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = t.id AND cm.user_id = ? AND cm.role IN ('owner','admin'))`, args: [userId] };
   }
   if (table === 'conversation_members') {
-    if (operation === 'insert') return admin
-      ? { sql: '1 = 1', args: [] }
-      : { sql: `(user_id = ? AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = t.conversation_id AND c.created_by = ?)) OR EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = t.conversation_id AND mine.user_id = ? AND mine.role IN ('owner','admin'))`, args: [userId, userId, userId] };
-    if (admin) return { sql: '1 = 1', args: [] };
-    if (operation === 'select') return { sql: `(${membershipExists(userId)} OR user_id = ?)`, args: [userId, userId] };
+    const serverConversation = `EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = t.conversation_id AND sc.kind = 'server')`;
+    if (operation === 'insert') {
+      if (admin) return { sql: `NOT ${serverConversation}`, args: [] };
+      return { sql: `(user_id = ? AND EXISTS (SELECT 1 FROM conversations c WHERE c.id = t.conversation_id AND c.created_by = ? AND c.kind <> 'server')) OR EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = t.conversation_id AND mine.user_id = ? AND mine.role IN ('owner','admin'))`, args: [userId, userId, userId] };
+    }
+    if (operation === 'select') {
+      const serverIds = await viewableServerIds(userId);
+      const serverAccess = serverConversationAccessSql(serverIds, 't.conversation_id');
+      if (admin) {
+        return {
+          sql: `(user_id = ? OR NOT ${serverConversation} OR (${serverConversation} AND ${serverAccess.sql}))`,
+          args: [userId, ...serverAccess.args],
+        };
+      }
+      return {
+        sql: `(user_id = ? OR (NOT ${serverConversation} AND ${membershipExists(userId)})) OR (${serverConversation} AND ${serverAccess.sql})`,
+        args: [userId, userId, ...serverAccess.args],
+      };
+    }
+    if (admin) return { sql: `NOT ${serverConversation}`, args: [] };
     // Members may update their own row (e.g. toggling `muted`); sensitive
     // columns (role, ids, joined_at) are blocked by protectedColumns anyway.
     return { sql: `user_id = ? OR EXISTS (SELECT 1 FROM conversation_members mine WHERE mine.conversation_id = t.conversation_id AND mine.user_id = ? AND mine.role IN ('owner','admin'))`, args: [userId, userId] };
   }
   if (table === 'friend_requests') {
-    if (admin) return { sql: '1 = 1', args: [] };
+    if (admin) return operation === 'select' || operation === 'delete'
+      ? { sql: '1 = 1', args: [] }
+      : { sql: '1 = 0', args: [] };
     if (operation === 'select' || operation === 'delete') return { sql: '(sender_id = ? OR receiver_id = ?)', args: [userId, userId] };
-    return { sql: operation === 'insert' ? 'sender_id = ?' : 'receiver_id = ?', args: [userId] };
+    return { sql: '1 = 0', args: [] };
   }
-  if (table === 'messages') return admin
-    ? { sql: '1 = 1', args: [] }
-    : operation === 'select'
-      ? { sql: membershipExists(userId), args: [userId] }
-      : { sql: `sender_id = ? AND ${membershipExists(userId)}`, args: [userId, userId] };
+  if (table === 'messages') {
+    const serverConversation = `EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = t.conversation_id AND sc.kind = 'server')`;
+    if (operation === 'select') {
+      const serverIds = await viewableServerIds(userId);
+      const serverAccess = serverConversationAccessSql(serverIds, 't.conversation_id');
+      if (admin) {
+        return {
+          sql: `NOT ${serverConversation} OR ${serverAccess.sql}`,
+          args: [...serverAccess.args],
+        };
+      }
+      return {
+        sql: `(NOT ${serverConversation} AND ${membershipExists(userId)}) OR ${serverAccess.sql}`,
+        args: [userId, ...serverAccess.args],
+      };
+    }
+    if (admin) return { sql: `(NOT ${serverConversation} OR (sender_id = ? AND ${membershipExists(userId)}))`, args: [userId, userId] };
+    const serverIds = await viewableServerIds(userId);
+    const serverAccess = serverConversationAccessSql(serverIds, 't.conversation_id');
+    let manageSql = '1 = 0';
+    const manageArgs = [];
+    if (operation === 'delete') {
+      const viewSet = new Set(serverIds);
+      const manageIds = (await serverIdsWithPermission(userId, 'manage_messages')).filter((id) => viewSet.has(id));
+      const manageAccess = serverConversationAccessSql(manageIds, 't.conversation_id');
+      manageSql = manageAccess.sql;
+      manageArgs.push(...manageAccess.args);
+    }
+    return {
+      sql: `(NOT ${serverConversation} AND sender_id = ? AND ${membershipExists(userId)}) OR (sender_id = ? AND ${serverAccess.sql}) OR (${serverConversation} AND ${manageSql})`,
+      args: [userId, userId, userId, ...serverAccess.args, ...manageArgs],
+    };
+  }
   if (table === 'message_reactions') {
     if (admin) return { sql: '1 = 1', args: [] };
-    // message_id is polymorphic: a reaction is visible when the target is a DM
-    // message in a conversation the user belongs to, or any global/announcement
-    // message (those channels are readable by everyone).
-    return operation === 'select'
-      ? { sql: `(EXISTS (SELECT 1 FROM messages m JOIN conversation_members cm ON cm.conversation_id = m.conversation_id WHERE m.id = t.message_id AND cm.user_id = ?) OR EXISTS (SELECT 1 FROM global_messages g WHERE g.id = t.message_id) OR EXISTS (SELECT 1 FROM announcement_messages a WHERE a.id = t.message_id))`, args: [userId] }
-      : { sql: 'user_id = ?', args: [userId] };
+    if (operation === 'select') {
+      const serverIds = await viewableServerIds(userId);
+      const serverAccess = serverConversationAccessSql(serverIds, 'm.conversation_id');
+      const serverConversation = `EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = m.conversation_id AND sc.kind = 'server')`;
+      // message_id is polymorphic: a reaction is visible when the target is a DM
+      // or viewable server message in a conversation the user belongs to, or any
+      // global/announcement message (those channels are readable by everyone).
+      return {
+        sql: `(EXISTS (SELECT 1 FROM messages m JOIN conversation_members cm ON cm.conversation_id = m.conversation_id WHERE m.id = t.message_id AND cm.user_id = ? AND (NOT ${serverConversation} OR ${serverAccess.sql})) OR EXISTS (SELECT 1 FROM global_messages g WHERE g.id = t.message_id) OR EXISTS (SELECT 1 FROM announcement_messages a WHERE a.id = t.message_id))`,
+        args: [userId, ...serverAccess.args],
+      };
+    }
+    return { sql: 'user_id = ?', args: [userId] };
   }
   if (table === 'polls') {
+    if (operation === 'select') {
+      const serverIds = await viewableServerIds(userId);
+      const serverAccess = serverConversationAccessSql(serverIds, 't.conversation_id');
+      const serverConversation = `EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = t.conversation_id AND sc.kind = 'server')`;
+      if (admin) {
+        return {
+          sql: `(t.conversation_id IS NULL OR NOT ${serverConversation} OR ${serverAccess.sql})`,
+          args: [...serverAccess.args],
+        };
+      }
+      return {
+        sql: `(t.conversation_id IS NULL OR (NOT ${serverConversation} AND ${membershipExists(userId)}) OR ${serverAccess.sql})`,
+        args: [userId, ...serverAccess.args],
+      };
+    }
     if (admin) return { sql: '1 = 1', args: [] };
-    return operation === 'select'
-      ? { sql: `(conversation_id IS NULL OR ${membershipExists(userId)})`, args: [userId] }
-      : { sql: 'created_by = ?', args: [userId] };
+    return { sql: 'created_by = ?', args: [userId] };
   }
   if (table === 'poll_options' || table === 'poll_votes') {
     if (admin) return { sql: '1 = 1', args: [] };
     if (table === 'poll_votes' && operation !== 'select') return { sql: 'user_id = ?', args: [userId] };
+    if (operation === 'select') {
+      const serverIds = await viewableServerIds(userId);
+      const serverAccess = serverConversationAccessSql(serverIds, 'p.conversation_id');
+      const serverConversation = `EXISTS (SELECT 1 FROM conversations sc WHERE sc.id = p.conversation_id AND sc.kind = 'server')`;
+      return {
+        sql: `EXISTS (SELECT 1 FROM polls p WHERE p.id = t.poll_id AND (p.conversation_id IS NULL OR (NOT ${serverConversation} AND EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = p.conversation_id AND cm.user_id = ?)) OR ${serverAccess.sql})${table === 'poll_options' && operation !== 'select' ? ' AND p.created_by = ?' : ''})`,
+        args: [userId, ...serverAccess.args, ...(table === 'poll_options' && operation !== 'select' ? [userId] : [])],
+      };
+    }
     const extra = table === 'poll_options' && operation !== 'select' ? ' AND p.created_by = ?' : '';
     return { sql: `EXISTS (SELECT 1 FROM polls p WHERE p.id = t.poll_id AND (p.conversation_id IS NULL OR EXISTS (SELECT 1 FROM conversation_members cm WHERE cm.conversation_id = p.conversation_id AND cm.user_id = ?))${extra})`, args: extra ? [userId, userId] : [userId] };
   }
-  if (table === 'friend_requests') return { sql: '(sender_id = ? OR receiver_id = ?)', args: [userId, userId] };
+  if (['servers', 'server_roles', 'server_members', 'server_bans', 'server_categories', 'server_channels', 'server_invites'].includes(table)) {
+    if ((table === 'server_channels' || table === 'server_categories') && operation === 'select') {
+      const ids = await viewableServerIds(userId);
+      if (!ids.length) return { sql: '1 = 0', args: [] };
+      return { sql: `t.server_id IN (${ids.map(() => '?').join(', ')})`, args: ids };
+    }
+    if (table === 'server_bans' && operation === 'select') {
+      const ids = await serverIdsWithPermission(userId, 'ban_members');
+      if (!ids.length) return { sql: '1 = 0', args: [] };
+      return { sql: `t.server_id IN (${ids.map(() => '?').join(', ')})`, args: ids };
+    }
+    const serverColumn = table === 'servers' ? 't.id' : 't.server_id';
+    if (operation === 'select') {
+      return { sql: `EXISTS (SELECT 1 FROM server_members sm WHERE sm.server_id = ${serverColumn} AND sm.user_id = ?)`, args: [userId] };
+    }
+    return { sql: '1 = 0', args: [] };
+  }
   if (owner[table]) {
     const cols = owner[table];
     return { sql: admin && table === 'user_roles' ? '1 = 1' : `(${cols.map((col) => `${col} = ?`).join(' OR ')})`, args: admin && table === 'user_roles' ? [] : cols.map(() => userId) };
@@ -268,6 +397,7 @@ async function queryDataUncached(userId, payload) {
       const row = { ...input };
       if (columns.has('id') && !row.id) row.id = randomUUID();
       if (!await canInsert(table, row, userId, access)) throw new Error('Not allowed to insert this row.');
+      if (table === 'messages' && columns.has('preview')) row.preview = messagePreview(row);
       const normalizedRow = normalizeRowTemporalValues(row, columns);
       const storedRow = encryptRowForTable(table, normalizedRow);
       const keys = Object.keys(storedRow);
@@ -308,15 +438,17 @@ async function queryDataUncached(userId, payload) {
   }
 
   if (operation === 'update') {
-    const patch = encryptRowForTable(table, normalizeRowTemporalValues(payload.values || {}, columns));
+    const rawPatch = normalizeRowTemporalValues(payload.values || {}, columns);
+    if (table === 'messages' && columns.has('preview') && typeof rawPatch.content === 'string') rawPatch.preview = messagePreview(rawPatch);
+    const patch = encryptRowForTable(table, rawPatch);
     const keys = Object.keys(patch);
     for (const key of keys) identifier(key, columns);
     if (!keys.length) return { data: [], count: 0 };
     const protectedColumns = new Set(['id']);
     const protectedByTable = {
-      profiles: ['id'], user_roles: ['user_id'], conversations: ['created_by', 'is_group'],
-      conversation_members: ['conversation_id', 'user_id', 'role', 'joined_at'], friend_requests: ['sender_id', 'receiver_id'],
-      messages: ['conversation_id', 'sender_id'], global_messages: ['sender_id'],
+      profiles: ['id'], user_roles: ['user_id'], conversations: ['created_by', 'is_group', 'kind'],
+      conversation_members: ['conversation_id', 'user_id', 'role', 'joined_at'], friend_requests: ['sender_id', 'receiver_id', 'user_low', 'user_high'],
+      messages: ['conversation_id', 'sender_id', 'preview'], global_messages: ['sender_id'],
       announcement_messages: ['sender_id'], message_reactions: ['message_id', 'user_id'],
       blocked_users: ['blocker_id', 'blocked_id'], pinned_conversations: ['user_id', 'conversation_id'],
       polls: ['created_by', 'conversation_id'], poll_options: ['poll_id'],
@@ -349,7 +481,7 @@ async function queryDataUncached(userId, payload) {
       const [result] = await pool.execute(`DELETE FROM \`${table}\` AS t WHERE ${whereSql}`, whereArgs);
       return { data: before, count: result.affectedRows ?? 0 };
     }
-    const realtimeColumns = ['id', 'user_id', 'conversation_id', 'message_id', 'poll_id', 'option_id', 'sender_id', 'receiver_id', 'blocker_id', 'blocked_id', 'group_id']
+    const realtimeColumns = ['id', 'user_id', 'conversation_id', 'message_id', 'poll_id', 'option_id', 'sender_id', 'receiver_id', 'blocker_id', 'blocked_id', 'group_id', 'server_id', 'role_id', 'category_id', 'channel_id']
       .filter((column) => columns.has(column));
     const [rows] = await pool.execute(`SELECT ${realtimeColumns.map((column) => `t.\`${column}\``).join(', ')} FROM \`${table}\` t WHERE ${whereSql}`, whereArgs);
     if (!rows.length) return { data: payload.returning ? [] : null, count: 0 };
@@ -395,6 +527,21 @@ function messagePayloadAllowed(row) {
   return true;
 }
 
+function messagePreview(row) {
+  const content = String(row.content || '').replace(/\s+/g, ' ').trim();
+  if (content.startsWith('[[poll:')) return 'Poll';
+  if (content) return content.slice(0, 140);
+  if (row.image_url) return '[Attachment]';
+  return '';
+}
+
+async function serverChannelContext(conversationId, userId) {
+  const channel = await serverChannelForConversation(conversationId);
+  if (!channel) return null;
+  const context = await getServerMemberContext(userId, channel.server_id);
+  return { channel, context };
+}
+
 async function canInsert(table, row, userId, access) {
   const admin = await isAdmin(userId);
   if (MESSAGE_TABLES.has(table) && !messagePayloadAllowed(row)) return false;
@@ -404,27 +551,29 @@ async function canInsert(table, row, userId, access) {
   if (table === 'notification_trigger_events') return false;
   if (table === 'notification_preferences' || table === 'notification_digest_state' || table === 'native_push_tokens' || table === 'pinned_conversations') return row.user_id === userId;
   if (table === 'blocked_users') return row.blocker_id === userId && row.blocked_id !== userId;
-  if (table === 'friend_requests') {
-    if (row.sender_id !== userId || row.receiver_id === userId || row.status !== 'pending') return false;
-    const [recipient] = await pool.execute('SELECT allow_friend_requests FROM profiles WHERE id = ? LIMIT 1', [row.receiver_id]);
-    if (!recipient[0]?.allow_friend_requests) return false;
-    const [blocked] = await pool.execute('SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1', [userId, row.receiver_id, row.receiver_id, userId]);
-    return blocked.length === 0;
-  }
+  if (table === 'friend_requests') return false;
   if (table === 'messages') {
     if (row.sender_id !== userId) return false;
     const [members] = await pool.execute(
-      'SELECT c.is_group FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id WHERE cm.conversation_id = ? AND cm.user_id = ? LIMIT 1',
+      'SELECT c.is_group, c.kind FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id WHERE cm.conversation_id = ? AND cm.user_id = ? LIMIT 1',
       [row.conversation_id, userId],
     );
     if (!members.length) return false;
+    const channel = members[0];
+    if (channel.kind === 'server') {
+      const post = await canPostInServerChannel(userId, row.conversation_id, String(row.content || ''), pool, Boolean(row.image_url));
+      return post.allowed;
+    }
     // 1:1 DMs enforce blocks in both directions — being in a shared
     // conversation must not let a blocked user keep messaging.
-    if (!members[0].is_group) {
+    if (!channel.is_group) {
       const [others] = await pool.execute('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id <> ?', [row.conversation_id, userId]);
       for (const other of others) {
         const [blocked] = await pool.execute('SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1', [userId, other.user_id, other.user_id, userId]);
         if (blocked.length) return false;
+        const [low, high] = friendPair(userId, other.user_id);
+        const [friendship] = await pool.execute("SELECT 1 FROM friend_requests WHERE status = 'accepted' AND user_low = ? AND user_high = ? LIMIT 1", [low, high]);
+        if (!friendship.length) return false;
       }
     }
     return true;
@@ -433,8 +582,22 @@ async function canInsert(table, row, userId, access) {
   if (table === 'announcement_messages') return admin && row.sender_id === userId;
   if (table === 'message_reactions') {
     if (row.user_id !== userId) return false;
-    const [message] = await pool.execute('SELECT 1 FROM messages m JOIN conversation_members cm ON cm.conversation_id = m.conversation_id WHERE m.id = ? AND cm.user_id = ? LIMIT 1', [row.message_id, userId]);
-    if (message.length) return true;
+    const [message] = await pool.execute('SELECT m.conversation_id, c.kind FROM messages m JOIN conversations c ON c.id = m.conversation_id JOIN conversation_members cm ON cm.conversation_id = m.conversation_id WHERE m.id = ? AND cm.user_id = ? LIMIT 1', [row.message_id, userId]);
+    if (message.length) {
+      if (message[0].kind === 'server') {
+        const server = await serverChannelContext(message[0].conversation_id, userId);
+        return Boolean(server?.context?.member && server.context.permissions.has('view_channel') && server.context.permissions.has('add_reactions'));
+      }
+      if (message[0].kind === 'dm') {
+        const [others] = await pool.execute('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id <> ? LIMIT 1', [message[0].conversation_id, userId]);
+        for (const other of others) {
+          const [low, high] = friendPair(userId, other.user_id);
+          const [friendship] = await pool.execute("SELECT 1 FROM friend_requests WHERE status = 'accepted' AND user_low = ? AND user_high = ? LIMIT 1", [low, high]);
+          if (!friendship.length) return false;
+        }
+      }
+      return true;
+    }
     // Global chat and announcements are readable by everyone, so anyone may
     // react to their messages.
     const [publicMessage] = await pool.execute('SELECT 1 FROM global_messages WHERE id = ? UNION ALL SELECT 1 FROM announcement_messages WHERE id = ? LIMIT 1', [row.message_id, row.message_id]);
@@ -443,8 +606,12 @@ async function canInsert(table, row, userId, access) {
   if (table === 'polls') {
     if (row.created_by !== userId || !['dm', 'global', 'announcement'].includes(row.channel)) return false;
     if (row.channel === 'dm') {
-      const [members] = await pool.execute('SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ? LIMIT 1', [row.conversation_id, userId]);
-      return members.length > 0;
+      const [members] = await pool.execute('SELECT c.kind FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id WHERE cm.conversation_id = ? AND cm.user_id = ? LIMIT 1', [row.conversation_id, userId]);
+      if (!members.length) return false;
+      if (members[0].kind !== 'server') return true;
+      const post = await canPostInServerChannel(userId, row.conversation_id, `[[poll:${row.id || 'new'}]]`);
+      if (!post.allowed || !post.context?.permissions.has('create_poll')) return false;
+      return true;
     }
     return row.channel !== 'announcement' || admin;
   }
@@ -454,10 +621,21 @@ async function canInsert(table, row, userId, access) {
   }
   if (table === 'poll_votes') {
     if (row.user_id !== userId) return false;
-    const [poll] = await pool.execute('SELECT p.id FROM polls p JOIN poll_options o ON o.poll_id = p.id WHERE p.id = ? AND o.id = ? AND p.closed_at IS NULL AND p.ends_at > CURRENT_TIMESTAMP(3)', [row.poll_id, row.option_id]);
-    return poll.length > 0;
+    const [poll] = await pool.execute('SELECT p.id, p.conversation_id, c.kind FROM polls p JOIN poll_options o ON o.poll_id = p.id LEFT JOIN conversations c ON c.id = p.conversation_id WHERE p.id = ? AND o.id = ? AND p.closed_at IS NULL AND p.ends_at > CURRENT_TIMESTAMP(3)', [row.poll_id, row.option_id]);
+    if (!poll.length) return false;
+    if (poll[0].conversation_id) {
+      if (poll[0].kind === 'server') {
+        const server = await serverChannelContext(poll[0].conversation_id, userId);
+        return Boolean(server?.context?.member && server.context.permissions.has('view_channel'));
+      }
+      const [member] = await pool.execute('SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ? LIMIT 1', [poll[0].conversation_id, userId]);
+      return member.length > 0;
+    }
+    return true;
   }
   if (table === 'conversation_members') {
+    const [conversation] = await pool.execute('SELECT kind FROM conversations WHERE id = ? LIMIT 1', [row.conversation_id]);
+    if (conversation[0]?.kind === 'server') return false;
     if (row.role && row.role !== 'member') return false;
     if (admin) return true;
     if (row.user_id === userId) {
@@ -467,7 +645,7 @@ async function canInsert(table, row, userId, access) {
     const [member] = await pool.execute("SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ? AND role IN ('owner','admin') LIMIT 1", [row.conversation_id, userId]);
     return member.length > 0;
   }
-  if (table === 'conversations') return row.created_by === userId;
+  if (table === 'conversations') return row.created_by === userId && row.kind !== 'server';
   return access.sql !== '1 = 0' && admin;
 }
 

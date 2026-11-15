@@ -33,7 +33,8 @@ USE_MARIADB=false npm run db:migrate
 
 `npm run db:migrate` picks `database/schema.postgres.sql` automatically when
 `USE_MARIADB=false`. The schema mirrors `database/schema.sql`: same tables,
-columns, foreign keys, and unique constraints. Differences worth knowing:
+columns, foreign keys, and unique constraints — including the 1.3.0 friend-pair
+and server tables. Differences worth knowing:
 
 - `DATETIME(3)` maps to `TIMESTAMP(3)` stored in UTC; the API pins each
   session's timezone to UTC, matching MariaDB's `timezone: 'Z'` behavior.

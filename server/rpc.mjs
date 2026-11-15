@@ -3,6 +3,20 @@ import { pool, isPostgres } from './db.mjs';
 import { encryptField } from './encryption.mjs';
 import { notifyNewMessage } from './notifications.mjs';
 import { cachedUserRoles } from './redis.mjs';
+import { ensureDirectMessage, friendPair } from './dm.mjs';
+import {
+  respondFriendRequest,
+  blockUser,
+  cancelFriendRequest,
+  getBlockedUsers,
+  getFriendRequests,
+  getFriends,
+  sendFriendRequest,
+  unblockUser,
+  unfriend,
+} from './friends.mjs';
+import { callServerRpc } from './servers.mjs';
+import { canPostInServerChannel, serverChannelForConversation } from './permissions.mjs';
 
 // Boolean columns are BOOLEAN in PostgreSQL but tinyint(1) in MariaDB; pass
 // the right JS type per dialect (mysql2 wants 0/1, node-postgres wants bool).
@@ -36,6 +50,11 @@ async function adminCheck(userId, connection = pool) {
 async function groupRole(userId, conversationId, connection = pool) {
   const [rows] = await connection.execute('SELECT role FROM conversation_members WHERE conversation_id = ? AND user_id = ? LIMIT 1', [conversationId, userId]);
   return rows[0]?.role || null;
+}
+
+async function requireGroupConversation(conversationId, connection = pool) {
+  const [rows] = await connection.execute("SELECT kind, is_group FROM conversations WHERE id = ? LIMIT 1", [conversationId]);
+  if (!rows.length || rows[0].kind === 'server' || !rows[0].is_group) throw new Error('This action is only available for group chats.');
 }
 
 async function userDmList(userId) {
@@ -73,7 +92,7 @@ async function userGroupList(userId) {
       (SELECT JSON_ARRAYAGG(JSON_OBJECT('id', p.id, 'username', p.username, 'display_name', p.display_name, 'avatar_url', p.avatar_url))
          FROM conversation_members cm JOIN profiles p ON p.id = cm.user_id WHERE cm.conversation_id = c.id) AS member_previews
      FROM conversations c JOIN conversation_members mine ON mine.conversation_id = c.id AND mine.user_id = ?
-     WHERE c.is_group = 1
+     WHERE c.is_group = 1 AND c.kind <> 'server'
      ORDER BY is_pinned DESC, last_message_at DESC`,
     [userId, userId, userId],
   );
@@ -122,6 +141,15 @@ export async function callRpc(userId, name, args = {}) {
         ORDER BY message_count DESC LIMIT ?`, [limit]);
       return rows;
     }
+    case 'get_friends': return getFriends(userId);
+    case 'get_friend_requests': return getFriendRequests(userId);
+    case 'get_blocked_users': return getBlockedUsers(userId);
+    case 'send_friend_request': return sendFriendRequest(userId, args);
+    case 'respond_friend_request': return respondFriendRequest(userId, args);
+    case 'cancel_friend_request': return cancelFriendRequest(userId, args);
+    case 'unfriend': return unfriend(userId, args);
+    case 'block_user': return blockUser(userId, args);
+    case 'unblock_user': return unblockUser(userId, args);
     case 'get_or_create_dm': return getOrCreateDm(userId, args._other_user_id);
     case 'create_group_chat': return createGroupChat(userId, args._name, args._member_ids || []);
     case 'rename_group': return renameGroup(userId, args._conv, args._name);
@@ -156,7 +184,11 @@ export async function callRpc(userId, name, args = {}) {
     case 'get_user_sessions':
     case 'revoke_user_session':
       throw new Error('Session management is not available through the data RPC API.');
-    default: throw new Error(`Unsupported database action: ${name}`);
+    default: {
+      const serverResult = await callServerRpc(userId, name, args);
+      if (serverResult.handled) return serverResult.data;
+      throw new Error(`Unsupported database action: ${name}`);
+    }
   }
 }
 
@@ -190,11 +222,18 @@ async function createPoll(userId, args = {}) {
   try {
     await connection.beginTransaction();
     if (channel === 'dm') {
-      const [members] = await connection.execute(
-        'SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ? LIMIT 1',
-        [conversationId, userId],
-      );
-      if (!members.length) throw new Error('You are not a member of this conversation.');
+      const serverChannel = await serverChannelForConversation(conversationId, connection);
+      if (serverChannel) {
+        const post = await canPostInServerChannel(userId, conversationId, `[[poll:${pollId}]]`, connection);
+        if (!post.allowed) throw new Error('You cannot post in this channel.');
+        if (!post.context?.permissions.has('create_poll')) throw new Error('You cannot create polls in this channel.');
+      } else {
+        const [members] = await connection.execute(
+          'SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ? LIMIT 1',
+          [conversationId, userId],
+        );
+        if (!members.length) throw new Error('You are not a member of this conversation.');
+      }
     } else if (channel === 'announcement' && !await adminCheck(userId, connection)) {
       throw new Error('Admin access required.');
     }
@@ -211,8 +250,8 @@ async function createPoll(userId, args = {}) {
     const marker = `[[poll:${pollId}]]`;
     if (channel === 'dm') {
       await connection.execute(
-        'INSERT INTO messages (id, conversation_id, sender_id, content) VALUES (?, ?, ?, ?)',
-        [messageId, conversationId, userId, encryptField(marker)],
+        'INSERT INTO messages (id, conversation_id, sender_id, content, preview) VALUES (?, ?, ?, ?, ?)',
+        [messageId, conversationId, userId, encryptField(marker), 'Poll'],
       );
     } else {
       await connection.execute(
@@ -243,43 +282,6 @@ async function createPoll(userId, args = {}) {
   };
 }
 
-export async function ensureDirectMessage(userId, otherId) {
-  if (!otherId || otherId === userId) throw new Error('Choose another user to start a conversation.');
-  const [blocked] = await pool.execute('SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1', [userId, otherId, otherId, userId]);
-  if (blocked.length) throw new Error('This conversation is unavailable.');
-  const [friendship] = await pool.execute("SELECT id FROM friend_requests WHERE status = 'accepted' AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)) LIMIT 1", [userId, otherId, otherId, userId]);
-  if (!friendship.length) throw new Error('You can only message accepted friends.');
-  // Fast path: an existing DM for this pair.
-  const [low, high] = [userId, otherId].sort();
-  const [existing] = await pool.execute('SELECT conversation_id FROM dm_pairs WHERE user_low = ? AND user_high = ?', [low, high]);
-  if (existing.length) return existing[0].conversation_id;
-  // Atomic claim: dm_pairs' primary key guarantees exactly one concurrent
-  // caller wins the insert; losers read the winner's conversation_id. The
-  // INSERT ... waits on the winner's row lock, so the follow-up SELECT sees
-  // the committed pair row.
-  const id = randomUUID();
-  const connection = await pool.getConnection();
-  try {
-    await connection.beginTransaction();
-    const [claim] = await connection.execute(
-      'INSERT IGNORE INTO dm_pairs (user_low, user_high, conversation_id) VALUES (?, ?, ?)',
-      [low, high, id],
-    );
-    if (!claim.affectedRows) {
-      const [pair] = await connection.execute('SELECT conversation_id FROM dm_pairs WHERE user_low = ? AND user_high = ?', [low, high]);
-      await connection.commit();
-      return pair[0].conversation_id;
-    }
-    await connection.execute('INSERT INTO conversations (id, is_group, created_by) VALUES (?, ?, ?)', [id, boolParam(false), userId]);
-    await connection.execute('INSERT INTO conversation_members (id, conversation_id, user_id, role) VALUES (?, ?, ?, ?), (?, ?, ?, ?)', [randomUUID(), id, userId, 'member', randomUUID(), id, otherId, 'member']);
-    await connection.commit();
-    return id;
-  } catch (error) {
-    await connection.rollback();
-    throw error;
-  } finally { connection.release(); }
-}
-
 const getOrCreateDm = ensureDirectMessage;
 
 async function createGroupChat(userId, name, memberIds) {
@@ -293,12 +295,22 @@ async function createGroupChat(userId, name, memberIds) {
     const [profiles] = await connection.execute(`SELECT id FROM profiles WHERE id IN (${uniqueIds.map(() => '?').join(',')})`, uniqueIds);
     if (profiles.length !== uniqueIds.length) throw new Error('One or more group members do not exist.');
     for (const memberId of uniqueIds.filter((id) => id !== userId)) {
-      const [friendship] = await connection.execute("SELECT 1 FROM friend_requests WHERE status = 'accepted' AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)) LIMIT 1", [userId, memberId, memberId, userId]);
+      const [low, high] = friendPair(userId, memberId);
+      const [friendship] = await connection.execute("SELECT 1 FROM friend_requests WHERE status = 'accepted' AND user_low = ? AND user_high = ? LIMIT 1", [low, high]);
       if (!friendship.length) throw new Error('You can only add accepted friends to a group.');
       const [blocked] = await connection.execute('SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1', [userId, memberId, memberId, userId]);
       if (blocked.length) throw new Error('A selected group member is unavailable.');
     }
-    await connection.execute('INSERT INTO conversations (id, is_group, name, created_by) VALUES (?, ?, ?, ?)', [id, boolParam(true), String(name).trim(), userId]);
+    for (let i = 0; i < uniqueIds.length; i += 1) {
+      for (let j = i + 1; j < uniqueIds.length; j += 1) {
+        const [pairBlocked] = await connection.execute(
+          'SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1',
+          [uniqueIds[i], uniqueIds[j], uniqueIds[j], uniqueIds[i]],
+        );
+        if (pairBlocked.length) throw new Error('A selected group member is unavailable.');
+      }
+    }
+    await connection.execute('INSERT INTO conversations (id, is_group, kind, name, created_by) VALUES (?, ?, ?, ?, ?)', [id, boolParam(true), 'group', String(name).trim(), userId]);
     for (const member of uniqueIds) await connection.execute('INSERT INTO conversation_members (id, conversation_id, user_id, role) VALUES (?, ?, ?, ?)', [randomUUID(), id, member, member === userId ? 'owner' : 'member']);
     await connection.commit();
     return id;
@@ -315,24 +327,36 @@ async function requireGroupAdmin(userId, conv, connection = pool) {
 }
 
 async function renameGroup(userId, conv, name) {
+  await requireGroupConversation(conv);
   await requireGroupAdmin(userId, conv);
   await pool.execute('UPDATE conversations SET name = ? WHERE id = ? AND is_group = 1', [String(name).trim(), conv]);
   return null;
 }
 
 async function addGroupMembers(userId, conv, userIds) {
+  await requireGroupConversation(conv);
   await requireGroupAdmin(userId, conv);
   for (const member of [...new Set(userIds)]) {
-    const [friendship] = await pool.execute("SELECT 1 FROM friend_requests WHERE status = 'accepted' AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)) LIMIT 1", [userId, member, member, userId]);
+    const [low, high] = friendPair(userId, member);
+    const [friendship] = await pool.execute("SELECT 1 FROM friend_requests WHERE status = 'accepted' AND user_low = ? AND user_high = ? LIMIT 1", [low, high]);
     if (!friendship.length) throw new Error('You can only add accepted friends to a group.');
     const [blocked] = await pool.execute('SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1', [userId, member, member, userId]);
     if (blocked.length) throw new Error('A selected group member is unavailable.');
+    const [existing] = await pool.execute('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id <> ?', [conv, member]);
+    for (const row of existing) {
+      const [pairBlocked] = await pool.execute(
+        'SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1',
+        [member, row.user_id, row.user_id, member],
+      );
+      if (pairBlocked.length) throw new Error('A selected group member is unavailable.');
+    }
     await pool.execute('INSERT IGNORE INTO conversation_members (id, conversation_id, user_id, role) VALUES (?, ?, ?, \'member\')', [randomUUID(), conv, member]);
   }
   return null;
 }
 
 async function removeGroupMember(userId, conv, targetId) {
+  await requireGroupConversation(conv);
   const role = await requireGroupAdmin(userId, conv);
   if (targetId === userId && role === 'owner') throw new Error('Transfer ownership before leaving the group.');
   if (await groupRole(targetId, conv) === 'owner') throw new Error('Transfer ownership before removing the owner.');
@@ -341,6 +365,7 @@ async function removeGroupMember(userId, conv, targetId) {
 }
 
 async function setMemberRole(userId, conv, targetId, role) {
+  await requireGroupConversation(conv);
   const actorRole = await requireGroupAdmin(userId, conv);
   if (actorRole !== 'owner') throw new Error('Only the group owner can change roles.');
   if (!['admin', 'member'].includes(role)) throw new Error('Invalid group role.');
@@ -349,6 +374,7 @@ async function setMemberRole(userId, conv, targetId, role) {
 }
 
 async function transferOwnership(userId, conv, targetId) {
+  await requireGroupConversation(conv);
   const actorRole = await requireGroupAdmin(userId, conv);
   if (actorRole !== 'owner') throw new Error('Only the group owner can transfer ownership.');
   const connection = await pool.getConnection();
@@ -365,6 +391,7 @@ async function transferOwnership(userId, conv, targetId) {
 }
 
 async function leaveGroup(userId, conv) {
+  await requireGroupConversation(conv);
   const role = await groupRole(userId, conv);
   if (role === 'owner') {
     // A sole-member group would be orphaned forever — let the owner delete it.

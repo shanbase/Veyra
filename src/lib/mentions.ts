@@ -68,12 +68,16 @@ export function messageMentionsEveryone(content: string): boolean {
  * Does the message body mention the current user OR `@everyone`?
  * Used to decide whether to show the red mention indicator.
  */
+export function messageMentionsHere(content: string): boolean {
+  return new RegExp(`${PRE}@here${POST}`, "i").test(content);
+}
+
 export function messageMentionsMe(
   content: string,
   myUsername: string | null | undefined,
 ): boolean {
   if (!content) return false;
-  if (messageMentionsEveryone(content)) return true;
+  if (messageMentionsEveryone(content) || messageMentionsHere(content)) return true;
   if (myUsername && messageMentionsUser(content, myUsername)) return true;
   return false;
 }
@@ -84,7 +88,7 @@ export function messageMentionsMe(
  * eliminate substring false positives (e.g. `@bob` inside `@bobby`).
  */
 export function mentionIlikePatterns(myUsername: string | null | undefined): string[] {
-  const patterns = ["%@everyone%"];
+  const patterns = ["%@everyone%", "%@here%"];
   if (myUsername) patterns.push(`%@${myUsername}%`);
   return patterns;
 }

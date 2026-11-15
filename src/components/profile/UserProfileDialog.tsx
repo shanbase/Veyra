@@ -195,32 +195,24 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
       setRel("unavailable");
       return;
     }
-    const { data, error } = await supabase
-      .from("friend_requests")
-      .select("id, sender_id, receiver_id, status")
-      .or(
-        `and(sender_id.eq.${user.id},receiver_id.eq.${userId}),and(sender_id.eq.${userId},receiver_id.eq.${user.id})`,
-      )
-      .order("updated_at", { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    if (error) {
-      setRel("none");
-      setRequestId(null);
+    const [friendsResult, requestsResult] = await Promise.all([
+      supabase.rpc("get_friends"),
+      supabase.rpc("get_friend_requests"),
+    ]);
+    const friend = ((friendsResult.data || []) as any[]).find((row) => row.id === userId || row.user_id === userId);
+    if (friend) {
+      setRel("friends");
+      setRequestId(friend.friendship_id ?? null);
       return;
     }
-    if (!data) {
-      setRel(profile?.allow_friend_requests === false ? "requests_off" : "none");
-      setRequestId(null);
+    const request = ((requestsResult.data || []) as any[]).find((row) => row.other_user_id === userId);
+    if (request) {
+      setRequestId(request.id);
+      setRel(request.direction === "incoming" ? "received" : "sent");
       return;
     }
-    setRequestId(data.id);
-    if (data.status === "accepted") setRel("friends");
-    else if (data.status === "pending") {
-      setRel(data.sender_id === user.id ? "sent" : "received");
-    } else {
-      setRel(profile?.allow_friend_requests === false ? "requests_off" : "none");
-    }
+    setRel(profile?.allow_friend_requests === false ? "requests_off" : "none");
+    setRequestId(null);
   }, [userId, user, profile?.status, profile?.allow_friend_requests]);
 
   useEffect(() => {
@@ -255,39 +247,25 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
     setActionPending(true);
     const prev = rel;
     setRel("sent"); // optimistic
-
-    // Clear any stale row in the reverse direction (e.g. a rejected request
-    // they once sent us) so the unique constraint can't trip us up.
-    await supabase
-      .from("friend_requests")
-      .delete()
-      .eq("sender_id", userId)
-      .eq("receiver_id", user.id);
-
-    const { data, error } = await supabase
-      .from("friend_requests")
-      .upsert(
-        { sender_id: user.id, receiver_id: userId, status: "pending" },
-        { onConflict: "sender_id,receiver_id" },
-      )
-      .select("id")
-      .single();
+    const { data, error } = await supabase.rpc("send_friend_request", { _other_id: userId });
     if (error) {
       setRel(prev);
       toast.error(error.message || "Failed to send friend request");
     } else {
-      setRequestId(data.id);
-      toast.success("Friend request sent");
+      const status = (data as any)?.status;
+      setRel(status === "already_friends" ? "friends" : status === "pending_incoming" ? "received" : "sent");
+      setRequestId((data as any)?.friendship_id ?? null);
+      toast.success(status === "already_friends" ? "You're already friends" : "Friend request sent");
     }
     setActionPending(false);
   };
 
   const cancelRequest = async () => {
-    if (!requestId || actionPending) return;
+    if (!user || !userId || actionPending) return;
     setActionPending(true);
     const prev = rel;
     setRel("none");
-    const { error } = await supabase.from("friend_requests").delete().eq("id", requestId);
+    const { error } = await supabase.rpc("cancel_friend_request", { _other_id: userId });
     if (error) {
       setRel(prev);
       toast.error(error.message || "Failed to cancel");
@@ -299,14 +277,11 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
   };
 
   const acceptRequest = async () => {
-    if (!requestId || actionPending) return;
+    if (!user || !userId || actionPending) return;
     setActionPending(true);
     const prev = rel;
     setRel("friends");
-    const { error } = await supabase
-      .from("friend_requests")
-      .update({ status: "accepted" })
-      .eq("id", requestId);
+    const { error } = await supabase.rpc("respond_friend_request", { _other_id: userId, _accept: true });
     if (error) {
       setRel(prev);
       toast.error(error.message || "Failed to accept");
@@ -314,46 +289,6 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
       toast.success("Friend added");
     }
     setActionPending(false);
-  };
-
-  // Remove any friendship/pending request and leave the shared DM. Shared by
-  // both the Unfriend action and the Block action (block also unfriends).
-  const removeFriendship = async () => {
-    if (!user || !userId) return;
-    let removedConversationId: string | null = null;
-    try {
-      const { data: list } = await supabase.rpc("get_user_dm_list");
-      const existing = (list || []).find((r: any) => r.other_user_id === userId);
-      removedConversationId = existing?.conversation_id ?? null;
-    } catch {
-      /* non-fatal */
-    }
-
-    const { error } = await supabase
-      .from("friend_requests")
-      .delete()
-      .or(
-        `and(sender_id.eq.${user.id},receiver_id.eq.${userId}),and(sender_id.eq.${userId},receiver_id.eq.${user.id})`,
-      );
-    if (error) throw error;
-
-    if (removedConversationId) {
-      try {
-        await supabase
-          .from("conversation_members")
-          .delete()
-          .eq("conversation_id", removedConversationId)
-          .eq("user_id", user.id);
-      } catch {
-        /* non-fatal */
-      }
-    }
-
-    window.dispatchEvent(
-      new CustomEvent("friend-removed", {
-        detail: { otherUserId: userId, conversationId: removedConversationId },
-      }),
-    );
   };
 
   const unfriend = async () => {
@@ -364,7 +299,14 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
     setRel("none");
     setRequestId(null);
     try {
-      await removeFriendship();
+      const { data, error } = await supabase.rpc("unfriend", { _other_id: userId });
+      if (error) throw error;
+      const result = data as any;
+      window.dispatchEvent(
+        new CustomEvent("friend-removed", {
+          detail: { otherUserId: userId, conversationId: result?.conversation_id || null },
+        }),
+      );
       toast.success("Removed friend");
     } catch (error: any) {
       setRel(prev);
@@ -379,16 +321,13 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
     if (!user || !userId || blockPending) return;
     setBlockPending(true);
     try {
-      // Blocking also unfriends (silent — they aren't notified).
-      await removeFriendship().catch(() => {});
-      const { error } = await supabase
-        .from("blocked_users")
-        .insert({ blocker_id: user.id, blocked_id: userId });
-      if (error && !error.message.includes("duplicate")) throw error;
+      const { data, error } = await supabase.rpc("block_user", { _other_id: userId });
+      if (error) throw error;
       setBlockedByMe(true);
       setRel("none");
       setRequestId(null);
       window.dispatchEvent(new CustomEvent("user-blocked", { detail: { userId } }));
+      window.dispatchEvent(new CustomEvent("friend-removed", { detail: { otherUserId: userId, conversationId: (data as any)?.conversation_id || null } }));
       toast.success("User blocked");
     } catch (error: any) {
       toast.error(error.message || "Failed to block user");
@@ -401,11 +340,7 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
     if (!user || !userId || blockPending) return;
     setBlockPending(true);
     try {
-      const { error } = await supabase
-        .from("blocked_users")
-        .delete()
-        .eq("blocker_id", user.id)
-        .eq("blocked_id", userId);
+      const { error } = await supabase.rpc("unblock_user", { _other_id: userId });
       if (error) throw error;
       setBlockedByMe(false);
       window.dispatchEvent(new CustomEvent("user-unblocked", { detail: { userId } }));

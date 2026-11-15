@@ -2,6 +2,24 @@
 
 GitHub Releases are the public update source for the Windows desktop and Android apps. A release is created by pushing a semantic version tag in the form `vMAJOR.MINOR.PATCH`, for example `v1.2.0`. The release workflow builds both apps, attaches their installers, generates `latest.json`, and publishes the release. Pull request and branch builds do not publish releases.
 
+## Veyra 1.3.0
+
+Feature release that adds user-created servers and rebuilds the friends experience:
+
+- **Servers:** create/join servers from templates or invite codes, with server icons/banners, categories, text channels, roles/permissions, member lists, nicknames, timeouts, kicks, bans, read-only channels, slow mode, verification levels, and invite management. Server channels reuse the normal message pipeline with server-side permission checks.
+- **Discord-style shell:** a server rail, channel sidebar, chat pane, and member list now sit alongside the existing Direct Messages, Global Chat, and Announcements surfaces.
+- **Friends:** normalized friend-request state fixes duplicate/stale requests; new Online/All/Pending/Blocked/Add Friend views, accept/decline/cancel/unfriend/block/unblock flows, and friend-only group creation.
+- **Mentions:** Discord-style markdown plus `@user`, `@everyone`, `@here`, role (`<@&id>`), and channel (`<#id>`) mentions with permission-aware autocomplete and rendering.
+- **Media:** avatars, banners, group icons, server icons/banners, and chat attachments support JPEG/PNG/WebP/GIF/AVIF where applicable.
+- **Realtime/notifications:** server membership fanout, server-aware unread/mention badges, permission-filtered push recipients, and native/desktop notification metadata for server channels.
+- **Compatibility:** MariaDB remains authoritative; PostgreSQL schema/RPC compatibility is updated, and web/Electron/Android share the same API contracts.
+
+### Downloads (once published)
+
+- Windows: `Veyra1.3.0.exe`
+- Android: `AndroidVeyra1.3.0.apk`
+- Update metadata: `latest.json`
+
 ## Veyra 1.2.6
 
 Fixes and hardening release on top of 1.2.5:

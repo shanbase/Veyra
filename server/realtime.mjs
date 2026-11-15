@@ -1,13 +1,16 @@
 import { createHmac } from 'node:crypto';
 import { pool } from './db.mjs';
+import { defaultEveryonePermissions, parsePermissions } from './permissions.mjs';
 import { acknowledgeRealtimeBatch, enqueueRealtimeBatch, pendingRealtimeBatches, redisGetJson, redisSetJson } from './redis.mjs';
 
 const PUBLIC_TOPIC = 'veyra-public-mariadb';
 const SAFE_KEYS = new Set([
   'id', 'user_id', 'conversation_id', 'message_id', 'poll_id', 'option_id',
   'sender_id', 'receiver_id', 'blocker_id', 'blocked_id', 'group_id',
+  'server_id', 'role_id', 'category_id', 'channel_id',
 ]);
 const publicTables = new Set(['global_messages', 'announcement_messages']);
+const serverTables = new Set(['servers', 'server_roles', 'server_members', 'server_bans', 'server_categories', 'server_channels', 'server_invites']);
 const messageTables = new Set(['messages', 'global_messages', 'announcement_messages']);
 const MESSAGE_EVENT_COLUMNS = new Set([
   'id', 'conversation_id', 'sender_id', 'content', 'image_url', 'reply_to_id',
@@ -78,6 +81,52 @@ async function conversationMembers(conversationId, cache) {
   return cache.get(conversationId);
 }
 
+async function serverMembers(serverId, cache) {
+  if (!serverId) return [];
+  const cacheKey = `server:${serverId}`;
+  if (!cache.has(cacheKey)) {
+    cache.set(cacheKey, (async () => {
+      const redisKey = `veyra:v1:smembers:${serverId}`;
+      const cached = await redisGetJson(redisKey);
+      if (Array.isArray(cached)) return cached;
+      const [rows] = await pool.execute('SELECT user_id FROM server_members WHERE server_id = ?', [serverId]);
+      const ids = rows.map((row) => row.user_id);
+      await redisSetJson(redisKey, ids, 20);
+      return ids;
+    })());
+  }
+  return cache.get(cacheKey);
+}
+
+async function serverViewableMembers(serverId, cache) {
+  const cacheKey = `viewable:${serverId}`;
+  if (!cache.has(cacheKey)) {
+    cache.set(cacheKey, (async () => {
+      const [servers] = await pool.execute('SELECT owner_id FROM servers WHERE id = ? LIMIT 1', [serverId]);
+      const ownerId = servers[0]?.owner_id;
+      const [roles] = await pool.execute('SELECT * FROM server_roles WHERE server_id = ?', [serverId]);
+      const defaultRoles = roles.filter((role) => role.is_default);
+      const roleById = new Map(roles.map((role) => [role.id, role]));
+      const basePermissions = defaultRoles.length
+        ? new Set(defaultRoles.flatMap((role) => [...parsePermissions(role.permissions)]))
+        : new Set(Object.keys(defaultEveryonePermissions()).filter((key) => defaultEveryonePermissions()[key]));
+      const [members] = await pool.execute('SELECT user_id, role_id FROM server_members WHERE server_id = ?', [serverId]);
+      const ids = [];
+      for (const member of members) {
+        if (member.user_id === ownerId) { ids.push(member.user_id); continue; }
+        const memberRoles = [...defaultRoles];
+        if (member.role_id && roleById.has(member.role_id)) memberRoles.push(roleById.get(member.role_id));
+        if (memberRoles.some((role) => role.administrator)) { ids.push(member.user_id); continue; }
+        const permissions = new Set(basePermissions);
+        for (const role of memberRoles) for (const permission of parsePermissions(role.permissions)) permissions.add(permission);
+        if (permissions.has('view_channel')) ids.push(member.user_id);
+      }
+      return ids;
+    })());
+  }
+  return cache.get(cacheKey);
+}
+
 async function recipientsFor(change, actorId, membershipCache) {
   const keys = collectKeys(change.values, change.filters, change.data, change.realtimeRows);
   if (publicTables.has(change.table)) return { keys, users: [], isPublic: true };
@@ -112,6 +161,17 @@ async function recipientsFor(change, actorId, membershipCache) {
     if (conversationId == null) return { keys, users: [], isPublic: true };
   } else if (change.table === 'conversations') {
     conversationId = conversationId || keys.id;
+  } else if (serverTables.has(change.table)) {
+    let serverId = keys.server_id || (change.table === 'servers' ? keys.id : null);
+    if (!serverId && keys.id) {
+      const [rows] = await pool.execute(`SELECT server_id FROM ${change.table} WHERE id = ? LIMIT 1`, [keys.id]);
+      serverId = rows[0]?.server_id;
+    }
+    if (serverId) {
+      keys.server_id = serverId;
+      for (const memberId of await serverMembers(serverId, membershipCache)) users.add(memberId);
+    }
+    if (keys.user_id) users.add(keys.user_id);
   } else if (change.table === 'friend_requests') {
     if ((!keys.sender_id || !keys.receiver_id) && keys.id) {
       const [rows] = await pool.execute('SELECT sender_id, receiver_id FROM friend_requests WHERE id = ? LIMIT 1', [keys.id]);
@@ -132,7 +192,12 @@ async function recipientsFor(change, actorId, membershipCache) {
 
   if (conversationId) {
     keys.conversation_id = conversationId;
-    for (const memberId of await conversationMembers(conversationId, membershipCache)) users.add(memberId);
+    const [serverChannel] = await pool.execute('SELECT server_id FROM server_channels WHERE conversation_id = ? LIMIT 1', [conversationId]);
+    if (serverChannel[0]?.server_id) {
+      for (const memberId of await serverViewableMembers(serverChannel[0].server_id, membershipCache)) users.add(memberId);
+    } else {
+      for (const memberId of await conversationMembers(conversationId, membershipCache)) users.add(memberId);
+    }
   }
   if (change.table === 'conversation_members' && keys.user_id) users.add(keys.user_id);
 
@@ -242,7 +307,75 @@ export function changeFromDataRequest(payload, result) {
   };
 }
 
+const friendRequestChange = (result, eventType, extra = {}) => result?.friendship_id ? [
+  { table: 'friend_requests', eventType, operation: 'rpc', values: { id: result.friendship_id, ...extra }, columns: ['id'] },
+] : [];
+
+const serverScopedChange = (table, eventType, result, extra = {}, columns = []) => {
+  const serverId = result?.server_id;
+  return serverId ? [{ table, eventType, operation: 'rpc', values: { server_id: serverId, ...extra }, columns }] : [];
+};
+
 const RPC_CHANGES = {
+  send_friend_request: (_args, result) => friendRequestChange(result, 'INSERT', result?.user?.id ? { sender_id: null, receiver_id: result.user.id } : {}),
+  respond_friend_request: (_args, result) => friendRequestChange(result, 'UPDATE', result?.other_user_id ? { sender_id: null, receiver_id: result.other_user_id } : {}),
+  cancel_friend_request: (_args, result) => friendRequestChange(result, 'UPDATE', result?.other_user_id ? { sender_id: null, receiver_id: result.other_user_id } : {}),
+  unfriend: (_args, result) => [
+    ...friendRequestChange(result, 'DELETE', result?.other_user_id ? { sender_id: null, receiver_id: result.other_user_id } : {}),
+    ...(result?.conversation_id ? [{ table: 'conversation_members', eventType: 'DELETE', operation: 'rpc', values: { conversation_id: result.conversation_id, user_id: result.other_user_id || undefined }, columns: ['conversation_id', 'user_id'] }] : []),
+  ],
+  block_user: (_args, result) => [
+    ...(result?.user_id ? [{ table: 'blocked_users', eventType: 'INSERT', operation: 'rpc', values: { blocked_id: result.user_id }, columns: ['blocked_id'] }] : []),
+    ...(result?.friendship_id ? [{ table: 'friend_requests', eventType: 'DELETE', operation: 'rpc', values: { id: result.friendship_id }, columns: ['id'] }] : []),
+    ...(result?.conversation_id ? [{ table: 'conversation_members', eventType: 'DELETE', operation: 'rpc', values: { conversation_id: result.conversation_id }, columns: ['conversation_id'] }] : []),
+  ],
+  unblock_user: (_args, result) => result?.user_id ? [{ table: 'blocked_users', eventType: 'DELETE', operation: 'rpc', values: { blocked_id: result.user_id }, columns: ['blocked_id'] }] : [],
+  create_server: (_args, result) => result?.server_id ? [
+    { table: 'servers', eventType: 'INSERT', operation: 'rpc', values: { id: result.server_id }, columns: ['id'] },
+    { table: 'server_roles', eventType: 'INSERT', operation: 'rpc', values: { server_id: result.server_id }, columns: ['server_id'] },
+    { table: 'server_members', eventType: 'INSERT', operation: 'rpc', values: { server_id: result.server_id }, columns: ['server_id'] },
+    { table: 'server_channels', eventType: 'INSERT', operation: 'rpc', values: { server_id: result.server_id }, columns: ['server_id'] },
+  ] : [],
+  get_my_servers: () => [],
+  get_server_view: () => [],
+  update_server: (_args, result) => serverScopedChange('servers', 'UPDATE', result, {}, ['name', 'description', 'icon_url', 'banner_url', 'verification_level']),
+  delete_server: (_args, result) => result?.server_id ? [
+    { table: 'servers', eventType: 'DELETE', operation: 'rpc', values: { id: result.server_id }, columns: ['id'] },
+    ...(result.member_ids || []).map((userId) => ({ table: 'server_members', eventType: 'DELETE', operation: 'rpc', values: { server_id: result.server_id, user_id: userId }, columns: ['server_id', 'user_id'] })),
+  ] : [],
+  leave_server: (_args, result) => serverScopedChange('server_members', 'DELETE', result),
+  kick_member: (_args, result) => serverScopedChange('server_members', 'DELETE', result, result?.user_id ? { user_id: result.user_id } : {}),
+  ban_member: (_args, result) => [
+    ...serverScopedChange('server_members', 'DELETE', result, result?.user_id ? { user_id: result.user_id } : {}),
+    ...serverScopedChange('server_bans', 'INSERT', result, result?.user_id ? { user_id: result.user_id } : {}, ['server_id', 'user_id']),
+  ],
+  unban_member: (_args, result) => serverScopedChange('server_bans', 'DELETE', result, result?.user_id ? { user_id: result.user_id } : {}),
+  list_bans: () => [],
+  set_server_member_role: (_args, result) => serverScopedChange('server_members', 'UPDATE', result, result?.user_id ? { user_id: result.user_id } : {}, ['role_id']),
+  set_member_nickname: (_args, result) => serverScopedChange('server_members', 'UPDATE', result, result?.user_id ? { user_id: result.user_id } : {}, ['nickname']),
+  timeout_member: (_args, result) => serverScopedChange('server_members', 'UPDATE', result, result?.user_id ? { user_id: result.user_id } : {}, ['timed_out_until']),
+  create_channel: (_args, result) => [
+    ...serverScopedChange('server_channels', 'INSERT', result, result?.channel_id ? { id: result.channel_id } : {}, ['id', 'server_id']),
+    ...(result?.conversation_id ? [{ table: 'conversations', eventType: 'INSERT', operation: 'rpc', values: { id: result.conversation_id }, columns: ['id'] }] : []),
+    ...(result?.conversation_id ? [{ table: 'conversation_members', eventType: 'INSERT', operation: 'rpc', values: { conversation_id: result.conversation_id }, columns: ['conversation_id'] }] : []),
+  ],
+  update_channel: (_args, result) => serverScopedChange('server_channels', 'UPDATE', result, result?.channel_id ? { id: result.channel_id } : {}, ['name', 'topic', 'category_id', 'position', 'slow_mode_seconds', 'is_readonly']),
+  delete_channel: (_args, result) => serverScopedChange('server_channels', 'DELETE', result, result?.channel_id ? { id: result.channel_id } : {}),
+  reorder_channels: (_args, result) => serverScopedChange('server_channels', 'UPDATE', result),
+  create_category: (_args, result) => serverScopedChange('server_categories', 'INSERT', result, result?.category_id ? { id: result.category_id } : {}, ['id', 'server_id']),
+  update_category: (_args, result) => serverScopedChange('server_categories', 'UPDATE', result, result?.category_id ? { id: result.category_id } : {}, ['name', 'position']),
+  delete_category: (_args, result) => serverScopedChange('server_categories', 'DELETE', result, result?.category_id ? { id: result.category_id } : {}),
+  create_role: (_args, result) => serverScopedChange('server_roles', 'INSERT', result, result?.role_id ? { id: result.role_id } : {}, ['id', 'server_id']),
+  update_role: (_args, result) => serverScopedChange('server_roles', 'UPDATE', result, result?.role_id ? { id: result.role_id } : {}, ['name', 'color', 'position', 'hoist', 'mentionable', 'permissions', 'administrator']),
+  delete_role: (_args, result) => serverScopedChange('server_roles', 'DELETE', result, result?.role_id ? { id: result.role_id } : {}),
+  reorder_roles: (_args, result) => serverScopedChange('server_roles', 'UPDATE', result),
+  create_invite: (_args, result) => serverScopedChange('server_invites', 'INSERT', result, result?.invite_id ? { id: result.invite_id } : {}, ['id', 'server_id']),
+  list_invites: () => [],
+  revoke_invite: (_args, result) => serverScopedChange('server_invites', 'UPDATE', result, result?.invite_id ? { id: result.invite_id } : {}, ['revoked_at']),
+  join_server_by_code: (_args, result) => result?.server_id ? [
+    { table: 'server_members', eventType: 'INSERT', operation: 'rpc', values: { server_id: result.server_id }, columns: ['server_id'] },
+    { table: 'server_channels', eventType: 'INSERT', operation: 'rpc', values: { server_id: result.server_id }, columns: ['server_id'] },
+  ] : [],
   get_or_create_dm: (_args, result) => result ? [
     { table: 'conversations', eventType: 'INSERT', operation: 'rpc', values: { id: result } },
     { table: 'conversation_members', eventType: 'INSERT', operation: 'rpc', values: { conversation_id: result } },

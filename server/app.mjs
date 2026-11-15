@@ -11,9 +11,10 @@ import { getSupabaseAdmin } from './supabase-admin.mjs';
 import { invalidateReadCache, consumeRateLimit, redisGetJson, redisSetJson } from './redis.mjs';
 import { assertEncryptionConfig, encryptionEnabled } from './encryption.mjs';
 import { assertQueuesConfig } from './queues.mjs';
+import { getServerMemberContext, requireServerPermission, serverChannelForConversation } from './permissions.mjs';
 
 const MAX_PROFILE_IMAGE_BYTES = 25 * 1024 * 1024;
-const PROFILE_UPLOAD_TYPES = new Set(['image/jpeg', 'image/gif']);
+const PROFILE_UPLOAD_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/avif']);
 const CHAT_UPLOAD_BUCKETS = new Set(['chat-images', 'chat-videos', 'chat-voice']);
 const MAX_CHAT_UPLOAD_BYTES = 25 * 1024 * 1024;
 
@@ -162,7 +163,7 @@ export function createApp() {
   app.post('/api/storage/profile-upload', async (req, res) => {
     const { bucket, contentType, size } = req.body || {};
     if (!['avatars', 'banners'].includes(bucket)) return res.status(400).json({ error: 'Unsupported profile image bucket.' });
-    if (!PROFILE_UPLOAD_TYPES.has(contentType)) return res.status(400).json({ error: 'Only JPEG and GIF profile images are supported.' });
+    if (!PROFILE_UPLOAD_TYPES.has(contentType)) return res.status(400).json({ error: 'JPEG, PNG, WebP, GIF, and AVIF images are supported.' });
     if (!Number.isFinite(size) || size <= 0 || size > MAX_PROFILE_IMAGE_BYTES) {
       return res.status(413).json({ error: 'Maximum file size is 25 MB.' });
     }
@@ -176,6 +177,28 @@ export function createApp() {
     } catch (error) {
       console.error('Profile image upload link failed:', error);
       res.status(503).json({ error: 'Profile image storage is not configured.' });
+    }
+  });
+  app.post('/api/storage/server-image-upload', async (req, res) => {
+    const { serverId, image, contentType, size } = req.body || {};
+    if (typeof serverId !== 'string' || !serverId || !['icon', 'banner'].includes(image)) {
+      return res.status(400).json({ error: 'Invalid server image upload.' });
+    }
+    if (!PROFILE_UPLOAD_TYPES.has(contentType)) return res.status(400).json({ error: 'JPEG, PNG, WebP, GIF, and AVIF images are supported.' });
+    if (!Number.isFinite(size) || size <= 0 || size > MAX_PROFILE_IMAGE_BYTES) {
+      return res.status(413).json({ error: 'Maximum file size is 25 MB.' });
+    }
+    try {
+      await requireServerPermission(req.user.id, serverId, 'manage_server');
+      const path = `${serverId}/${image}`;
+      const { data, error } = await getSupabaseAdmin().storage.from('avatars').createSignedUploadUrl(path, { upsert: true });
+      if (error || !data?.token) throw error || new Error('Could not create a secure upload link.');
+      const { data: publicData } = getSupabaseAdmin().storage.from('avatars').getPublicUrl(path);
+      res.json({ path, token: data.token, publicUrl: publicData.publicUrl });
+    } catch (error) {
+      const status = /not a member|Missing server permission/.test(error.message) ? 403 : 503;
+      if (status === 503) console.error('Server image upload link failed:', error);
+      res.status(status).json({ error: status === 403 ? error.message : 'Server image storage is not configured.' });
     }
   });
   app.post('/api/storage/chat-upload', async (req, res) => {
@@ -196,6 +219,14 @@ export function createApp() {
         [scope, req.user.id],
       );
       if (!members.length) return res.status(403).json({ error: 'You cannot upload media to this conversation.' });
+      const serverChannel = await serverChannelForConversation(scope);
+      if (serverChannel) {
+        const context = await getServerMemberContext(req.user.id, serverChannel.server_id);
+        const permissions = context?.permissions || new Set();
+        if (!permissions.has('view_channel') || !permissions.has('send_messages') || !permissions.has('attach_files')) {
+          return res.status(403).json({ error: 'You cannot upload media to this channel.' });
+        }
+      }
     }
     const limited = await consumeRateLimit(`chat-upload:${req.user.id}`, 120, 60_000);
     if (limited && !limited.allowed) {
@@ -238,6 +269,11 @@ export function createApp() {
           [scope, req.user.id],
         );
         if (!members.length) return res.status(403).json({ error: 'You cannot access this conversation media.' });
+        const serverChannel = await serverChannelForConversation(scope);
+        if (serverChannel) {
+          const context = await getServerMemberContext(req.user.id, serverChannel.server_id);
+          if (!context?.permissions.has('view_channel')) return res.status(403).json({ error: 'You cannot access this channel media.' });
+        }
       }
       // Signed URLs are bearer credentials but identical for every authorized
       // viewer of the same object — cache them in Redis for 50 minutes (the

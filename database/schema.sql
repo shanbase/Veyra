@@ -355,3 +355,145 @@ JOIN conversation_members a ON a.conversation_id = c.id
 JOIN conversation_members b ON b.conversation_id = c.id AND b.user_id > a.user_id
 WHERE c.is_group = 0
   AND (SELECT COUNT(*) FROM conversation_members cm WHERE cm.conversation_id = c.id) = 2;
+
+-- ---------------------------------------------------------------------------
+-- 1.3.0 additions (idempotent — safe to re-run on existing databases)
+-- ---------------------------------------------------------------------------
+
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'dm';
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS avatar_url TEXT NULL;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS preview VARCHAR(280) NULL;
+
+UPDATE conversations SET kind = 'group' WHERE is_group = 1 AND kind = 'dm';
+UPDATE conversations SET kind = 'dm' WHERE is_group = 0 AND kind <> 'dm';
+
+ALTER TABLE friend_requests ADD COLUMN IF NOT EXISTS user_low CHAR(36) NULL;
+ALTER TABLE friend_requests ADD COLUMN IF NOT EXISTS user_high CHAR(36) NULL;
+UPDATE friend_requests SET user_low = LEAST(sender_id, receiver_id), user_high = GREATEST(sender_id, receiver_id) WHERE user_low IS NULL OR user_high IS NULL;
+
+-- Collapse legacy directional duplicates to one row per unordered pair. Keep
+-- the strongest relationship: accepted > pending > rejected/cancelled, then
+-- the oldest row for deterministic ties.
+DELETE fr FROM friend_requests fr
+JOIN friend_requests keep
+  ON keep.user_low = fr.user_low
+ AND keep.user_high = fr.user_high
+ AND keep.id <> fr.id
+WHERE CASE keep.status WHEN 'accepted' THEN 3 WHEN 'pending' THEN 2 ELSE 1 END
+    > CASE fr.status WHEN 'accepted' THEN 3 WHEN 'pending' THEN 2 ELSE 1 END
+   OR (
+     CASE keep.status WHEN 'accepted' THEN 3 WHEN 'pending' THEN 2 ELSE 1 END
+     = CASE fr.status WHEN 'accepted' THEN 3 WHEN 'pending' THEN 2 ELSE 1 END
+     AND (keep.created_at < fr.created_at OR (keep.created_at = fr.created_at AND keep.id < fr.id))
+   );
+
+ALTER TABLE friend_requests MODIFY COLUMN user_low CHAR(36) NOT NULL;
+ALTER TABLE friend_requests MODIFY COLUMN user_high CHAR(36) NOT NULL;
+ALTER TABLE friend_requests ADD UNIQUE KEY IF NOT EXISTS uq_friend_request_pair_normalized (user_low, user_high);
+ALTER TABLE friend_requests ADD KEY IF NOT EXISTS idx_friend_requests_pair (user_low, user_high);
+
+CREATE TABLE IF NOT EXISTS servers (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  icon_url TEXT NULL,
+  banner_url TEXT NULL,
+  description VARCHAR(500) NULL,
+  owner_id CHAR(36) NOT NULL,
+  verification_level VARCHAR(16) NOT NULL DEFAULT 'none',
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  KEY idx_servers_owner (owner_id),
+  CONSTRAINT fk_servers_owner FOREIGN KEY (owner_id) REFERENCES profiles(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS server_roles (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  server_id CHAR(36) NOT NULL,
+  name VARCHAR(100) NOT NULL,
+  color VARCHAR(9) NULL,
+  position INT NOT NULL DEFAULT 0,
+  hoist BOOLEAN NOT NULL DEFAULT FALSE,
+  mentionable BOOLEAN NOT NULL DEFAULT FALSE,
+  is_default BOOLEAN NOT NULL DEFAULT FALSE,
+  administrator BOOLEAN NOT NULL DEFAULT FALSE,
+  permissions JSON NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_server_roles_name (server_id, name),
+  KEY idx_server_roles_server (server_id, position),
+  CONSTRAINT fk_server_roles_server FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS server_members (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  server_id CHAR(36) NOT NULL,
+  user_id CHAR(36) NOT NULL,
+  role_id CHAR(36) NULL,
+  nickname VARCHAR(80) NULL,
+  timed_out_until DATETIME(3) NULL,
+  joined_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_server_member (server_id, user_id),
+  KEY idx_server_members_user (user_id),
+  KEY idx_server_members_role (role_id),
+  CONSTRAINT fk_server_members_server FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_server_members_profile FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE,
+  CONSTRAINT fk_server_members_role FOREIGN KEY (role_id) REFERENCES server_roles(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS server_categories (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  server_id CHAR(36) NOT NULL,
+  name VARCHAR(100) NOT NULL,
+  position INT NOT NULL DEFAULT 0,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_server_categories_server (server_id, position),
+  CONSTRAINT fk_server_categories_server FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS server_channels (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  server_id CHAR(36) NOT NULL,
+  conversation_id CHAR(36) NOT NULL,
+  name VARCHAR(100) NOT NULL,
+  type VARCHAR(16) NOT NULL DEFAULT 'text',
+  category_id CHAR(36) NULL,
+  position INT NOT NULL DEFAULT 0,
+  topic VARCHAR(500) NULL,
+  slow_mode_seconds INT NOT NULL DEFAULT 0,
+  is_readonly BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_server_channel_conversation (conversation_id),
+  KEY idx_server_channels_server (server_id, position),
+  KEY idx_server_channels_category (category_id),
+  CONSTRAINT fk_server_channels_server FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_server_channels_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+  CONSTRAINT fk_server_channels_category FOREIGN KEY (category_id) REFERENCES server_categories(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS server_bans (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  server_id CHAR(36) NOT NULL,
+  user_id CHAR(36) NOT NULL,
+  banned_by CHAR(36) NULL,
+  reason VARCHAR(300) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_server_ban (server_id, user_id),
+  KEY idx_server_bans_user (user_id),
+  CONSTRAINT fk_server_bans_server FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_server_bans_profile FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE,
+  CONSTRAINT fk_server_bans_actor FOREIGN KEY (banned_by) REFERENCES profiles(id) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS server_invites (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  server_id CHAR(36) NOT NULL,
+  code VARCHAR(32) NOT NULL UNIQUE,
+  created_by CHAR(36) NOT NULL,
+  max_uses INT NULL,
+  uses INT NOT NULL DEFAULT 0,
+  expires_at DATETIME(3) NULL,
+  revoked_at DATETIME(3) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_server_invites_server (server_id),
+  CONSTRAINT fk_server_invites_server FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE,
+  CONSTRAINT fk_server_invites_creator FOREIGN KEY (created_by) REFERENCES profiles(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

@@ -1,6 +1,7 @@
 import { randomUUID, createSign } from 'node:crypto';
 import { pool } from './db.mjs';
 import { enqueueJob } from './queues.mjs';
+import { defaultEveryonePermissions, parsePermissions } from './permissions.mjs';
 
 const DEFAULT_SERVER = process.env.NTFY_SERVER_URL || 'https://ntfy.chat-amani.xyz';
 const ALLOWED_HOSTS = ['ntfy.sh', 'ntfy.chat-amani.xyz'];
@@ -159,18 +160,67 @@ function mentionsUser(content, username) {
   return new RegExp(`(^|\\s)@${escaped}(?=$|[^A-Za-z0-9_])`, 'i').test(content);
 }
 
+async function filterServerViewChannel(serverId, candidateIds) {
+  if (!candidateIds.length) return new Set();
+  const placeholders = candidateIds.map(() => '?').join(',');
+  const [servers] = await pool.execute('SELECT owner_id FROM servers WHERE id = ? LIMIT 1', [serverId]);
+  const ownerId = servers[0]?.owner_id;
+  const [roles] = await pool.execute('SELECT * FROM server_roles WHERE server_id = ?', [serverId]);
+  const defaultRoles = roles.filter((role) => role.is_default);
+  const defaultPermissions = defaultRoles.length
+    ? defaultRoles.flatMap((role) => [...parsePermissions(role.permissions)])
+    : Object.keys(defaultEveryonePermissions()).filter((key) => defaultEveryonePermissions()[key]);
+  const roleById = new Map(roles.map((role) => [role.id, role]));
+  const [members] = await pool.execute(
+    `SELECT * FROM server_members WHERE server_id = ? AND user_id IN (${placeholders})`,
+    [serverId, ...candidateIds],
+  );
+  const memberById = new Map(members.map((member) => [member.user_id, member]));
+  const allowed = new Set();
+  for (const userId of candidateIds) {
+    if (userId === ownerId) { allowed.add(userId); continue; }
+    const member = memberById.get(userId);
+    if (!member) continue;
+    const memberRoles = [...defaultRoles];
+    if (member.role_id && roleById.has(member.role_id)) memberRoles.push(roleById.get(member.role_id));
+    if (memberRoles.some((role) => role.administrator)) { allowed.add(userId); continue; }
+    const permissions = new Set(defaultPermissions);
+    for (const role of memberRoles) {
+      for (const permission of parsePermissions(role.permissions)) permissions.add(permission);
+    }
+    if (permissions.has('view_channel')) allowed.add(userId);
+  }
+  return allowed;
+}
+
 export async function notifyNewMessage(table, row) {
   const channel = table === 'messages' ? 'dm' : table === 'global_messages' ? 'global' : table === 'announcement_messages' ? 'announcement' : null;
   if (!channel || !row?.sender_id) return;
   const content = typeof row.content === 'string' ? row.content : '';
   const [senderRows] = await pool.execute('SELECT username, display_name FROM profiles WHERE id = ? LIMIT 1', [row.sender_id]);
   const sender = senderRows[0]?.display_name || senderRows[0]?.username || 'Someone';
+  let serverContext = null;
+  if (table === 'messages' && row.conversation_id) {
+    const [contexts] = await pool.execute(
+      `SELECT c.kind, sc.id AS channel_id, sc.name AS channel_name, sc.server_id, s.name AS server_name
+       FROM conversations c
+       LEFT JOIN server_channels sc ON sc.conversation_id = c.id
+       LEFT JOIN servers s ON s.id = sc.server_id
+       WHERE c.id = ? LIMIT 1`,
+      [row.conversation_id],
+    );
+    if (contexts[0]?.kind === 'server') serverContext = contexts[0];
+  }
   const [recipients] = channel === 'dm'
     ? await pool.execute('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id <> ? AND muted = FALSE', [row.conversation_id, row.sender_id])
     : channel === 'global'
       ? await pool.execute('SELECT id AS user_id FROM profiles WHERE id <> ? AND global_muted = FALSE', [row.sender_id])
       : await pool.execute('SELECT id AS user_id FROM profiles WHERE id <> ?', [row.sender_id]);
-  const ids = [...new Set(recipients.map((r) => r.user_id))];
+  let ids = [...new Set(recipients.map((r) => r.user_id))];
+  if (serverContext?.server_id) {
+    const allowed = await filterServerViewChannel(serverContext.server_id, ids);
+    ids = ids.filter((id) => allowed.has(id));
+  }
   if (!ids.length) return;
   const placeholders = ids.map(() => '?').join(',');
   const [prefs] = await pool.execute(`SELECT * FROM notification_preferences WHERE user_id IN (${placeholders})`, ids);
@@ -188,10 +238,17 @@ export async function notifyNewMessage(table, row) {
     channel,
     conversation_id: row.conversation_id || '',
     sender_id: row.sender_id,
+    ...(serverContext ? {
+      kind: 'server',
+      server_id: serverContext.server_id,
+      channel_id: serverContext.channel_id,
+      channel_name: serverContext.channel_name || '',
+      server_name: serverContext.server_name || '',
+    } : {}),
   };
   const sent = new Set();
   const channelKey = channel === 'dm' ? `dm:${row.conversation_id}` : channel;
-  const mentionAll = /(^|\s)@everyone(?=$|[^A-Za-z0-9_])/i.test(content);
+  const mentionAll = /(^|\s)@(everyone|here)(?=$|[^A-Za-z0-9_])/i.test(content);
 
   for (const userId of ids) {
     const pref = { ...DEFAULT_PREF, ...(prefByUser.get(userId) || {}) };
@@ -199,7 +256,7 @@ export async function notifyNewMessage(table, row) {
     if (mode === 'off') continue;
     // A direct @mention (or @everyone) overrides the channel's default mode so
     // people actually see they were called out.
-    const mentioned = channel !== 'dm' && (mentionAll || mentionsUser(content, usernameById.get(userId)));
+    const mentioned = (channel !== 'dm' || serverContext) && (mentionAll || mentionsUser(content, usernameById.get(userId)));
     if (mentioned) mode = 'every';
     let title;
     let message;
@@ -221,8 +278,13 @@ export async function notifyNewMessage(table, row) {
         claimed = inserted.affectedRows > 0;
       }
       if (!claimed) continue;
-      title = channel === 'dm' ? 'New messages' : channel === 'global' ? 'New global chat messages' : 'New announcements';
-      message = channel === 'dm' ? 'You have new direct messages.' : channel === 'global' ? "There's new activity in Global Chat." : 'There are new announcements.';
+      if (serverContext) {
+        title = `New messages in #${serverContext.channel_name || 'channel'}`;
+        message = `${serverContext.server_name || 'Server'} has new messages.`;
+      } else {
+        title = channel === 'dm' ? 'New messages' : channel === 'global' ? 'New global chat messages' : 'New announcements';
+        message = channel === 'dm' ? 'You have new direct messages.' : channel === 'global' ? "There's new activity in Global Chat." : 'There are new announcements.';
+      }
     } else {
       const custom = !!pref[`${channel}_custom_enabled`];
       const titleTemplate = custom ? pref[`${channel}_title_template`] : templates[channel].title;

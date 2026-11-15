@@ -49,7 +49,7 @@ import { VoiceRecordingIndicator } from "@/components/chat/VoiceRecordingIndicat
 import { 
   Send, Check, CheckCheck, Clock, MoreVertical, Pencil, X, 
   Trash2, Smile, ArrowLeft, ImagePlus, ArrowDown, Reply,
-  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff
+  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff, Hash
 } from "lucide-react";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { signMessageMedia, encodeFile, decodeFile, encodeMusic, decodeMusic } from "@/lib/mediaUrl";
@@ -156,17 +156,35 @@ function classifyFile(file: File): AttachmentKind {
 }
 
 
+interface ServerChannelInfo {
+  serverId: string;
+  channelId: string;
+  name: string;
+  topic: string | null;
+  isReadonly: boolean;
+  canPost: boolean;
+  canMentionEveryone: boolean;
+  serverName: string;
+}
+
+interface MentionRenderContext {
+  roles?: Record<string, { name: string; color?: string | null }>;
+  channels?: Record<string, string>;
+}
+
 interface ChatViewProps {
   conversationId?: string | null;
   onBack?: () => void;
   isMobile?: boolean;
   channel?: "dm" | "global" | "announcements";
   isActive?: boolean;
+  serverChannel?: ServerChannelInfo | null;
+  mentionContext?: MentionRenderContext | null;
 }
 
 const EMOJI_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
 
-export function ChatView({ conversationId: conversationIdProp, onBack, isMobile = false, channel = "dm", isActive = true }: ChatViewProps) {
+export function ChatView({ conversationId: conversationIdProp, onBack, isMobile = false, channel = "dm", isActive = true, serverChannel = null, mentionContext = null }: ChatViewProps) {
   const { user } = useAuth();
   const ownSenderProfile = useMemo(() => {
     if (!user) return undefined;
@@ -193,12 +211,18 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   // read receipts (would be misleading with many recipients) and replace the
   // DM header with a group header + settings.
   const [isGroupConv, setIsGroupConv] = useState(false);
+  const [isServerConv, setIsServerConv] = useState(false);
   const [groupInfo, setGroupInfo] = useState<{ name: string | null; my_role: "owner" | "admin" | "member" | null }>({ name: null, my_role: null });
   const [groupMembers, setGroupMembers] = useState<Profile[]>([]);
   const [groupSettingsOpen, setGroupSettingsOpen] = useState(false);
-  const showReceipts = isDM && !isGroupConv;
+  const showReceipts = isDM && !isGroupConv && !isServerConv;
   const supportsPinning = isDM || isAnnouncements;
-  const canPost = isAnnouncements ? (isAdmin || isSuperAdmin) : true;
+  const canPost = isAnnouncements ? (isAdmin || isSuperAdmin) : isServerConv ? !!serverChannel?.canPost : true;
+  const canMentionEveryone = isServerConv ? !!serverChannel?.canMentionEveryone : isAdmin || isSuperAdmin;
+  const mentionOptions = useMemo(() => mentionContext ? {
+    roles: Object.entries(mentionContext.roles || {}).map(([id, role]) => ({ id, name: role.name, color: role.color })),
+    channels: Object.entries(mentionContext.channels || {}).map(([id, name]) => ({ id, name })),
+  } : undefined, [mentionContext]);
   const channelTitle = isGlobal ? "Global Chat" : isAnnouncements ? "Announcements" : null;
 
   // Mark announcements/global mentions as read when the channel becomes active
@@ -422,6 +446,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
         content={msg.content}
         isOwn={false}
         myUsername={myUsername}
+        mentionContext={mentionContext || undefined}
         className="text-[13px] sm:text-sm leading-snug whitespace-pre-wrap break-words"
       />
     );
@@ -1013,11 +1038,12 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     // header / mention candidates / read-receipt behavior.
     const { data: conv } = await supabase
       .from("conversations")
-      .select("id, is_group, name")
+      .select("id, is_group, kind, name")
       .eq("id", conversationId)
       .maybeSingle();
 
     const isGroup = !!conv?.is_group;
+    const isServer = conv?.kind === "server";
 
     if (isGroup) {
       const { data: rows } = await supabase
@@ -1041,7 +1067,8 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
       const myRole = (rows ?? []).find((r: any) => r.user_id === user.id)?.role ?? null;
 
       if (!isCurrent()) return;
-      setIsGroupConv(true);
+      setIsServerConv(isServer);
+      setIsGroupConv(!isServer);
       setGroupMembers(orderedMembers);
       setGroupInfo({ name: conv?.name ?? null, my_role: myRole as any });
       setOtherUser(null);
@@ -1060,6 +1087,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     }
 
     if (!isCurrent()) return;
+    setIsServerConv(false);
     setIsGroupConv(false);
     setGroupMembers([]);
     setGroupInfo({ name: null, my_role: null });
@@ -1796,7 +1824,18 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
             <ArrowLeft className="h-5 w-5" />
           </Button>
         )}
-        {isDM && isGroupConv ? (
+        {isDM && isServerConv && serverChannel ? (
+          <div className="flex flex-1 min-w-0 items-center gap-2 sm:gap-3">
+            <Hash className="h-5 w-5 flex-shrink-0 text-muted-foreground" />
+            <div className="min-w-0 flex-1">
+              <p className="truncate font-semibold">{serverChannel.name}</p>
+              <p className="truncate text-xs text-muted-foreground">
+                {serverChannel.topic || serverChannel.serverName}
+                {serverChannel.isReadonly ? " · Read-only" : ""}
+              </p>
+            </div>
+          </div>
+        ) : isDM && isGroupConv ? (
           <button
             type="button"
             onClick={() => setGroupSettingsOpen(true)}
@@ -1930,6 +1969,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                           content={msg.content}
                           isOwn={false}
                           myUsername={myUsername}
+                          mentionContext={mentionContext || undefined}
                           className="text-sm whitespace-pre-wrap break-words text-muted-foreground"
                         />
                       ) : (
@@ -1978,6 +2018,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                         content={msg.content}
                         isOwn={false}
                         myUsername={myUsername}
+                        mentionContext={mentionContext || undefined}
                         className="text-sm whitespace-pre-wrap break-words text-muted-foreground"
                       />
 
@@ -2021,6 +2062,11 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
               && nextMessage?.sender_id === message.sender_id
               && nextMessage._status === "read"
               && serverDateMs(nextMessage.created_at) - serverDateMs(message.created_at) <= 5 * 60 * 1000;
+            const previousMessage = index > 0 ? messages[index - 1] : null;
+            const isGroupedMessage = isServerConv
+              && !!previousMessage
+              && previousMessage.sender_id === message.sender_id
+              && serverDateMs(message.created_at) - serverDateMs(previousMessage.created_at) <= 5 * 60 * 1000;
             const isEditing = editingMessageId === message.id;
             const groupedReactions = groupReactions(message.reactions || []);
 
@@ -2191,7 +2237,9 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                   />
                 )}
 
-                {message.sender_id && message.sender_id !== user?.id ? (
+                {isGroupedMessage ? (
+                  <div className="h-7 w-7 sm:h-8 sm:w-8 flex-shrink-0 mt-0.5" />
+                ) : message.sender_id && message.sender_id !== user?.id ? (
 
                   <Popover>
                     <PopoverTrigger asChild>
@@ -2256,27 +2304,36 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                   ) : (
                     <div className="flex items-start gap-1 min-w-0">
                       <div className="relative flex-1 min-w-0 overflow-hidden">
-                        <div className="flex items-center gap-x-1.5 gap-y-0.5 mb-0.5 flex-wrap min-w-0">
-                          <button
-                            type="button"
-                            onClick={() => message.sender_id && setProfileUserId(message.sender_id)}
-                            className="font-semibold text-[13px] sm:text-sm text-foreground truncate max-w-[58vw] sm:max-w-none hover:underline focus:outline-none focus-visible:underline cursor-pointer text-left"
-                          >
-                            {message.sender?.display_name || message.sender?.username || "Unknown"}
-                          </button>
-                          <span className="text-xs text-muted-foreground">
-                            {formatMessageDate(message.created_at)}
-                          </span>
-                          {message.edited_at && (
-                            <span
-                              className="text-[10px] italic text-muted-foreground/80"
-                              title={`Edited ${formatMessageDate(message.edited_at)}`}
-                            >
-                              (edited)
+                        {isGroupedMessage ? (
+                          <div className="mb-0.5 h-4">
+                            <span className="text-[10px] text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100">
+                              {formatMessageDate(message.created_at)}
                             </span>
-                          )}
-                          {isOwn && getStatusIcon(message, isOwn, !continuesReadChain)}
-                        </div>
+                            {message.edited_at && <span className="ml-1 text-[10px] italic text-muted-foreground/80">(edited)</span>}
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-x-1.5 gap-y-0.5 mb-0.5 flex-wrap min-w-0">
+                            <button
+                              type="button"
+                              onClick={() => message.sender_id && setProfileUserId(message.sender_id)}
+                              className="font-semibold text-[13px] sm:text-sm text-foreground truncate max-w-[58vw] sm:max-w-none hover:underline focus:outline-none focus-visible:underline cursor-pointer text-left"
+                            >
+                              {message.sender?.display_name || message.sender?.username || "Unknown"}
+                            </button>
+                            <span className="text-xs text-muted-foreground">
+                              {formatMessageDate(message.created_at)}
+                            </span>
+                            {message.edited_at && (
+                              <span
+                                className="text-[10px] italic text-muted-foreground/80"
+                                title={`Edited ${formatMessageDate(message.edited_at)}`}
+                              >
+                                (edited)
+                              </span>
+                            )}
+                            {isOwn && getStatusIcon(message, isOwn, !continuesReadChain)}
+                          </div>
+                        )}
 
 
                         <div className="text-foreground break-words min-w-0">
@@ -2616,7 +2673,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
       <form onSubmit={sendMessage} className="mx-2 mt-2 mb-[max(0.5rem,env(safe-area-inset-bottom))] sm:m-3 sm:mt-0 p-3 rounded-2xl border border-border/60 bg-card/60 backdrop-blur-xl shadow-[0_4px_20px_-8px_hsl(var(--foreground)/0.15)] flex-shrink-0">
         {!canPost ? (
           <div className="text-center text-sm text-muted-foreground py-2">
-            Only admins can post in this channel.
+            {isServerConv ? "You don't have permission to post in this channel." : "Only admins can post in this channel."}
           </div>
         ) : null}
         {canPost && replyingTo && (
@@ -2858,9 +2915,11 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
             {mentionState && (
               <MentionAutocomplete
                 query={mentionState.query}
-                scope={isDM ? "dm" : isAnnouncements ? "announcements" : "global"}
+                scope={isServerConv ? "server" : isDM ? "dm" : isAnnouncements ? "announcements" : "global"}
                 dmMembers={dmMembers}
-                allowEveryone={isAdmin || isSuperAdmin}
+                serverMentions={mentionOptions}
+                allowEveryone={canMentionEveryone}
+                allowHere={isServerConv && canMentionEveryone}
                 anchorEl={textareaRef.current}
                 registerKeyHandler={(h) => {
                   mentionKeyHandlerRef.current = h;
@@ -2872,7 +2931,11 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                   const queryLen = mentionState.query.length;
                   const before = newMessage.slice(0, start);
                   const after = newMessage.slice(start + 1 + queryLen);
-                  const insert = `@${value} `;
+                  const insert = value.startsWith("role:")
+                    ? `<@&${value.slice(5)}> `
+                    : value.startsWith("channel:")
+                      ? `<#${value.slice(8)}> `
+                      : `@${value} `;
                   const next = before + insert + after;
                   setNewMessage(next);
                   setMentionState(null);
