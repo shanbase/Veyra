@@ -2,6 +2,27 @@
 
 GitHub Releases are the public update source for the Windows desktop and Android apps. A release is created by pushing a semantic version tag in the form `vMAJOR.MINOR.PATCH`, for example `v1.2.0`. The release workflow builds both apps, attaches their installers, generates `latest.json`, and publishes the release. Pull request and branch builds do not publish releases.
 
+## Veyra 1.2.6
+
+Fixes and hardening release on top of 1.2.5:
+
+- **Notifications actually deliver:** push no longer requires an ntfy topic — FCM device tokens receive notifications independently. Users without saved preferences now get sensible defaults (DMs and announcements immediate, Global Chat off), and `@mention`/`@everyone` overrides channel settings so mentions always push.
+- **Pair-device auth bounce fixed:** after signing in on Android/desktop (or password login), the app navigated before the session resolved and bounced back to the auth page — it only worked on the second attempt. The user is now resolved synchronously before navigation on every auth path.
+- **Auth UX:** "check your spam or junk folder" hint, a Resend confirmation email button (new rate-limited, captcha-protected endpoint), and signup switches straight to the login form.
+- **Friend requests are live:** incoming requests appear instantly via realtime instead of only after restarting the app, and accepting one shows the new DM in the sidebar within ~150ms. Friend-request profile lookups are batched.
+- **Blocking enforced everywhere:** blocked users can no longer send messages in existing DMs or be added to groups — previously blocking only prevented *creating* a new conversation.
+- **Upload scope hardening:** chat uploads now verify the target conversation/scope and are rate-limited; message content is capped server-side; LIKE wildcards are escaped.
+- **Desktop notifications respect settings:** the tray now honors off/digest modes and @mention overrides instead of pinging on every message.
+- **Correctness fixes:** poll votes are atomic (no double-voting races), digest cooldowns can't double-fire, deletes work on composite-key tables, sole-member groups can be left, and markdown parsing is depth-capped.
+- **Faster uploads:** multiple attachments upload in parallel instead of one-by-one.
+- **Database:** new `messages(conversation_id, read_at)` index for unread counts/receipts.
+
+### Downloads (once published)
+
+- Windows: `Veyra1.2.6.exe`
+- Android: `AndroidVeyra1.2.6.apk`
+- Update metadata: `latest.json`
+
 ## Veyra 1.2.5
 
 Feature release on top of 1.2.4:
