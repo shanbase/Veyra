@@ -466,6 +466,19 @@ export function registerAuthRoutes(app) {
     res.json({ ok: true, message: 'If that account exists, a password reset link has been sent.' });
   });
 
+  app.post('/api/auth/resend-confirmation', async (req, res) => {
+    if (!await allowRequest(req, res, 'resend-confirm', 5, 60 * 60 * 1000)) return;
+    await verifyCaptcha(req.body?.captchaToken, req.ip);
+    const email = normalizeEmail(req.body?.email);
+    const [rows] = await pool.execute('SELECT id, email, email_verified_at FROM auth_users WHERE email = ? LIMIT 1', [email]);
+    // Always answer the same way so the endpoint can't be used to enumerate accounts.
+    if (rows.length && !rows[0].email_verified_at) {
+      try { await createEmailToken(rows[0].id, rows[0].email, 'confirm'); }
+      catch (error) { console.error('Confirmation resend failed:', error); return res.status(502).json({ error: 'Could not send the confirmation email right now.' }); }
+    }
+    res.json({ ok: true, message: 'If that account still needs confirmation, a new email is on its way.' });
+  });
+
   app.post('/api/auth/verify', async (req, res) => {
     const token = String(req.body?.token || '');
     const [rows] = await pool.execute("SELECT id, user_id FROM auth_email_tokens WHERE token_hash = ? AND purpose = 'confirm' AND expires_at > UTC_TIMESTAMP(3) LIMIT 1", [hashToken(token)]);

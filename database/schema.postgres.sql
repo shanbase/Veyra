@@ -154,6 +154,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_conversation_created ON messages (conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages (sender_id);
 CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages (reply_to_id);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_read ON messages (conversation_id, read_at);
 
 CREATE TABLE IF NOT EXISTS global_messages (
   id VARCHAR(36) NOT NULL PRIMARY KEY,

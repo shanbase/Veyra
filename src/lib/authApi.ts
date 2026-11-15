@@ -42,3 +42,18 @@ export function notifyAuthChanged(user?: VeyraUser | null) {
   window.dispatchEvent(new CustomEvent("veyra-auth-changed", { detail }));
 }
 
+// Fetches /api/auth/me with the current credentials and publishes the result
+// synchronously so route guards see the user before navigation. Call this
+// after storing a new session token and BEFORE navigate() — otherwise the
+// destination can bounce back to /auth while the user fetch is in flight.
+export async function refreshAuthUser(): Promise<VeyraUser | null> {
+  try {
+    const { user } = await authRequest<{ user: VeyraUser }>("me");
+    notifyAuthChanged(user);
+    return user;
+  } catch {
+    notifyAuthChanged(null);
+    return null;
+  }
+}
+
