@@ -325,6 +325,8 @@ async function addGroupMembers(userId, conv, userIds) {
   for (const member of [...new Set(userIds)]) {
     const [friendship] = await pool.execute("SELECT 1 FROM friend_requests WHERE status = 'accepted' AND ((sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?)) LIMIT 1", [userId, member, member, userId]);
     if (!friendship.length) throw new Error('You can only add accepted friends to a group.');
+    const [blocked] = await pool.execute('SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1', [userId, member, member, userId]);
+    if (blocked.length) throw new Error('A selected group member is unavailable.');
     await pool.execute('INSERT IGNORE INTO conversation_members (id, conversation_id, user_id, role) VALUES (?, ?, ?, \'member\')', [randomUUID(), conv, member]);
   }
   return null;
@@ -363,7 +365,14 @@ async function transferOwnership(userId, conv, targetId) {
 }
 
 async function leaveGroup(userId, conv) {
-  if (await groupRole(userId, conv) === 'owner') throw new Error('Transfer ownership before leaving the group.');
+  const role = await groupRole(userId, conv);
+  if (role === 'owner') {
+    // A sole-member group would be orphaned forever — let the owner delete it.
+    const [members] = await pool.execute('SELECT COUNT(*) AS total FROM conversation_members WHERE conversation_id = ?', [conv]);
+    if (Number(members[0]?.total || 0) > 1) throw new Error('Transfer ownership before leaving the group.');
+    await pool.execute('DELETE FROM conversations WHERE id = ?', [conv]);
+    return null;
+  }
   await pool.execute('DELETE FROM conversation_members WHERE conversation_id = ? AND user_id = ?', [conv, userId]);
   return null;
 }

@@ -88,7 +88,10 @@ function Spoiler({ children }: { children: React.ReactNode }) {
 /**
  * Parse inline markdown into React nodes.
  */
-function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?: string | null): InlineNode[] {
+function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?: string | null, depth = 0): InlineNode[] {
+  // Nested wrappers recurse — cap depth so pathological input like
+  // ****… can't overflow the stack; beyond the cap render as plain text.
+  if (depth > 24) return [text];
   const nodes: InlineNode[] = [];
   let buffer = "";
   let i = 0;
@@ -181,7 +184,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
           length: end - i + 2,
           node: (
             <Spoiler key={makeKey(keyPrefix + "-spoil", nodeIdx++)}>
-              {parseInline(inner, isOwn, keyPrefix + "-spoilbody-" + nodeIdx, myUsername)}
+              {parseInline(inner, isOwn, keyPrefix + "-spoilbody-" + nodeIdx, myUsername, depth + 1)}
             </Spoiler>
           ),
         };
@@ -197,7 +200,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
             length: full.length,
             node: (
               <React.Fragment key={makeKey(keyPrefix + "-unsafe", nodeIdx++)}>
-                {parseInline(label, isOwn, keyPrefix + "-unsafelbl-" + nodeIdx, myUsername)}
+                {parseInline(label, isOwn, keyPrefix + "-unsafelbl-" + nodeIdx, myUsername, depth + 1)}
               </React.Fragment>
             ),
           };
@@ -206,7 +209,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
           length: full.length,
           node: renderLink(
             url,
-            parseInline(label, isOwn, keyPrefix + "-linklbl-" + nodeIdx, myUsername),
+            parseInline(label, isOwn, keyPrefix + "-linklbl-" + nodeIdx, myUsername, depth + 1),
             isOwn,
             makeKey(keyPrefix + "-link", nodeIdx++)
           ),
@@ -283,7 +286,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
           if (inner.length === 0) continue;
           return {
             length: end + w.close.length - i,
-            node: w.wrap(parseInline(inner, isOwn, keyPrefix + "-wbody-" + nodeIdx, myUsername)),
+            node: w.wrap(parseInline(inner, isOwn, keyPrefix + "-wbody-" + nodeIdx, myUsername, depth + 1)),
           };
         }
       }
@@ -298,7 +301,7 @@ function parseInline(text: string, isOwn: boolean, keyPrefix = "i", myUsername?:
             length: end - i + 1,
             node: (
               <em key={makeKey(keyPrefix + "-iu", nodeIdx++)}>
-                {parseInline(inner, isOwn, keyPrefix + "-iubody-" + nodeIdx, myUsername)}
+                {parseInline(inner, isOwn, keyPrefix + "-iubody-" + nodeIdx, myUsername, depth + 1)}
               </em>
             ),
           };

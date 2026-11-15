@@ -157,6 +157,16 @@ async function policy(table, userId, operation) {
   return { sql: '1 = 0', args: [] };
 }
 
+// Escapes LIKE metacharacters so user input can't inject wildcards; `*` is
+// still mapped to `%` as the PostgREST-style wildcard the client sends.
+function escapeLike(value) {
+  return String(value)
+    .replaceAll('\\', '\\\\')
+    .replaceAll('%', '\\%')
+    .replaceAll('_', '\\_')
+    .replaceAll('*', '%');
+}
+
 function filterSql(filters, columns) {
   const parts = [];
   const args = [];
@@ -189,7 +199,7 @@ function filterSql(filters, columns) {
           args.push(normalizeTemporalValue(filter.value, columns.get(filter.column)));
         }
         break;
-      case 'ilike': parts.push(`LOWER(${col}) LIKE LOWER(?)`); args.push(String(filter.value).replaceAll('*', '%')); break;
+      case 'ilike': parts.push(`LOWER(${col}) LIKE LOWER(?)`); args.push(escapeLike(filter.value)); break;
       default: throw new Error(`Unsupported filter: ${filter.op}`);
     }
   }
@@ -206,7 +216,7 @@ function parseOr(raw, columns) {
     const col = identifier(match[1], columns);
     const op = match[2];
     const value = match[3];
-    if (op === 'ilike') { args.push(value.replaceAll('*', '%')); return `LOWER(${col}) LIKE LOWER(?)`; }
+    if (op === 'ilike') { args.push(escapeLike(value)); return `LOWER(${col}) LIKE LOWER(?)`; }
     args.push(normalizeTemporalValue(value, columns.get(match[1])));
     return `${col} ${op === 'eq' ? '=' : '<>'} ?`;
   });
@@ -258,22 +268,34 @@ async function queryDataUncached(userId, payload) {
       const row = { ...input };
       if (columns.has('id') && !row.id) row.id = randomUUID();
       if (!await canInsert(table, row, userId, access)) throw new Error('Not allowed to insert this row.');
-      if (table === 'poll_votes') {
-        const [polls] = await pool.execute('SELECT multiple_choice FROM polls WHERE id = ? AND closed_at IS NULL AND ends_at > CURRENT_TIMESTAMP(3)', [row.poll_id]);
-        if (!polls.length) throw new Error('This poll is closed.');
-        if (!polls[0].multiple_choice) await pool.execute('DELETE FROM poll_votes WHERE poll_id = ? AND user_id = ? AND option_id <> ?', [row.poll_id, row.user_id, row.option_id]);
-      }
       const normalizedRow = normalizeRowTemporalValues(row, columns);
       const storedRow = encryptRowForTable(table, normalizedRow);
       const keys = Object.keys(storedRow);
       for (const key of keys) identifier(key, columns);
       if (!keys.length) throw new Error('Insert data is empty.');
       const updateKeys = operation === 'upsert' ? keys.filter((key) => key !== 'id' && key !== 'user_id') : [];
-      const [result] = await pool.execute(
-        `INSERT INTO \`${table}\` (${keys.map((key) => `\`${key}\``).join(', ')}) VALUES (${keys.map(() => '?').join(', ')})${operation === 'upsert' && updateKeys.length ? ` ON DUPLICATE KEY UPDATE ${updateKeys.map((key) => `\`${key}\` = VALUES(\`${key}\`)`).join(', ')}` : ''}`,
-        keys.map((key) => storedRow[key]),
-      );
-      inserted.push(row.id ?? row.user_id ?? result.insertId);
+      const insertSql = `INSERT INTO \`${table}\` (${keys.map((key) => `\`${key}\``).join(', ')}) VALUES (${keys.map(() => '?').join(', ')})${operation === 'upsert' && updateKeys.length ? ` ON DUPLICATE KEY UPDATE ${updateKeys.map((key) => `\`${key}\` = VALUES(\`${key}\`)`).join(', ')}` : ''}`;
+      const insertArgs = keys.map((key) => storedRow[key]);
+      if (table === 'poll_votes') {
+        // Single-choice votes delete-then-insert; both must be atomic or two
+        // concurrent votes on different options can both land.
+        const connection = await pool.getConnection();
+        try {
+          await connection.beginTransaction();
+          const [polls] = await connection.execute('SELECT multiple_choice FROM polls WHERE id = ? AND closed_at IS NULL AND ends_at > CURRENT_TIMESTAMP(3)', [row.poll_id]);
+          if (!polls.length) throw new Error('This poll is closed.');
+          if (!polls[0].multiple_choice) await connection.execute('DELETE FROM poll_votes WHERE poll_id = ? AND user_id = ? AND option_id <> ?', [row.poll_id, row.user_id, row.option_id]);
+          await connection.execute(insertSql, insertArgs);
+          await connection.commit();
+        } catch (error) {
+          await connection.rollback();
+          throw error;
+        } finally { connection.release(); }
+        inserted.push(row.id ?? row.user_id);
+      } else {
+        const [result] = await pool.execute(insertSql, insertArgs);
+        inserted.push(row.id ?? row.user_id ?? result.insertId);
+      }
     }
     const rows = operation === 'upsert' && table === 'friend_requests'
       ? await fetchUpsertedFriendRequests(inputRows, requested)
@@ -303,6 +325,7 @@ async function queryDataUncached(userId, payload) {
     };
     for (const column of protectedByTable[table] || []) protectedColumns.add(column);
     if (keys.some((key) => protectedColumns.has(key))) throw new Error('This field cannot be changed.');
+    if (MESSAGE_TABLES.has(table) && !messagePayloadAllowed(patch)) throw new Error('Message content is too large.');
     const friendRows = table === 'friend_requests' && patch.status === 'accepted'
       ? (await pool.execute(`SELECT sender_id, receiver_id FROM \`${table}\` t WHERE ${whereSql}`, whereArgs))[0]
       : [];
@@ -318,6 +341,14 @@ async function queryDataUncached(userId, payload) {
   }
 
   if (operation === 'delete') {
+    // Tables without a surrogate `id` column (composite PKs like
+    // notification_preferences / notification_digest_state) delete directly
+    // by the policy-scoped WHERE instead of an id IN (...) list.
+    if (!columns.has('id')) {
+      const before = payload.returning ? await fetchSelection(table, requested, whereSql, whereArgs) : null;
+      const [result] = await pool.execute(`DELETE FROM \`${table}\` AS t WHERE ${whereSql}`, whereArgs);
+      return { data: before, count: result.affectedRows ?? 0 };
+    }
     const realtimeColumns = ['id', 'user_id', 'conversation_id', 'message_id', 'poll_id', 'option_id', 'sender_id', 'receiver_id', 'blocker_id', 'blocked_id', 'group_id']
       .filter((column) => columns.has(column));
     const [rows] = await pool.execute(`SELECT ${realtimeColumns.map((column) => `t.\`${column}\``).join(', ')} FROM \`${table}\` t WHERE ${whereSql}`, whereArgs);
@@ -352,8 +383,21 @@ export async function queryData(userId, payload) {
   return withDecryptedData(result);
 }
 
+// Client composer caps at 2000 chars; the API allows headroom for API/other
+// clients but must never accept unbounded LONGTEXT payloads.
+const MAX_MESSAGE_CONTENT = 8000;
+const MAX_MESSAGE_MEDIA_META = 65535;
+const MESSAGE_TABLES = new Set(['messages', 'global_messages', 'announcement_messages']);
+
+function messagePayloadAllowed(row) {
+  if (typeof row.content === 'string' && row.content.length > MAX_MESSAGE_CONTENT) return false;
+  if (typeof row.image_url === 'string' && row.image_url.length > MAX_MESSAGE_MEDIA_META) return false;
+  return true;
+}
+
 async function canInsert(table, row, userId, access) {
   const admin = await isAdmin(userId);
+  if (MESSAGE_TABLES.has(table) && !messagePayloadAllowed(row)) return false;
   if (table === 'admin_logs') return admin && row.admin_id === userId;
   if (table === 'profiles') return row.id === userId;
   if (table === 'user_roles') return await isSuperAdmin(userId) && ['user', 'admin', 'super_admin'].includes(row.role);
@@ -369,8 +413,21 @@ async function canInsert(table, row, userId, access) {
   }
   if (table === 'messages') {
     if (row.sender_id !== userId) return false;
-    const [members] = await pool.execute('SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ? LIMIT 1', [row.conversation_id, userId]);
-    return members.length > 0;
+    const [members] = await pool.execute(
+      'SELECT c.is_group FROM conversation_members cm JOIN conversations c ON c.id = cm.conversation_id WHERE cm.conversation_id = ? AND cm.user_id = ? LIMIT 1',
+      [row.conversation_id, userId],
+    );
+    if (!members.length) return false;
+    // 1:1 DMs enforce blocks in both directions — being in a shared
+    // conversation must not let a blocked user keep messaging.
+    if (!members[0].is_group) {
+      const [others] = await pool.execute('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id <> ?', [row.conversation_id, userId]);
+      for (const other of others) {
+        const [blocked] = await pool.execute('SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1', [userId, other.user_id, other.user_id, userId]);
+        if (blocked.length) return false;
+      }
+    }
+    return true;
   }
   if (table === 'global_messages') return row.sender_id === userId;
   if (table === 'announcement_messages') return admin && row.sender_id === userId;

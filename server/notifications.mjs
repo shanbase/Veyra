@@ -204,10 +204,23 @@ export async function notifyNewMessage(table, row) {
     let title;
     let message;
     if (mode === 'digest' && !mentioned) {
-      const [state] = await pool.execute('SELECT last_notified_at FROM notification_digest_state WHERE user_id = ? AND channel_key = ? LIMIT 1', [userId, channelKey]);
-      const cooldownMs = Number(pref.digest_cooldown_minutes || 10) * 60_000;
-      if (state[0] && Date.now() - new Date(state[0].last_notified_at).getTime() < cooldownMs) continue;
-      await pool.execute(`INSERT INTO notification_digest_state (user_id, channel_key, last_notified_at) VALUES (?, ?, CURRENT_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE last_notified_at = CURRENT_TIMESTAMP(3)`, [userId, channelKey]);
+      // Atomically claim the digest slot: the conditional UPDATE wins for
+      // stale rows and INSERT IGNORE wins for first-time rows. Concurrent
+      // senders serialize on the row so only one notification goes out.
+      const cooldownSec = Math.max(1, Math.round(Number(pref.digest_cooldown_minutes || 10) * 60));
+      const [updated] = await pool.execute(
+        `UPDATE notification_digest_state SET last_notified_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND channel_key = ? AND last_notified_at < DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ${cooldownSec} SECOND)`,
+        [userId, channelKey],
+      );
+      let claimed = updated.affectedRows > 0;
+      if (!claimed) {
+        const [inserted] = await pool.execute(
+          'INSERT IGNORE INTO notification_digest_state (user_id, channel_key, last_notified_at) VALUES (?, ?, UTC_TIMESTAMP(3))',
+          [userId, channelKey],
+        );
+        claimed = inserted.affectedRows > 0;
+      }
+      if (!claimed) continue;
       title = channel === 'dm' ? 'New messages' : channel === 'global' ? 'New global chat messages' : 'New announcements';
       message = channel === 'dm' ? 'You have new direct messages.' : channel === 'global' ? "There's new activity in Global Chat." : 'There are new announcements.';
     } else {

@@ -232,6 +232,27 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     setMyUsername(ownSenderProfile?.username || null);
   }, [user?.id, ownSenderProfile?.username]);
 
+  // Notification preferences for the desktop tray path — loaded once per user
+  // so realtime callbacks don't hit the API per message.
+  useEffect(() => {
+    if (!user?.id) {
+      setNotifPrefs(null);
+      return;
+    }
+    let cancelled = false;
+    void supabase
+      .from("notification_preferences")
+      .select("*")
+      .eq("user_id", user.id)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (!cancelled) setNotifPrefs((data as Record<string, unknown> | null) ?? null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
+
   const { typingUsers, setTyping } = usePresence(isDM ? conversationIdProp ?? null : null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
@@ -304,6 +325,21 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     const incoming = change?.new;
     if (change?.eventType !== "INSERT" || !incoming || incoming.sender_id === user?.id) return;
     if (muted) return;
+    // Respect the same notification modes the server uses for push: 'off'
+    // silences the tray, 'digest' throttles to one alert per cooldown window,
+    // and a direct @mention overrides both (mirrors notifyNewMessage).
+    const notifyChannel = isDM ? "dm" : isGlobal ? "global" : "announcement";
+    const mode = notifPrefs
+      ? String(notifPrefs[`${notifyChannel}_mode`] || "off")
+      : notifyChannel === "global" ? "off" : "every";
+    const mentioned = messageMentionsMe(String(incoming.content || ""), myUsername);
+    if (mode === "off" && !mentioned) return;
+    if (mode === "digest" && !mentioned) {
+      const cooldownMs = Number(notifPrefs?.digest_cooldown_minutes || 15) * 60_000;
+      const last = desktopDigestRef.current[notifyChannel] || 0;
+      if (Date.now() - last < cooldownMs) return;
+      desktopDigestRef.current[notifyChannel] = Date.now();
+    }
     const notify = window.veyraDesktop?.showNotification;
     if (!notify) return;
     const senderName = isGlobal
@@ -395,6 +431,8 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   const [profileUserId, setProfileUserId] = useState<string | null>(null);
   const [mobileActionMessage, setMobileActionMessage] = useState<Message | null>(null);
   const [myUsername, setMyUsername] = useState<string | null>(null);
+  const [notifPrefs, setNotifPrefs] = useState<Record<string, unknown> | null>(null);
+  const desktopDigestRef = useRef<Record<string, number>>({});
   const [dmMembers, setDmMembers] = useState<MentionCandidate[]>([]);
   const [mentionState, setMentionState] = useState<{ start: number; query: string } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
