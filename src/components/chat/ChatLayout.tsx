@@ -12,6 +12,7 @@ import { ServerSettingsDialog } from "@/components/server/ServerSettingsDialog";
 import { rpc, type ServerSummary, type ServerView } from "@/components/server/api";
 import { supabase } from "@/integrations/supabase/client";
 import { registerNativePush } from "@/lib/pushNotifications";
+import { Button } from "@/components/ui/button";
 
 type ActivePane = "global" | "announcements" | "dm" | "server" | "list";
 
@@ -24,6 +25,7 @@ export default function ChatLayout() {
 
   const [servers, setServers] = useState<ServerSummary[]>([]);
   const [serverView, setServerView] = useState<ServerView | null>(null);
+  const [serverViewError, setServerViewError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState("overview");
   const [profileUserId, setProfileUserId] = useState<string | null>(null);
@@ -73,6 +75,7 @@ export default function ChatLayout() {
   }, [user]);
 
   const loadServerView = useCallback(async (id: string | null) => {
+    setServerViewError(null);
     if (!id) {
       setServerView(null);
       return;
@@ -80,8 +83,9 @@ export default function ChatLayout() {
     try {
       const data = await rpc<ServerView>("get_server_view", { _server_id: id });
       setServerView(data);
-    } catch {
+    } catch (error) {
       setServerView(null);
+      setServerViewError(error instanceof Error ? error.message : "Could not load this server.");
     }
   }, []);
 
@@ -182,6 +186,13 @@ export default function ChatLayout() {
     else navigate("/chat");
   };
 
+  const serverLoadError = serverViewError ? (
+    <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6 text-center text-muted-foreground">
+      <p className="text-sm">{serverViewError}</p>
+      <Button variant="outline" onClick={() => handleSelectServer(null)}>Back to messages</Button>
+    </div>
+  ) : null;
+
   const selectedChannel = useMemo(() => {
     if (!serverView || !conversationId) return null;
     return serverView.channels.find((channel) => channel.conversation_id === conversationId) || null;
@@ -279,7 +290,7 @@ export default function ChatLayout() {
                   onOpenSettings={(tab) => { setSettingsTab(tab || "overview"); setSettingsOpen(true); }}
                 />
               )
-            ) : <div className="flex h-full items-center justify-center text-muted-foreground">Loading server…</div>
+            ) : serverViewError ? serverLoadError : <div className="flex h-full items-center justify-center text-muted-foreground">Loading server…</div>
           ) : active === "list" ? (
             <FriendsList onSelectConversation={handleSelectConversation} selectedConversationId={active === "dm" ? activeConversationId : null} />
           ) : (
@@ -296,7 +307,7 @@ export default function ChatLayout() {
     <div className="flex h-[100dvh] gap-0 bg-background">
       <ServerRail servers={servers} selectedServerId={serverIdParam} onSelectServer={handleSelectServer} onChanged={() => void loadServers()} />
       {serverIdParam ? (
-        serverView ? serverPane : <div className="flex flex-1 items-center justify-center text-muted-foreground">Loading server…</div>
+        serverView ? serverPane : serverViewError ? serverLoadError : <div className="flex flex-1 items-center justify-center text-muted-foreground">Loading server…</div>
       ) : (
         <>
           <div className="w-80 flex-shrink-0 border-r bg-sidebar">
