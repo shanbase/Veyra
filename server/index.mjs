@@ -45,34 +45,19 @@ if (isProduction) {
 // This file is only the standalone/self-hosted entrypoint — Vercel uses
 // server/vercel-handler.mjs instead, so it always listens. Binding 0.0.0.0 is
 // required on container platforms (Altare allocates the port, not the host).
-//
-// Zero-downtime platforms (Altare) start the new version while the old one
-// still holds the port, so EADDRINUSE is expected during deploy handoff —
-// retry the bind instead of exiting and failing the deploy.
-const MAX_BIND_RETRIES = 120; // ~2 minutes at 1s intervals
-let bindAttempts = 0;
-let server = null;
+// On EADDRINUSE we exit immediately: zero-downtime platforms keep the old
+// version on the port until this process exits, then restart it — retrying
+// in-process just stalls the deploy.
+const server = app.listen(port, '0.0.0.0');
 
-function startListening() {
-  server = app.listen(port, '0.0.0.0', () => {
-    console.log(`Veyra API listening on 0.0.0.0:${port}.`);
-  });
+server.once('listening', () => {
+  console.log(`Veyra API listening on 0.0.0.0:${port}.`);
+});
 
-  server.on('error', (error) => {
-    if (error.code === 'EADDRINUSE' && bindAttempts < MAX_BIND_RETRIES) {
-      bindAttempts += 1;
-      if (bindAttempts === 1 || bindAttempts % 10 === 0) {
-        console.log(`Port ${port} still held by previous version, retrying bind (${bindAttempts}/${MAX_BIND_RETRIES})`);
-      }
-      setTimeout(startListening, 1000);
-      return;
-    }
-    console.error('Veyra API failed to listen:', error);
-    process.exit(1);
-  });
-}
-
-startListening();
+server.on('error', (error) => {
+  console.error('Veyra API failed to listen:', error);
+  process.exit(1);
+});
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, async () => {
