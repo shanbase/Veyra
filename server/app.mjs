@@ -180,9 +180,26 @@ export function createApp() {
   });
   app.post('/api/storage/chat-upload', async (req, res) => {
     const { bucket, path, contentType, size } = req.body || {};
+    const pathParts = typeof path === 'string' ? path.split('/') : [];
     if (!CHAT_UPLOAD_BUCKETS.has(bucket) || typeof path !== 'string' || path.length > 512
-      || path.split('/')[0] !== req.user.id || path.split('/').some((part) => !part || part === '.' || part === '..')) {
+      || pathParts[0] !== req.user.id || pathParts.length < 3 || pathParts.length > 8
+      || pathParts.some((part) => !part || part === '.' || part === '..')) {
       return res.status(400).json({ error: 'Invalid chat upload path.' });
+    }
+    // The folder segment scopes who can later read the file via chat-read:
+    // 'global'/'announcements' are world-readable, anything else must be a
+    // conversation the uploader actually belongs to.
+    const scope = pathParts[1];
+    if (scope !== 'global' && scope !== 'announcements') {
+      const [members] = await pool.execute(
+        'SELECT 1 FROM conversation_members WHERE conversation_id = ? AND user_id = ? LIMIT 1',
+        [scope, req.user.id],
+      );
+      if (!members.length) return res.status(403).json({ error: 'You cannot upload media to this conversation.' });
+    }
+    const limited = await consumeRateLimit(`chat-upload:${req.user.id}`, 120, 60_000);
+    if (limited && !limited.allowed) {
+      return res.status(429).json({ error: 'Too many uploads. Please slow down and try again.' });
     }
     if (!Number.isFinite(size) || size <= 0 || size > MAX_CHAT_UPLOAD_BYTES) {
       return res.status(413).json({ error: 'Maximum file size is 25 MB.' });

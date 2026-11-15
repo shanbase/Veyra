@@ -232,6 +232,27 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     setMyUsername(ownSenderProfile?.username || null);
   }, [user?.id, ownSenderProfile?.username]);
 
+  // Notification preferences for the desktop tray path — loaded once per user
+  // so realtime callbacks don't hit the API per message.
+  useEffect(() => {
+    if (!user?.id) {
+      setNotifPrefs(null);
+      return;
+    }
+    let cancelled = false;
+    void supabase
+      .from("notification_preferences")
+      .select("*")
+      .eq("user_id", user.id)
+      .maybeSingle()
+      .then(({ data }) => {
+        if (!cancelled) setNotifPrefs((data as Record<string, unknown> | null) ?? null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.id]);
+
   const { typingUsers, setTyping } = usePresence(isDM ? conversationIdProp ?? null : null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
@@ -304,6 +325,21 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     const incoming = change?.new;
     if (change?.eventType !== "INSERT" || !incoming || incoming.sender_id === user?.id) return;
     if (muted) return;
+    // Respect the same notification modes the server uses for push: 'off'
+    // silences the tray, 'digest' throttles to one alert per cooldown window,
+    // and a direct @mention overrides both (mirrors notifyNewMessage).
+    const notifyChannel = isDM ? "dm" : isGlobal ? "global" : "announcement";
+    const mode = notifPrefs
+      ? String(notifPrefs[`${notifyChannel}_mode`] || "off")
+      : notifyChannel === "global" ? "off" : "every";
+    const mentioned = messageMentionsMe(String(incoming.content || ""), myUsername);
+    if (mode === "off" && !mentioned) return;
+    if (mode === "digest" && !mentioned) {
+      const cooldownMs = Number(notifPrefs?.digest_cooldown_minutes || 15) * 60_000;
+      const last = desktopDigestRef.current[notifyChannel] || 0;
+      if (Date.now() - last < cooldownMs) return;
+      desktopDigestRef.current[notifyChannel] = Date.now();
+    }
     const notify = window.veyraDesktop?.showNotification;
     if (!notify) return;
     const senderName = isGlobal
@@ -395,6 +431,8 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   const [profileUserId, setProfileUserId] = useState<string | null>(null);
   const [mobileActionMessage, setMobileActionMessage] = useState<Message | null>(null);
   const [myUsername, setMyUsername] = useState<string | null>(null);
+  const [notifPrefs, setNotifPrefs] = useState<Record<string, unknown> | null>(null);
+  const desktopDigestRef = useRef<Record<string, number>>({});
   const [dmMembers, setDmMembers] = useState<MentionCandidate[]>([]);
   const [mentionState, setMentionState] = useState<{ start: number; query: string } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1230,8 +1268,10 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     if (previewsToSend.length > 0) {
       setUploadingMedia(true);
       try {
-        const urls: string[] = [];
-        for (const preview of previewsToSend) {
+        // Upload attachments in parallel — sequential awaits made multi-file
+        // sends take N× as long. Promise.all preserves order.
+        const folder = isDM ? conversationIdProp : channel;
+        const urls: string[] = await Promise.all(previewsToSend.map(async (preview) => {
           // Compress images to WebP/AVIF before upload to slash egress.
           const fileToUpload =
             preview.type === "image"
@@ -1241,26 +1281,24 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
           const fileExt =
             fileToUpload.name.split(".").pop() ||
             (preview.type === "video" ? "mp4" : preview.type === "image" ? "webp" : "bin");
-          const folder = isDM ? conversationIdProp : channel;
           const fileName = `${user.id}/${folder}/${Date.now()}-${Math.random().toString(36).slice(2)}.${fileExt}`;
           const bucket = preview.type === "video" ? "chat-videos" : "chat-images";
 
           const publicUrl = await uploadChatMedia(bucket, fileName, fileToUpload);
           if (preview.type === "video") {
-            urls.push(`video:${publicUrl}`);
+            return `video:${publicUrl}`;
           } else if (preview.type === "image") {
-            urls.push(publicUrl);
+            return publicUrl;
           } else if (preview.type === "music") {
-            urls.push(encodeMusic({ url: publicUrl, name: preview.file.name, size: preview.file.size }));
-          } else {
-            urls.push(encodeFile({
-              url: publicUrl,
-              name: preview.file.name,
-              size: preview.file.size,
-              mime: preview.file.type || "application/octet-stream",
-            }));
+            return encodeMusic({ url: publicUrl, name: preview.file.name, size: preview.file.size });
           }
-        }
+          return encodeFile({
+            url: publicUrl,
+            name: preview.file.name,
+            size: preview.file.size,
+            mime: preview.file.type || "application/octet-stream",
+          });
+        }));
         imageUrlJson = JSON.stringify(urls);
       } catch (error: any) {
         toast({ title: "Error uploading media", description: error.message, variant: "destructive" });

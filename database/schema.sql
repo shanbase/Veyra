@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS messages (
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   KEY idx_messages_conversation_created (conversation_id, created_at),
   KEY idx_messages_sender (sender_id),
+  KEY idx_messages_conversation_read (conversation_id, read_at),
   CONSTRAINT fk_messages_conversation FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
   CONSTRAINT fk_messages_sender FOREIGN KEY (sender_id) REFERENCES profiles(id) ON DELETE SET NULL,
   CONSTRAINT fk_messages_reply FOREIGN KEY (reply_to_id) REFERENCES messages(id) ON DELETE SET NULL,
@@ -325,7 +326,7 @@ CREATE TABLE IF NOT EXISTS native_push_tokens (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ---------------------------------------------------------------------------
--- 1.2.5 additions (idempotent — safe to re-run on existing databases)
+-- 1.2.5 additions (idempotent ï¿½ safe to re-run on existing databases)
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS dm_pairs (
@@ -343,6 +344,7 @@ CREATE TABLE IF NOT EXISTS dm_pairs (
 ALTER TABLE message_reactions DROP FOREIGN KEY IF EXISTS fk_reactions_message;
 ALTER TABLE conversation_members ADD COLUMN IF NOT EXISTS muted BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE profiles ADD COLUMN IF NOT EXISTS global_muted BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE messages ADD KEY IF NOT EXISTS idx_messages_conversation_read (conversation_id, read_at);
 
 -- Backfill dm_pairs for existing 1:1 conversations so ensureDirectMessage can
 -- dedupe atomically. Only exactly-two-member non-group conversations qualify.

@@ -132,26 +132,58 @@ export async function sendTestNotification(userId) {
   return { ok, error: ok ? null : 'The ntfy server is currently unavailable.' };
 }
 
+// Users without a notification_preferences row still get sane defaults that
+// mirror the schema: DMs and announcements notify immediately, Global Chat
+// stays off unless they opt in.
+const DEFAULT_PREF = {
+  ntfy_server: DEFAULT_SERVER,
+  ntfy_topic: null,
+  dm_mode: 'every',
+  dm_custom_enabled: false,
+  dm_title_template: templates.dm.title,
+  dm_body_template: templates.dm.body,
+  global_mode: 'off',
+  global_custom_enabled: false,
+  global_title_template: templates.global.title,
+  global_body_template: templates.global.body,
+  announcement_mode: 'every',
+  announcement_custom_enabled: false,
+  announcement_title_template: templates.announcement.title,
+  announcement_body_template: templates.announcement.body,
+  digest_cooldown_minutes: 15,
+};
+
+function mentionsUser(content, username) {
+  if (!content || !username) return false;
+  const escaped = String(username).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|\\s)@${escaped}(?=$|[^A-Za-z0-9_])`, 'i').test(content);
+}
+
 export async function notifyNewMessage(table, row) {
   const channel = table === 'messages' ? 'dm' : table === 'global_messages' ? 'global' : table === 'announcement_messages' ? 'announcement' : null;
   if (!channel || !row?.sender_id) return;
+  const content = typeof row.content === 'string' ? row.content : '';
   const [senderRows] = await pool.execute('SELECT username, display_name FROM profiles WHERE id = ? LIMIT 1', [row.sender_id]);
   const sender = senderRows[0]?.display_name || senderRows[0]?.username || 'Someone';
   const [recipients] = channel === 'dm'
     ? await pool.execute('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id <> ? AND muted = FALSE', [row.conversation_id, row.sender_id])
     : channel === 'global'
-      ? await pool.execute('SELECT np.user_id FROM notification_preferences np JOIN profiles p ON p.id = np.user_id WHERE np.user_id <> ? AND p.global_muted = FALSE', [row.sender_id])
-      : await pool.execute('SELECT user_id FROM notification_preferences WHERE user_id <> ?', [row.sender_id]);
+      ? await pool.execute('SELECT id AS user_id FROM profiles WHERE id <> ? AND global_muted = FALSE', [row.sender_id])
+      : await pool.execute('SELECT id AS user_id FROM profiles WHERE id <> ?', [row.sender_id]);
   const ids = [...new Set(recipients.map((r) => r.user_id))];
   if (!ids.length) return;
-  const [prefs] = await pool.execute(`SELECT * FROM notification_preferences WHERE user_id IN (${ids.map(() => '?').join(',')})`, ids);
+  const placeholders = ids.map(() => '?').join(',');
+  const [prefs] = await pool.execute(`SELECT * FROM notification_preferences WHERE user_id IN (${placeholders})`, ids);
+  const [profiles] = await pool.execute(`SELECT id, username FROM profiles WHERE id IN (${placeholders})`, ids);
+  const usernameById = new Map(profiles.map((p) => [p.id, p.username]));
   // FCM device tokens for the same recipient set (empty when FCM isn't used).
-  const [tokenRows] = await pool.execute(`SELECT user_id, token FROM native_push_tokens WHERE user_id IN (${ids.map(() => '?').join(',')}) AND enabled = TRUE`, ids);
+  const [tokenRows] = await pool.execute(`SELECT user_id, token FROM native_push_tokens WHERE user_id IN (${placeholders}) AND enabled = TRUE`, ids);
   const tokensByUser = new Map();
   for (const row of tokenRows) {
     if (!tokensByUser.has(row.user_id)) tokensByUser.set(row.user_id, []);
     tokensByUser.get(row.user_id).push(row.token);
   }
+  const prefByUser = new Map(prefs.map((pref) => [pref.user_id, pref]));
   const fcmData = {
     channel,
     conversation_id: row.conversation_id || '',
@@ -159,31 +191,55 @@ export async function notifyNewMessage(table, row) {
   };
   const sent = new Set();
   const channelKey = channel === 'dm' ? `dm:${row.conversation_id}` : channel;
+  const mentionAll = /(^|\s)@everyone(?=$|[^A-Za-z0-9_])/i.test(content);
 
-  for (const pref of prefs) {
-    if (!pref.ntfy_topic) continue;
-    const server = pref.ntfy_server || DEFAULT_SERVER;
-    const topic = pref.ntfy_topic.trim();
-    const dedupeKey = `${server.replace(/\/+$/, '')}|${topic}`;
-    if (sent.has(dedupeKey)) continue;
-    const mode = pref[`${channel}_mode`] || 'off';
+  for (const userId of ids) {
+    const pref = { ...DEFAULT_PREF, ...(prefByUser.get(userId) || {}) };
+    let mode = pref[`${channel}_mode`] || 'off';
     if (mode === 'off') continue;
+    // A direct @mention (or @everyone) overrides the channel's default mode so
+    // people actually see they were called out.
+    const mentioned = channel !== 'dm' && (mentionAll || mentionsUser(content, usernameById.get(userId)));
+    if (mentioned) mode = 'every';
     let title;
     let message;
-    if (mode === 'digest') {
-      const [state] = await pool.execute('SELECT last_notified_at FROM notification_digest_state WHERE user_id = ? AND channel_key = ? LIMIT 1', [pref.user_id, channelKey]);
-      const cooldownMs = Number(pref.digest_cooldown_minutes || 10) * 60_000;
-      if (state[0] && Date.now() - new Date(state[0].last_notified_at).getTime() < cooldownMs) continue;
-      await pool.execute(`INSERT INTO notification_digest_state (user_id, channel_key, last_notified_at) VALUES (?, ?, CURRENT_TIMESTAMP(3)) ON DUPLICATE KEY UPDATE last_notified_at = CURRENT_TIMESTAMP(3)`, [pref.user_id, channelKey]);
+    if (mode === 'digest' && !mentioned) {
+      // Atomically claim the digest slot: the conditional UPDATE wins for
+      // stale rows and INSERT IGNORE wins for first-time rows. Concurrent
+      // senders serialize on the row so only one notification goes out.
+      const cooldownSec = Math.max(1, Math.round(Number(pref.digest_cooldown_minutes || 10) * 60));
+      const [updated] = await pool.execute(
+        `UPDATE notification_digest_state SET last_notified_at = UTC_TIMESTAMP(3) WHERE user_id = ? AND channel_key = ? AND last_notified_at < DATE_SUB(UTC_TIMESTAMP(3), INTERVAL ${cooldownSec} SECOND)`,
+        [userId, channelKey],
+      );
+      let claimed = updated.affectedRows > 0;
+      if (!claimed) {
+        const [inserted] = await pool.execute(
+          'INSERT IGNORE INTO notification_digest_state (user_id, channel_key, last_notified_at) VALUES (?, ?, UTC_TIMESTAMP(3))',
+          [userId, channelKey],
+        );
+        claimed = inserted.affectedRows > 0;
+      }
+      if (!claimed) continue;
       title = channel === 'dm' ? 'New messages' : channel === 'global' ? 'New global chat messages' : 'New announcements';
       message = channel === 'dm' ? 'You have new direct messages.' : channel === 'global' ? "There's new activity in Global Chat." : 'There are new announcements.';
     } else {
       const custom = !!pref[`${channel}_custom_enabled`];
       const titleTemplate = custom ? pref[`${channel}_title_template`] : templates[channel].title;
       const bodyTemplate = custom ? pref[`${channel}_body_template`] : templates[channel].body;
-      title = render(titleTemplate, { user: sender, message: row.content || '(no text)' });
-      message = render(bodyTemplate, { user: sender, message: row.content || '(no text)' });
+      title = render(titleTemplate, { user: sender, message: content || '(no text)' });
+      message = render(bodyTemplate, { user: sender, message: content || '(no text)' });
     }
+    // Native push goes to every registered device for this user — it does not
+    // require an ntfy topic.
+    for (const token of tokensByUser.get(userId) || []) {
+      void sendFcmNotification(token, title, message, fcmData);
+    }
+    const topic = String(pref.ntfy_topic || '').trim();
+    if (!topic) continue;
+    const server = pref.ntfy_server || DEFAULT_SERVER;
+    const dedupeKey = `${server.replace(/\/+$/, '')}|${topic}`;
+    if (sent.has(dedupeKey)) continue;
     const job = { server, topic, title, message };
     const { delivered, result } = await enqueueJob('notifications.deliver', job, {
       idempotencyKey: `veyra-notify-${randomUUID()}`,
@@ -191,10 +247,5 @@ export async function notifyNewMessage(table, row) {
     });
     const accepted = delivered === 'queued' || (delivered !== 'unavailable' && Boolean(result));
     if (accepted) sent.add(dedupeKey);
-    // Native push goes to every registered device for this user, independent
-    // of their ntfy topic configuration.
-    for (const token of tokensByUser.get(pref.user_id) || []) {
-      void sendFcmNotification(token, title, message, fcmData);
-    }
   }
 }

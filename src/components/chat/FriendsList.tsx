@@ -245,19 +245,42 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
       return;
     }
 
-    const requestsWithProfiles = await Promise.all(
-      (data || []).map(async (request) => {
-        const { data: senderData } = await supabase
-          .from("profiles")
-          .select("*")
-          .eq("id", request.sender_id)
-          .single();
-        return { ...request, sender: senderData };
-      })
-    );
+    // One batched profile lookup instead of a query per request.
+    const senderIds = [...new Set((data || []).map((request) => request.sender_id))];
+    const { data: senderProfiles } = senderIds.length
+      ? await supabase.from("profiles").select("*").in("id", senderIds)
+      : { data: [] };
+    const senderById = new Map((senderProfiles || []).map((profile: any) => [profile.id, profile]));
+    const requestsWithProfiles = (data || []).map((request) => ({
+      ...request,
+      sender: senderById.get(request.sender_id) ?? null,
+    }));
 
     setFriendRequests(requestsWithProfiles);
   };
+
+  const fetchFriendRequestsRef = useRef(fetchFriendRequests);
+  fetchFriendRequestsRef.current = fetchFriendRequests;
+
+  // Live friend-request updates. The server only sends friend_requests
+  // events to the request's sender and receiver, so no client filter is
+  // needed — any event here concerns this user.
+  useEffect(() => {
+    if (!user) return;
+    const channel = supabase
+      .channel(`friend-requests:${user.id}`)
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "friend_requests" },
+        () => {
+          void fetchFriendRequestsRef.current();
+        }
+      )
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user]);
 
   const fetchConversations = async () => {
     if (!user) return;
@@ -424,24 +447,35 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
     };
   }, [user]);
 
-  // Live-refresh groups when membership changes (added/removed, role changes,
-  // ownership transfers) or when a group is renamed.
+  // Live-refresh groups AND the DM list when membership changes — accepting
+  // a friend request inserts conversation_members rows for the new DM, so
+  // without this the conversation only appears after a full reload.
   useEffect(() => {
     if (!user) return;
+    let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+    const refresh = () => {
+      if (refreshTimer) return;
+      refreshTimer = setTimeout(() => {
+        refreshTimer = null;
+        void fetchConversations();
+        void fetchGroups();
+      }, 150);
+    };
     const ch = supabase
       .channel("group-membership-sidebar")
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "conversation_members" },
-        () => fetchGroups(),
+        refresh,
       )
       .on(
         "postgres_changes",
         { event: "UPDATE", schema: "public", table: "conversations" },
-        () => fetchGroups(),
+        refresh,
       )
       .subscribe();
     return () => {
+      if (refreshTimer) clearTimeout(refreshTimer);
       supabase.removeChannel(ch);
     };
   }, [user]);

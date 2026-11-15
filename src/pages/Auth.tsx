@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
-import { authRequest, notifyAuthChanged } from "@/lib/authApi";
+import { authRequest, refreshAuthUser } from "@/lib/authApi";
 import { isNativeVeyraApp, openSystemBrowser, setNativeSessionToken } from "@/lib/nativeSession";
 import { clearNativePair, markNativePairComplete, registerNativePair } from "@/lib/nativePairing";
 import { Button } from "@/components/ui/button";
@@ -30,6 +30,7 @@ export default function Auth() {
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [captchaToken, setCaptchaToken] = useState<string | null>(null);
+  const [resendingConfirm, setResendingConfirm] = useState(false);
   const captchaRef = useRef<HCaptcha>(null);
   const navigate = useNavigate();
   const siteKey = import.meta.env.VITE_HCAPTCHA_SITE_KEY;
@@ -138,7 +139,7 @@ export default function Auth() {
     try {
       if (isLogin) {
         await authRequest("login", { email, password, captchaToken });
-        notifyAuthChanged();
+        await refreshAuthUser();
         toast({ title: "Welcome back!", description: "Successfully logged in." });
         navigate(returnTo);
       } else {
@@ -150,6 +151,10 @@ export default function Auth() {
           description: result.message,
         });
         resetCaptcha();
+        // Move straight to sign-in — the confirmation email is on its way.
+        setMode("login");
+        setPassword("");
+        setConfirmPassword("");
       }
     } catch (error: unknown) {
       toast({
@@ -160,6 +165,21 @@ export default function Auth() {
       resetCaptcha();
     } finally {
       setLoading(false);
+    }
+  };
+
+  const resendConfirmation = async () => {
+    if (!email.trim() || !captchaToken) return;
+    setResendingConfirm(true);
+    try {
+      const result = await authRequest<{ message?: string }>("resend-confirmation", { email, captchaToken });
+      toast({ title: "Confirmation email", description: result.message || "If the account needs it, a new email was sent." });
+      resetCaptcha();
+    } catch (error: unknown) {
+      toast({ title: "Could not resend", description: error instanceof Error ? error.message : "Please try again.", variant: "destructive" });
+      resetCaptcha();
+    } finally {
+      setResendingConfirm(false);
     }
   };
 
@@ -191,8 +211,10 @@ export default function Auth() {
         if (result.token) {
           if (result.clientId !== clientId) throw new Error('This pairing request belongs to a different Veyra app.');
           await setNativeSessionToken(result.token);
+          // Resolve the user BEFORE navigating — otherwise "/" can bounce back
+          // to /auth while /api/auth/me is still in flight.
+          await refreshAuthUser();
           markNativePairComplete(pairing.code);
-          notifyAuthChanged();
           toast({ title: 'Signed in', description: 'This app is now connected to your Veyra account.' });
           navigate('/');
           return;
@@ -341,6 +363,9 @@ export default function Auth() {
                 </div>
               </div>
             )}
+            <p className="text-xs text-muted-foreground text-center">
+              Can't see the email? Check your spam or junk folder.
+            </p>
             {siteKey && (
               <div className="flex justify-center">
                 <HCaptcha
@@ -368,6 +393,18 @@ export default function Auth() {
                 : "Sign Up"}
             </Button>
           </form>
+          {isSignup && (
+            <div className="mt-3 text-center">
+              <button
+                type="button"
+                onClick={() => void resendConfirmation()}
+                disabled={resendingConfirm || !email.trim() || !captchaToken}
+                className="text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+              >
+                {resendingConfirm ? "Sending..." : "Didn't get the confirmation email? Resend"}
+              </button>
+            </div>
+          )}
           {!isForgot && (
             <>
               <div className="relative my-4">

@@ -127,6 +127,7 @@ export type Database = {
           conversation_id: string
           id: string
           joined_at: string
+          muted: boolean
           role: string
           user_id: string
         }
@@ -134,6 +135,7 @@ export type Database = {
           conversation_id: string
           id?: string
           joined_at?: string
+          muted?: boolean
           role?: string
           user_id: string
         }
@@ -141,6 +143,7 @@ export type Database = {
           conversation_id?: string
           id?: string
           joined_at?: string
+          muted?: boolean
           role?: string
           user_id?: string
         }
@@ -662,6 +665,7 @@ export type Database = {
           custom_status_text: string | null
           display_name: string | null
           global_mentions_last_read_at: string | null
+          global_muted: boolean
           id: string
           pronouns: string | null
           status: string | null
@@ -683,6 +687,7 @@ export type Database = {
           custom_status_text?: string | null
           display_name?: string | null
           global_mentions_last_read_at?: string | null
+          global_muted?: boolean
           id: string
           pronouns?: string | null
           status?: string | null
@@ -704,6 +709,7 @@ export type Database = {
           custom_status_text?: string | null
           display_name?: string | null
           global_mentions_last_read_at?: string | null
+          global_muted?: boolean
           id?: string
           pronouns?: string | null
           status?: string | null
@@ -823,6 +829,10 @@ export type Database = {
       is_super_admin: { Args: { _user_id: string }; Returns: boolean }
       leave_group: { Args: { _conv: string }; Returns: undefined }
       mark_conversation_delivered: {
+        Args: { _conversation_id: string }
+        Returns: undefined
+      }
+      mark_conversation_read: {
         Args: { _conversation_id: string }
         Returns: undefined
       }

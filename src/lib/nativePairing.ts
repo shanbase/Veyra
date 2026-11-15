@@ -1,5 +1,5 @@
 import { Capacitor } from '@capacitor/core';
-import { authRequest, notifyAuthChanged } from '@/lib/authApi';
+import { authRequest, refreshAuthUser } from '@/lib/authApi';
 import { setNativeSessionToken } from '@/lib/nativeSession';
 
 const pendingPairCodes = new Set<string>();
@@ -61,8 +61,10 @@ async function handlePairCallback(rawUrl: string) {
       const result = await authRequest<{ token: string; clientId: string }>('native/exchange', { code, clientId });
       if (result.clientId !== expectedClientId || !result.token) throw new Error('The pairing response was invalid.');
       await setNativeSessionToken(result.token);
+      // Resolve the user before emitting completion so the auth page doesn't
+      // bounce back while /api/auth/me is still loading.
+      await refreshAuthUser();
       markNativePairComplete(code);
-      notifyAuthChanged();
       emit('veyra-native-pair-complete', { code });
     } catch (error) {
       emit('veyra-native-pair-error', {
