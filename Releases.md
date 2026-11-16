@@ -18,7 +18,11 @@ Security-hardening and scale release on top of 1.2.6:
 - **Chat UX:** consecutive messages from the same sender within 5 minutes now group into a chain (avatar/name/timestamp shown once, per-message time on hover); delivery status is icon-only — clock while sending, single check sent, double check delivered/read.
 - **Attachment cap:** up to 10 files per message.
 - **Android self-update:** the app now downloads APK updates in-app with progress and hands off to the system installer automatically, instead of opening a browser page.
-- **Discord-style message menu:** right-click a message (or use the hover "…" button) for quick reactions, reply, edit (own messages), react, delete, forward, copy text, copy message ID, pin, and report. Forward sends a copy to any DM or group; reports land in the new `message_reports` table for moderator review.
+- **Discord-style message menu:** right-click a message (or use the hover "…" button) for quick reactions, reply, edit (own messages), react, delete, forward, copy text, copy message ID, pin, and report. The mobile long-press sheet mirrors the same actions. Forwarded messages render with a "Forwarded" header and accent line; reports land in the new `message_reports` table for moderator review.
+- **Typing indicator, faster and in groups:** typing now rides Supabase Realtime broadcast (fire-and-forget) instead of presence state sync — near-instant delivery, receivers self-expire after 3s, and it works in group chats too (previously DMs only).
+- **Chat sticks to the latest message:** the view stays pinned to the bottom on new messages unless you scroll up into history; it re-engages at the bottom, survives media loads/edits via a resize observer, and applies before paint.
+- **Media sends no longer flicker:** image/video/voice/file previews stay on screen until the signed remote URLs are cached, then swap seamlessly.
+- **Redis hardening:** rate-limit counters are atomic (Lua `INCR`+`PEXPIRE`, crash-safe), the admin-role cache TTL dropped to 60s so out-of-band role changes propagate quickly, and the EZMSG dead-letter list is capped.
 
 ### Downloads (once published)
 

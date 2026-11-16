@@ -71,3 +71,12 @@ Notes:
   yourself.
 - There is no self-service admin signup path; roles are never assignable by
   non-super-admins through any endpoint.
+
+## Message reports
+
+Users can report any message they can see (message action menu → Report
+Message). Reports are stored in `message_reports` (`message_table`,
+`message_id`, `reporter_id`, `reason`, `created_at`). Users can only insert
+their own reports and cannot read them back; admins can read all reports for
+moderator review. There is no dedicated moderation UI yet — query the table
+directly or via `/api/data` as an admin.
