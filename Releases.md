@@ -13,6 +13,11 @@ Security-hardening and scale release on top of 1.2.6:
 - **Infra errors no longer leak:** database connection failures return a generic 503 instead of raw driver messages.
 - **Group cap:** groups are limited to 500 members.
 - **Content-Security-Policy** header added to all responses.
+- **Optional Redis write-behind (`REDIS_EZMSG=true`):** message inserts can be queued in Redis and drained to the database asynchronously, with pending-read merging so senders still see their messages instantly. Off by default and disabled on Vercel.
+- **Client spam brake:** sending too many messages in a short window shows a blocking notice until acknowledged.
+- **Chat UX:** consecutive messages from the same sender within 5 minutes now group into a chain (avatar/name/timestamp shown once, per-message time on hover); delivery status is icon-only — clock while sending, single check sent, double check delivered/read.
+- **Attachment cap:** up to 10 files per message.
+- **Android self-update:** the app now downloads APK updates in-app with progress and hands off to the system installer automatically, instead of opening a browser page.
 
 ### Downloads (once published)
 

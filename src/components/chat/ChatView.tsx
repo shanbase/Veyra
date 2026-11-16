@@ -169,6 +169,8 @@ const EMOJI_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
 // Spam brake: this many sends inside the window triggers the blocking notice.
 const SPAM_WINDOW_MS = 10_000;
 const SPAM_MAX_MESSAGES = 8;
+// Max files (images/videos/etc.) attachable to a single message.
+const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 
 export function ChatView({ conversationId: conversationIdProp, onBack, isMobile = false, channel = "dm", isActive = true }: ChatViewProps) {
   const { user } = useAuth();
@@ -1454,9 +1456,29 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
         type: kind,
       });
     }
-    if (validFiles.length > 0) {
-      setMediaPreviews((prev) => [...prev, ...validFiles]);
-    }
+    if (validFiles.length === 0) return;
+    setMediaPreviews((prev) => {
+      const remaining = MAX_ATTACHMENTS_PER_MESSAGE - prev.length;
+      if (remaining <= 0) {
+        for (const preview of validFiles) URL.revokeObjectURL(preview.url);
+        toast({
+          title: "Attachment limit reached",
+          description: `You can attach up to ${MAX_ATTACHMENTS_PER_MESSAGE} files per message.`,
+          variant: "destructive",
+        });
+        return prev;
+      }
+      const accepted = validFiles.slice(0, remaining);
+      for (const preview of validFiles.slice(remaining)) URL.revokeObjectURL(preview.url);
+      if (accepted.length < validFiles.length) {
+        toast({
+          title: "Attachment limit reached",
+          description: `Only the first ${MAX_ATTACHMENTS_PER_MESSAGE} files were added.`,
+          variant: "destructive",
+        });
+      }
+      return [...prev, ...accepted];
+    });
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1615,35 +1637,21 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
 
     switch (message._status) {
       case "sending":
-        return (
-          <span className="flex items-center gap-1 text-primary-foreground/50">
-            <Clock className="h-3 w-3" />
-            <span className="text-[10px]">Sending</span>
-          </span>
-        );
+        return <Clock className="h-3 w-3 animate-spin text-primary-foreground/50" />;
       case "read":
-        return (
-          <span className="flex items-center gap-1 text-emerald-300">
-            <CheckCheck className="h-3 w-3" />
-            <span className="text-[10px] font-medium">Read</span>
-          </span>
-        );
+        return <CheckCheck className="h-3 w-3 text-emerald-300" />;
       case "delivered":
-        return (
-          <span className="flex items-center gap-1 text-primary-foreground/70">
-            <CheckCheck className="h-3 w-3" />
-            <span className="text-[10px] font-medium">Delivered</span>
-          </span>
-        );
+        return <CheckCheck className="h-3 w-3 text-primary-foreground/70" />;
       case "sent":
       default:
-        return (
-          <span className="flex items-center gap-1 text-amber-200">
-            <Check className="h-3 w-3" />
-            <span className="text-[10px] font-medium">Sent</span>
-          </span>
-        );
+        return <Check className="h-3 w-3 text-amber-200" />;
     }
+  };
+
+  const formatMessageTime = (dateString: string) => {
+    const date = parseServerDate(dateString);
+    if (!date) return "";
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   };
 
   const formatMessageDate = (dateString: string) => {
@@ -2039,10 +2047,33 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
           {(() => messages.map((message, index) => {
             const isOwn = message.sender_id === user?.id;
             const nextMessage = messages[index + 1];
+            const prevMessage = index > 0 ? messages[index - 1] : null;
             const continuesReadChain = message._status === "read"
               && nextMessage?.sender_id === message.sender_id
               && nextMessage._status === "read"
               && serverDateMs(nextMessage.created_at) - serverDateMs(message.created_at) <= 5 * 60 * 1000;
+
+            // Message chaining: consecutive messages from the same sender
+            // within 5 minutes collapse into one visual group — only the
+            // first shows the avatar/name/timestamp header.
+            const prevGap = prevMessage
+              ? serverDateMs(message.created_at) - serverDateMs(prevMessage.created_at)
+              : NaN;
+            const isChainStart = !prevMessage
+              || prevMessage.sender_id !== message.sender_id
+              || shouldShowDateLabel(index)
+              || !Number.isFinite(prevGap)
+              || prevGap < 0
+              || prevGap > 5 * 60 * 1000;
+            const nextGap = nextMessage
+              ? serverDateMs(nextMessage.created_at) - serverDateMs(message.created_at)
+              : NaN;
+            const isChainEnd = !nextMessage
+              || nextMessage.sender_id !== message.sender_id
+              || (index + 1 < messages.length && shouldShowDateLabel(index + 1))
+              || !Number.isFinite(nextGap)
+              || nextGap < 0
+              || nextGap > 5 * 60 * 1000;
             const isEditing = editingMessageId === message.id;
             const groupedReactions = groupReactions(message.reactions || []);
 
@@ -2213,7 +2244,9 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                   />
                 )}
 
-                {message.sender_id && message.sender_id !== user?.id ? (
+                {!isChainStart ? (
+                  <div className="w-7 sm:w-8 flex-shrink-0" />
+                ) : message.sender_id && message.sender_id !== user?.id ? (
 
                   <Popover>
                     <PopoverTrigger asChild>
@@ -2278,6 +2311,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                   ) : (
                     <div className="flex items-start gap-1 min-w-0">
                       <div className="relative flex-1 min-w-0 overflow-hidden">
+                        {isChainStart && (
                         <div className="flex items-center gap-x-1.5 gap-y-0.5 mb-0.5 flex-wrap min-w-0">
                           <button
                             type="button"
@@ -2297,11 +2331,30 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                               (edited)
                             </span>
                           )}
-                          {isOwn && getStatusIcon(message, isOwn, !continuesReadChain)}
+                          {isOwn && isChainEnd && getStatusIcon(message, isOwn, !continuesReadChain)}
                         </div>
+                        )}
 
 
                         <div className="text-foreground break-words min-w-0">
+                          {!isChainStart && (
+                            <span className="hidden group-hover:inline text-[10px] text-muted-foreground/60 mr-1.5">
+                              {formatMessageTime(message.created_at)}
+                            </span>
+                          )}
+                          {!isChainStart && message.edited_at && (
+                            <span
+                              className="text-[10px] italic text-muted-foreground/80 mr-1"
+                              title={`Edited ${formatMessageDate(message.edited_at)}`}
+                            >
+                              (edited)
+                            </span>
+                          )}
+                          {!isChainStart && isOwn && isChainEnd && (
+                            <span className="inline-flex items-center mr-1.5 align-middle">
+                              {getStatusIcon(message, isOwn)}
+                            </span>
+                          )}
                           {message.replied_message && (
                             <button
                               type="button"

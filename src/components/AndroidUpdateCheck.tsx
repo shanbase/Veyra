@@ -1,18 +1,17 @@
-import { useEffect, useState } from 'react';
-import { Capacitor } from '@capacitor/core';
+import { useEffect, useRef, useState } from 'react';
+import { Capacitor, registerPlugin } from '@capacitor/core';
 import { App } from '@capacitor/app';
-import { Browser } from '@capacitor/browser';
 import { toast } from '@/hooks/use-toast';
 import {
   AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
   AlertDialogContent,
   AlertDialogDescription,
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import { Button } from '@/components/ui/button';
+import { Progress } from '@/components/ui/progress';
 
 // Served by the Veyra API, which fetches the GitHub release metadata
 // server-side. Fetching github.com directly fails in the Android WebView
@@ -63,11 +62,65 @@ type ReleaseInfo = {
   android?: { file?: string; url?: string };
 };
 
+type DownloadState = 'idle' | 'downloading' | 'applying' | 'error';
+
+interface AppUpdatePlugin {
+  downloadAndInstall(options: { url: string }): Promise<void>;
+  cancel(): Promise<void>;
+  addListener(
+    eventName: 'downloadProgress',
+    listenerFunc: (event: { received: number; total: number }) => void,
+  ): Promise<{ remove: () => void }>;
+  addListener(
+    eventName: 'downloadReady' | 'downloadFailed' | 'downloadCancelled' | 'installFailed',
+    listenerFunc: (event: { error?: string }) => void,
+  ): Promise<{ remove: () => void }>;
+}
+
+const AppUpdate = registerPlugin<AppUpdatePlugin>('AppUpdate');
+
+function formatMb(bytes: number) {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export function AndroidUpdateCheck() {
   const [release, setRelease] = useState<ReleaseInfo | null>(null);
   const [open, setOpen] = useState(false);
-  const [opening, setOpening] = useState(false);
   const [currentVersion, setCurrentVersion] = useState(BUILD_VERSION || '…');
+  const [download, setDownload] = useState<DownloadState>('idle');
+  const [received, setReceived] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const startedRef = useRef(false);
+
+  // Native download progress + lifecycle events.
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform() || Capacitor.getPlatform() !== 'android') return;
+    const handles: { remove: () => void }[] = [];
+    void (async () => {
+      handles.push(await AppUpdate.addListener('downloadProgress', (event) => {
+        setReceived(event.received || 0);
+        if (event.total > 0) setTotal(event.total);
+      }));
+      handles.push(await AppUpdate.addListener('downloadReady', () => {
+        setDownload('applying');
+      }));
+      handles.push(await AppUpdate.addListener('downloadFailed', (event) => {
+        setError(event.error || 'Download failed.');
+        setDownload('error');
+      }));
+      handles.push(await AppUpdate.addListener('installFailed', (event) => {
+        setError(event.error || 'Could not open the installer.');
+        setDownload('error');
+      }));
+      handles.push(await AppUpdate.addListener('downloadCancelled', () => {
+        setDownload('idle');
+      }));
+    })().catch(() => {});
+    return () => {
+      for (const handle of handles) void handle.remove();
+    };
+  }, []);
 
   useEffect(() => {
     if (!Capacitor.isNativePlatform() || Capacitor.getPlatform() !== 'android') return;
@@ -96,31 +149,69 @@ export function AndroidUpdateCheck() {
     return () => { cancelled = true; };
   }, []);
 
-  const download = async () => {
-    if (!release?.android?.url || opening) return;
-    setOpening(true);
+  // Auto-start the download as soon as an update is found — the native side
+  // reports progress and launches the system installer when the APK is ready.
+  useEffect(() => {
+    const url = release?.android?.url;
+    if (!open || !url || startedRef.current || download !== 'idle') return;
+    startedRef.current = true;
+    setDownload('downloading');
+    AppUpdate.downloadAndInstall({ url }).catch((error) => {
+      console.warn('Could not start the Android update download:', error);
+      setError(error?.message || 'Could not start the download.');
+      setDownload('error');
+    });
+  }, [open, release, download]);
+
+  const cancelDownload = async () => {
     try {
-      await Browser.open({ url: release.android.url });
-    } catch (error) {
-      console.warn('Could not open the Android update download:', error);
-      toast({
-        title: 'Download failed',
-        description: 'Could not open the update download. Please check your connection and try again.',
-        variant: 'destructive',
-      });
-    } finally {
-      setOpening(false);
+      await AppUpdate.cancel();
+    } catch {
+      // Native side may already be done; ignore.
     }
+    startedRef.current = false;
+    setDownload('idle');
+    setReceived(0);
+    setTotal(0);
+    setOpen(false);
   };
 
+  const retry = () => {
+    startedRef.current = false;
+    setError(null);
+    setReceived(0);
+    setTotal(0);
+    setDownload('idle');
+  };
+
+  const percent = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : null;
+
   return (
-    <AlertDialog open={open} onOpenChange={setOpen}>
+    <AlertDialog open={open} onOpenChange={(next) => { if (!next && download === 'idle') setOpen(false); }}>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>Veyra {release?.version} is available</AlertDialogTitle>
           <AlertDialogDescription asChild>
             <div className="space-y-2">
-              <p>You are running Veyra {currentVersion}. Download the new APK to update.</p>
+              {download === 'downloading' && (
+                <div className="space-y-2">
+                  <p>
+                    Downloading update… {formatMb(received)}
+                    {total > 0 ? ` / ${formatMb(total)}` : ''}
+                    {percent !== null ? ` (${percent}%)` : ''}
+                  </p>
+                  <Progress value={percent ?? undefined} />
+                </div>
+              )}
+              {download === 'applying' && (
+                <p>Applying update… the installer will open in a moment.</p>
+              )}
+              {download === 'error' && (
+                <p className="text-destructive">{error || 'Update failed.'}</p>
+              )}
+              {download === 'idle' && (
+                <p>You are running Veyra {currentVersion}.</p>
+              )}
               {release?.notes || release?.name ? (
                 <p className="text-xs text-muted-foreground whitespace-pre-wrap">
                   {release.notes || release.name}
@@ -130,10 +221,18 @@ export function AndroidUpdateCheck() {
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={opening}>Later</AlertDialogCancel>
-          <AlertDialogAction onClick={(event) => { event.preventDefault(); void download(); }} disabled={opening}>
-            {opening ? 'Opening…' : 'Download update'}
-          </AlertDialogAction>
+          {download === 'downloading' ? (
+            <Button variant="outline" onClick={() => void cancelDownload()}>
+              Cancel
+            </Button>
+          ) : download === 'error' ? (
+            <>
+              <Button variant="outline" onClick={() => { setOpen(false); }}>Later</Button>
+              <Button onClick={retry}>Retry</Button>
+            </>
+          ) : download === 'idle' ? (
+            <Button variant="outline" onClick={() => setOpen(false)}>Later</Button>
+          ) : null}
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

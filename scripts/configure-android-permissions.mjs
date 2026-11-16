@@ -10,6 +10,8 @@ const REQUIRED_PERMISSIONS = [
   'android.permission.MODIFY_AUDIO_SETTINGS',
   // Required on Android 13+ for FCM push notifications.
   'android.permission.POST_NOTIFICATIONS',
+  // Lets the in-app updater hand the downloaded APK to the system installer.
+  'android.permission.REQUEST_INSTALL_PACKAGES',
 ];
 
 const original = await readFile(manifestPath, 'utf8');
