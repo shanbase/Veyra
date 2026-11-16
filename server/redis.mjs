@@ -273,22 +273,33 @@ export async function ezmsgMarkFailed(item, error) {
 // explicit invalidation on user_roles writes is somehow bypassed.
 const ROLE_TTL_SECONDS = 60;
 
+export function normalizeUserRoles(rows) {
+  const roles = { admin: false, super: false };
+  for (const row of rows || []) {
+    if (row.role === 'admin') roles.admin = true;
+    if (row.role === 'super_admin') {
+      roles.admin = true;
+      roles.super = true;
+    }
+  }
+  return roles;
+}
+
 // Admin/super-admin flags are read on nearly every API request. Cache them
 // per user; writes to user_roles invalidate the specific users' keys (see
 // invalidateUserRole) so changes propagate immediately.
 export async function cachedUserRoles(userId) {
   const key = `veyra:v1:roles:${userId}`;
   const cached = await redisGetJson(key);
-  if (cached && typeof cached.admin === 'boolean' && typeof cached.super === 'boolean') return cached;
+  if (cached && typeof cached.admin === 'boolean' && typeof cached.super === 'boolean') {
+    // Entries cached before super_admin implied admin still have admin=false.
+    return cached.super && !cached.admin ? { admin: true, super: true } : cached;
+  }
   // Lazy import: pulling db.mjs in at module load would keep scripts/tests
   // that only need Redis helpers alive on an open DB pool.
   const { pool } = await import('./db.mjs');
   const [rows] = await pool.execute('SELECT role FROM user_roles WHERE user_id = ?', [userId]);
-  const roles = { admin: false, super: false };
-  for (const row of rows) {
-    if (row.role === 'admin') roles.admin = true;
-    if (row.role === 'super_admin') roles.super = true;
-  }
+  const roles = normalizeUserRoles(rows);
   await redisSetJson(key, roles, ROLE_TTL_SECONDS);
   return roles;
 }

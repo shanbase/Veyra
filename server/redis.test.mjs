@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 process.env.REDIS_URL = '';
-const { cachedRead, coalesce } = await import('./redis.mjs');
+const { cachedRead, coalesce, normalizeUserRoles } = await import('./redis.mjs');
 
 test('identical in-flight operations share one result', async () => {
   let calls = 0;
@@ -23,6 +23,10 @@ test('different keys do not share work', async () => {
     coalesce('user-b:conversation-a:page-1', async () => ++calls),
   ]);
   assert.equal(new Set(result).size, 3);
+});
+
+test('super admin role implies admin access', () => {
+  assert.deepEqual(normalizeUserRoles([{ role: 'super_admin' }]), { admin: true, super: true });
 });
 
 test('reads fall back to MariaDB when Redis is not configured', async () => {

@@ -255,23 +255,25 @@ export async function ensureDirectMessage(userId, otherId) {
   if (existing.length) return existing[0].conversation_id;
   // Atomic claim: dm_pairs' primary key guarantees exactly one concurrent
   // caller wins the insert; losers read the winner's conversation_id. The
-  // INSERT ... waits on the winner's row lock, so the follow-up SELECT sees
-  // the committed pair row.
+  // conversation must exist before the pair row because dm_pairs has a FK to
+  // conversations. Losers roll back their own conversation/members, so no
+  // orphan rows remain.
   const id = randomUUID();
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
+    await connection.execute('INSERT INTO conversations (id, is_group, created_by) VALUES (?, ?, ?)', [id, boolParam(false), userId]);
+    await connection.execute('INSERT INTO conversation_members (id, conversation_id, user_id, role) VALUES (?, ?, ?, ?), (?, ?, ?, ?)', [randomUUID(), id, userId, 'member', randomUUID(), id, otherId, 'member']);
     const [claim] = await connection.execute(
       'INSERT IGNORE INTO dm_pairs (user_low, user_high, conversation_id) VALUES (?, ?, ?)',
       [low, high, id],
     );
     if (!claim.affectedRows) {
+      await connection.rollback();
       const [pair] = await connection.execute('SELECT conversation_id FROM dm_pairs WHERE user_low = ? AND user_high = ?', [low, high]);
-      await connection.commit();
+      if (!pair.length) throw new Error('Conversation creation conflicted. Please try again.');
       return pair[0].conversation_id;
     }
-    await connection.execute('INSERT INTO conversations (id, is_group, created_by) VALUES (?, ?, ?)', [id, boolParam(false), userId]);
-    await connection.execute('INSERT INTO conversation_members (id, conversation_id, user_id, role) VALUES (?, ?, ?, ?), (?, ?, ?, ?)', [randomUUID(), id, userId, 'member', randomUUID(), id, otherId, 'member']);
     await connection.commit();
     return id;
   } catch (error) {
