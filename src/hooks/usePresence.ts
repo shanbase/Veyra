@@ -6,8 +6,6 @@ interface PresenceState {
   odataclause: string;
   user_id: string;
   online_at: string;
-  typing_in?: string;
-  typing_until?: number;
 }
 
 export function usePresence(conversationId: string | null) {
@@ -16,8 +14,6 @@ export function usePresence(conversationId: string | null) {
   const [typingUsers, setTypingUsers] = useState<Set<string>>(new Set());
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const typingExpiryRef = useRef(new Map<string, number>());
-  const trackQueueRef = useRef<Promise<void>>(Promise.resolve());
-  const lastTypingRef = useRef<{ typing_in?: string | null; typing_until?: number }>({ typing_until: 0 });
 
   useEffect(() => {
     if (!user || !conversationId) return;
@@ -26,47 +22,49 @@ export function usePresence(conversationId: string | null) {
     channelRef.current = channel;
 
     channel
+      // Typing uses broadcast, not presence state: it's fire-and-forget
+      // pub/sub (~100-300ms) instead of the slower track→sync→diff path,
+      // and receivers self-expire entries so no stop event or clock sync
+      // is needed.
+      .on("broadcast", { event: "typing" }, ({ payload }) => {
+        const typerId = (payload as { user_id?: string } | undefined)?.user_id;
+        if (!typerId || typerId === user.id) return;
+        const until = Date.now() + 3000;
+        typingExpiryRef.current.set(typerId, Math.max(typingExpiryRef.current.get(typerId) || 0, until));
+        setTypingUsers((previous) => {
+          if (previous.has(typerId)) return previous;
+          const next = new Set(previous);
+          next.add(typerId);
+          return next;
+        });
+      })
       .on("presence", { event: "sync" }, () => {
         const state = channel.presenceState();
         const online = new Set<string>();
-        const typing = new Set<string>();
-        const expiry = new Map<string, number>();
 
         Object.values(state).forEach((presences: any) => {
           presences.forEach((presence: PresenceState) => {
-            if (presence.user_id !== user.id) {
-              online.add(presence.user_id);
-              if (presence.typing_in === conversationId && (presence.typing_until || 0) > Date.now()) {
-                typing.add(presence.user_id);
-                expiry.set(presence.user_id, Math.max(expiry.get(presence.user_id) || 0, presence.typing_until || 0));
-              }
-            }
+            if (presence.user_id !== user.id) online.add(presence.user_id);
           });
         });
 
         setOnlineUsers(online);
-        typingExpiryRef.current = expiry;
-        setTypingUsers(typing);
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
           await channel.track({
             user_id: user.id,
             online_at: new Date().toISOString(),
-            typing_in: lastTypingRef.current.typing_in ?? null,
-            typing_until: lastTypingRef.current.typing_until ?? 0,
           });
         }
       });
 
     // Refresh presence periodically so other clients see a live online_at
-    // instead of a stale entry, preserving the current typing state.
+    // instead of a stale entry.
     const heartbeat = window.setInterval(() => {
       void channel.track({
         user_id: user.id,
         online_at: new Date().toISOString(),
-        typing_in: lastTypingRef.current.typing_in ?? null,
-        typing_until: lastTypingRef.current.typing_until ?? 0,
       }).catch(() => undefined);
     }, 30000);
 
@@ -83,28 +81,18 @@ export function usePresence(conversationId: string | null) {
       window.clearInterval(expiryTimer);
       window.clearInterval(heartbeat);
       typingExpiryRef.current.clear();
-      lastTypingRef.current = { typing_until: 0 };
       if (channelRef.current === channel) channelRef.current = null;
       supabase.removeChannel(channel);
     };
   }, [user, conversationId]);
 
   const setTyping = useCallback(
-    async (isTyping: boolean) => {
+    (isTyping: boolean) => {
       const channel = channelRef.current;
-      if (!user || !conversationId || !channel) return;
-
-      const payload = {
-        user_id: user.id,
-        online_at: new Date().toISOString(),
-        typing_in: isTyping ? conversationId : null,
-        typing_until: isTyping ? Date.now() + 5000 : 0,
-      };
-      lastTypingRef.current = { typing_in: payload.typing_in, typing_until: payload.typing_until };
-      trackQueueRef.current = trackQueueRef.current.catch(() => undefined).then(async () => {
-        if (channelRef.current === channel) await channel.track(payload);
-      });
-      await trackQueueRef.current;
+      if (!user || !conversationId || !channel || !isTyping) return;
+      void channel
+        .send({ type: "broadcast", event: "typing", payload: { user_id: user.id } })
+        .catch(() => undefined);
     },
     [user, conversationId]
   );
