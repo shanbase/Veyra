@@ -2,9 +2,6 @@ import { createHash } from 'node:crypto';
 import { createClient } from 'redis';
 
 const redisUrl = String(process.env.REDIS_URL || '').trim();
-if (redisUrl && process.env.NODE_ENV === 'production' && redisUrl.startsWith('redis://')) {
-  console.warn('REDIS_URL uses redis:// without TLS; use rediss:// for encrypted transport in production.');
-}
 const inFlight = new Map();
 const MAX_IN_FLIGHT = 500;
 let client;
