@@ -7,11 +7,22 @@ const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const crypto = require('node:crypto');
 
-const APP_URL = 'https://veyra-pink-mu.vercel.app';
-const APP_ORIGIN = new URL(APP_URL).origin;
+// Primary deployment first, Vercel as fallback. Both serve the same app and
+// backend; the window retries the next URL when the current one fails to
+// load, and the API/update checks try each origin in order.
+const APP_URLS = ['https://veyra.go.altare.global', 'https://veyra-pink-mu.vercel.app'];
+const APP_ORIGINS = new Set(APP_URLS.map((url) => new URL(url).origin));
 // Proxied through the Veyra API so the check works even when GitHub release
 // downloads are unreachable or redirect in ways fetch cannot follow.
-const RELEASE_METADATA = `${APP_ORIGIN}/api/app-version`;
+async function fetchReleaseMetadata() {
+  for (const origin of APP_ORIGINS) {
+    try {
+      const response = await fetch(`${origin}/api/app-version`, { signal: AbortSignal.timeout(7000), headers: { accept: 'application/json' } });
+      if (response.ok) return response.json();
+    } catch {}
+  }
+  return null;
+}
 const SESSION_PATH = path.join(app.getPath('userData'), 'session.dat');
 const UPDATE_PAGE = path.join(__dirname, 'update.html');
 let updateInstalling = false;
@@ -87,7 +98,7 @@ ipcMain.handle('veyra:clear-session-token', () => {
 });
 ipcMain.handle('veyra:open-external', async (_event, target) => {
   const url = new URL(String(target));
-  if (url.origin !== APP_ORIGIN || url.protocol !== 'https:') throw new Error('Only Veyra sign-in links can be opened.');
+  if (!APP_ORIGINS.has(url.origin) || url.protocol !== 'https:') throw new Error('Only Veyra sign-in links can be opened.');
   await shell.openExternal(url.toString());
 });
 
@@ -197,12 +208,11 @@ async function checkForUpdates() {
   if (!app.isPackaged || process.platform !== 'win32' || updateInstalling) return;
   let release;
   try {
-    const response = await fetch(RELEASE_METADATA, { signal: AbortSignal.timeout(7000), headers: { accept: 'application/json' } });
-    if (!response.ok) return;
-    release = await response.json();
+    release = await fetchReleaseMetadata();
   } catch {
     return;
   }
+  if (!release) return;
   if (!release?.version || !release.windows?.url || compareVersions(release.version, app.getVersion()) <= 0) return;
 
   pendingRelease = release;
@@ -281,10 +291,31 @@ function createWindow() {
     if (url.startsWith('https://')) void shell.openExternal(url);
     return { action: 'deny' };
   });
-  window.webContents.on('will-navigate', (event, url) => {
-    if (new URL(url).origin !== APP_ORIGIN) event.preventDefault();
+  // Ordered failover: load the primary deployment and hop to the next URL on
+  // a main-frame load failure. If every URL fails, retry the primary after a
+  // short delay so a transient outage self-heals.
+  let appUrlIndex = 0;
+  let failoverRetryTimer = null;
+  const loadAppUrl = (index) => {
+    appUrlIndex = index;
+    void window.loadURL(APP_URLS[index]);
+  };
+  window.webContents.on('did-fail-load', (_event, errorCode, _description, _validatedURL, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3) return; // -3 = aborted by our own navigation
+    if (appUrlIndex + 1 < APP_URLS.length) {
+      loadAppUrl(appUrlIndex + 1);
+    } else if (!failoverRetryTimer) {
+      failoverRetryTimer = setTimeout(() => {
+        failoverRetryTimer = null;
+        loadAppUrl(0);
+      }, 30000);
+      failoverRetryTimer.unref?.();
+    }
   });
-  void window.loadURL(APP_URL);
+  window.webContents.on('will-navigate', (event, url) => {
+    if (!APP_ORIGINS.has(new URL(url).origin)) event.preventDefault();
+  });
+  loadAppUrl(0);
 }
 
 app.whenReady().then(async () => {

@@ -6,7 +6,9 @@ const config: CapacitorConfig = {
   webDir: 'dist',
   server: {
     // The APK is a native shell around the deployed Veyra web app and API.
-    url: 'https://veyra-pink-mu.vercel.app',
+    // Primary host; FailoverWebViewClient retries the Vercel deployment if
+    // the primary fails to load (see scripts/configure-android-updater.mjs).
+    url: 'https://veyra.go.altare.global',
     cleartext: false,
   },
 };

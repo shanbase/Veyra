@@ -6,6 +6,7 @@ import { dirname } from 'node:path';
 // configure script — same pattern as the deeplink/icons/permissions scripts.
 const PLUGIN_PATH = 'android/app/src/main/java/chat/veyra/mobile/AppUpdatePlugin.java';
 const ACTIVITY_PATH = 'android/app/src/main/java/chat/veyra/mobile/MainActivity.java';
+const FAILOVER_PATH = 'android/app/src/main/java/chat/veyra/mobile/FailoverWebViewClient.java';
 
 const PLUGIN_SOURCE = `package chat.veyra.mobile;
 
@@ -137,6 +138,60 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(AppUpdatePlugin.class);
         super.onCreate(savedInstanceState);
+        // Wrap Capacitor's WebViewClient so a dead primary host falls back to
+        // the secondary deployment instead of stranding the user on an error
+        // page. Installed right after super.onCreate — the initial load is
+        // still in flight, so the client catches its failure.
+        bridge.setWebViewClient(new FailoverWebViewClient(bridge));
+    }
+}
+`;
+
+const FAILOVER_SOURCE = `package chat.veyra.mobile;
+
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebView;
+import com.getcapacitor.Bridge;
+import com.getcapacitor.BridgeWebViewClient;
+
+/**
+ * Retries the app on the secondary deployment when the primary host fails
+ * to load. Only the initial main-frame navigation triggers failover — once
+ * per activity — so in-app navigations and subresource errors never loop.
+ *
+ * Note: the secondary is a different origin, so the Capacitor native bridge
+ * injection (scoped to the configured appUrl origin) and web storage do not
+ * carry over; the app runs there as a regular web client.
+ */
+public class FailoverWebViewClient extends BridgeWebViewClient {
+    private static final String PRIMARY = "https://veyra.go.altare.global";
+    private static final String SECONDARY = "https://veyra-pink-mu.vercel.app";
+
+    private boolean failedOver = false;
+
+    public FailoverWebViewClient(Bridge bridge) {
+        super(bridge);
+    }
+
+    @Override
+    public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+        super.onReceivedError(view, request, error);
+        if (failedOver || request == null || !request.isForMainFrame()) return;
+        android.net.Uri uri = request.getUrl();
+        if (uri != null && uri.toString().startsWith(PRIMARY)) {
+            failedOver = true;
+            view.loadUrl(SECONDARY);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    @Override
+    public void onReceivedError(WebView view, int errorCode, String description, String failingUrl) {
+        super.onReceivedError(view, errorCode, description, failingUrl);
+        if (failedOver || failingUrl == null || !failingUrl.startsWith(PRIMARY)) return;
+        failedOver = true;
+        view.loadUrl(SECONDARY);
     }
 }
 `;
@@ -150,14 +205,23 @@ if (existingPlugin !== PLUGIN_SOURCE) {
   console.log('AppUpdatePlugin.java already up to date.');
 }
 
+const failover = await readFile(FAILOVER_PATH, 'utf8').catch(() => null);
+if (failover !== FAILOVER_SOURCE) {
+  await mkdir(dirname(FAILOVER_PATH), { recursive: true });
+  await writeFile(FAILOVER_PATH, FAILOVER_SOURCE);
+  console.log('Wrote FailoverWebViewClient.java.');
+} else {
+  console.log('FailoverWebViewClient.java already up to date.');
+}
+
 const activity = await readFile(ACTIVITY_PATH, 'utf8').catch(() => null);
 if (activity === null) {
   await mkdir(dirname(ACTIVITY_PATH), { recursive: true });
   await writeFile(ACTIVITY_PATH, ACTIVITY_SOURCE);
   console.log('Wrote MainActivity.java.');
-} else if (!activity.includes('AppUpdatePlugin')) {
+} else if (!activity.includes('AppUpdatePlugin') || !activity.includes('FailoverWebViewClient')) {
   await writeFile(ACTIVITY_PATH, ACTIVITY_SOURCE);
-  console.log('Updated MainActivity.java to register AppUpdatePlugin.');
+  console.log('Updated MainActivity.java to register AppUpdatePlugin and failover client.');
 } else {
-  console.log('MainActivity.java already registers AppUpdatePlugin.');
+  console.log('MainActivity.java already registers AppUpdatePlugin and failover client.');
 }
