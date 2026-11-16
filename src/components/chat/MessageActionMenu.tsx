@@ -87,8 +87,9 @@ export function MessageActionMenu({
   const menuRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ x: 0, y: 0 });
 
-  // Clamp the menu inside the chat viewport once its real size is known, and
-  // cap its height so every item stays reachable on short screens.
+  // Open at the cursor like a native context menu: prefer below-right, flip
+  // to the other side of the pointer only when it would overflow the chat
+  // viewport, then hard-clamp as a last resort.
   useLayoutEffect(() => {
     if (!state) return;
     const el = menuRef.current;
@@ -97,10 +98,15 @@ export function MessageActionMenu({
     const bounds = getBounds?.() ?? null;
     const minX = bounds ? bounds.left + 8 : 8;
     const minY = bounds ? bounds.top + 8 : 8;
-    const maxX = (bounds ? bounds.right : window.innerWidth) - rect.width - 8;
-    const maxY = (bounds ? bounds.bottom : window.innerHeight) - rect.height - 8;
-    const x = Math.min(Math.max(state.x, minX), Math.max(minX, maxX));
-    const y = Math.min(Math.max(state.y, minY), Math.max(minY, maxY));
+    const boundRight = bounds ? bounds.right - 8 : window.innerWidth - 8;
+    const boundBottom = bounds ? bounds.bottom - 8 : window.innerHeight - 8;
+
+    let x = state.x;
+    let y = state.y;
+    if (x + rect.width > boundRight) x = state.x - rect.width;
+    if (y + rect.height > boundBottom) y = state.y - rect.height;
+    x = Math.min(Math.max(x, minX), Math.max(minX, boundRight - rect.width));
+    y = Math.min(Math.max(y, minY), Math.max(minY, boundBottom - rect.height));
     setPos({ x, y });
   }, [state, getBounds]);
 
