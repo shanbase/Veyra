@@ -59,6 +59,10 @@ type ReleaseInfo = {
   tag?: string;
   notes?: string;
   name?: string;
+  // Minimum native shell version that must be installed. The app is a web
+  // shell, so website-only releases don't require an APK update — only
+  // releases that bump this floor (native plugins/permissions changes) do.
+  min_app_version?: string;
   android?: { file?: string; url?: string };
 };
 
@@ -134,7 +138,12 @@ export function AndroidUpdateCheck() {
         if (response.status === 404) return; // No published release yet.
         if (!response.ok) throw new Error(`Release check failed (HTTP ${response.status}).`);
         const info = await response.json() as ReleaseInfo;
-        if (cancelled || !info.version || !info.android?.url || compareVersions(info.version, installed) <= 0) return;
+        // Only prompt when the installed shell is older than the required
+        // minimum — the web content is always live, so a newer release tag
+        // alone doesn't justify an APK download. Older latest.json files
+        // without the field fall back to comparing the release version.
+        const required = normalizeVersion(info.min_app_version || info.version || '');
+        if (cancelled || !info.version || !info.android?.url || !required || compareVersions(required, installed) <= 0) return;
         setRelease(info);
         setOpen(true);
       } catch (error) {

@@ -116,8 +116,13 @@ jobs:
           VERSION="${RELEASE_VERSION#v}"
           WIN_SHA=$(sha256sum "release-assets/Veyra$VERSION.exe" | cut -d' ' -f1)
           APK_SHA=$(sha256sum "release-assets/AndroidVeyra$VERSION.apk" | cut -d' ' -f1)
+          # min_app_version gates native updates: apps only prompt when their
+          # installed shell is older than this floor, so website-only releases
+          # don't force an APK/EXE download. Bump package.json minAppVersion
+          # only when the native shell itself changes.
+          MIN_APP_VERSION=$(node -p "require('./package.json').minAppVersion || '$VERSION'")
           cat > release-assets/latest.json <<EOF
-          {"version":"$VERSION","tag":"$RELEASE_VERSION","windows":{"file":"Veyra$VERSION.exe","url":"https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION/Veyra$VERSION.exe","sha256":"$WIN_SHA"},"android":{"file":"AndroidVeyra$VERSION.apk","url":"https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION/AndroidVeyra$VERSION.apk","sha256":"$APK_SHA"}}
+          {"version":"$VERSION","tag":"$RELEASE_VERSION","min_app_version":"$MIN_APP_VERSION","windows":{"file":"Veyra$VERSION.exe","url":"https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION/Veyra$VERSION.exe","sha256":"$WIN_SHA"},"android":{"file":"AndroidVeyra$VERSION.apk","url":"https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION/AndroidVeyra$VERSION.apk","sha256":"$APK_SHA"}}
           EOF
       - name: Extract changelog
         env:

@@ -213,7 +213,11 @@ async function checkForUpdates() {
     return;
   }
   if (!release) return;
-  if (!release?.version || !release.windows?.url || compareVersions(release.version, app.getVersion()) <= 0) return;
+  // The window is a web shell — only prompt when the installed shell is older
+  // than min_app_version (native changes). Releases without the field fall
+  // back to the release version for backwards compatibility.
+  const requiredVersion = release.min_app_version || release.version;
+  if (!release?.version || !release.windows?.url || !requiredVersion || compareVersions(requiredVersion, app.getVersion()) <= 0) return;
 
   pendingRelease = release;
   ensureUpdateWindow();

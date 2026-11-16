@@ -2,6 +2,8 @@
 
 GitHub Releases are the public update source for the Windows desktop and Android apps. A release is created by pushing a semantic version tag in the form `vMAJOR.MINOR.PATCH`, for example `v1.2.0`. The release workflow builds both apps, attaches their installers, generates `latest.json`, and publishes the release. Pull request and branch builds do not publish releases.
 
+Both apps are web shells around the deployed site, so `latest.json` carries a `min_app_version` field (sourced from `minAppVersion` in `package.json`): apps only prompt for a native update when the installed shell is older than that floor. Bump `minAppVersion` only when the native shell itself changes (plugins, permissions, updater, failover) — website-only releases do not require an app update.
+
 ## Veyra 1.2.7
 
 Security-hardening, scale, and UX release on top of 1.2.6. Everything below shipped after the 1.2.6 tag.
