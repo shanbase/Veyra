@@ -369,3 +369,4 @@ CREATE TABLE IF NOT EXISTS message_reports (
   KEY idx_message_reports_reporter (reporter_id),
   CONSTRAINT fk_message_reports_reporter FOREIGN KEY (reporter_id) REFERENCES profiles(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE;

@@ -362,7 +362,7 @@ async function queryDataUncached(userId, payload) {
       // Receipt timestamps and thread linkage are server-managed: a sender
       // must not be able to forge read/delivered state or rewrite replies.
       // Content/edited_at/pin fields stay writable — the composer uses them.
-      messages: ['conversation_id', 'sender_id', 'read_at', 'delivered_at', 'reply_to_id', 'created_at'],
+      messages: ['conversation_id', 'sender_id', 'read_at', 'delivered_at', 'reply_to_id', 'created_at', 'is_forwarded'],
       global_messages: ['sender_id', 'reply_to_id', 'created_at'],
       announcement_messages: ['sender_id', 'reply_to_id', 'created_at'],
       message_reactions: ['message_id', 'user_id'],

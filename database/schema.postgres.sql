@@ -398,3 +398,4 @@ CREATE TABLE IF NOT EXISTS message_reports (
 );
 CREATE INDEX IF NOT EXISTS idx_message_reports_message ON message_reports (message_table, message_id);
 CREATE INDEX IF NOT EXISTS idx_message_reports_reporter ON message_reports (reporter_id);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE;

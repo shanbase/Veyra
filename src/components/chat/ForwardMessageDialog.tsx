@@ -85,6 +85,7 @@ export function ForwardMessageDialog({
       content: message.content ?? "",
       image_url: message.image_url ?? null,
       reply_to_id: null,
+      is_forwarded: true,
     });
     setSendingId(null);
     if (error) {

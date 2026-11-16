@@ -315,6 +315,7 @@ export type Database = {
           edited_at: string | null
           id: string
           image_url: string | null
+          is_forwarded: boolean
           is_pinned: boolean
           pinned_at: string | null
           pinned_by: string | null
@@ -331,6 +332,7 @@ export type Database = {
           edited_at?: string | null
           id?: string
           image_url?: string | null
+          is_forwarded?: boolean
           is_pinned?: boolean
           pinned_at?: string | null
           pinned_by?: string | null
@@ -347,6 +349,7 @@ export type Database = {
           edited_at?: string | null
           id?: string
           image_url?: string | null
+          is_forwarded?: boolean
           is_pinned?: boolean
           pinned_at?: string | null
           pinned_by?: string | null

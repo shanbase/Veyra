@@ -43,7 +43,7 @@ import { VoiceRecordingIndicator } from "@/components/chat/VoiceRecordingIndicat
 import {
   Send, Check, CheckCheck, Clock, MoreHorizontal, Pencil, X,
   Trash2, Smile, ArrowLeft, ImagePlus, ArrowDown, Reply,
-  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff
+  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff, Forward
 } from "lucide-react";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { signMessageMedia, encodeFile, decodeFile, encodeMusic, decodeMusic } from "@/lib/mediaUrl";
@@ -107,6 +107,7 @@ export interface Message {
   image_url: string | null;
   reply_to_id: string | null;
   is_pinned?: boolean;
+  is_forwarded?: boolean;
   pinned_at?: string | null;
   pinned_by?: string | null;
   sender?: {
@@ -1646,7 +1647,9 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
         startEditing(menuMessage);
         break;
       case "react":
-        setOpenEmojiPopover(`inline-${menuMessage.id}`);
+        // Opens the always-rendered hover reaction picker (the inline one only
+        // exists on messages that already have reactions).
+        setOpenEmojiPopover(menuMessage.id);
         break;
       case "delete":
         setDeleteMessageId(menuMessage.id);
@@ -2393,7 +2396,13 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                         )}
 
 
-                        <div className="text-foreground break-words min-w-0">
+                        <div className={`text-foreground break-words min-w-0 ${message.is_forwarded ? "border-l-2 border-white/70 pl-2 sm:pl-2.5" : ""}`}>
+                          {message.is_forwarded && (
+                            <div className="flex items-center gap-1.5 mb-1">
+                              <Forward className="h-3.5 w-3.5 text-muted-foreground" />
+                              <span className="text-xs font-bold text-foreground/90">Forwarded</span>
+                            </div>
+                          )}
                           {!isChainStart && message.edited_at && (
                             <span
                               className="text-[10px] italic text-muted-foreground/80 mr-1"
