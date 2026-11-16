@@ -360,22 +360,10 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
         ) : null;
       case "song":
         return song ? (
-          <div key="song" className="mt-4 w-full rounded-lg border border-border/60 p-3">
-            <p className="flex items-center gap-1.5 text-xs uppercase tracking-wide opacity-70 mb-1">
-              <Music className="h-3 w-3" /> Profile song
-            </p>
-            <p className="text-sm font-medium" style={baseStyle}>{song.title}{song.artist ? ` — ${song.artist}` : ""}</p>
-            <audio
-              ref={songAudioRef}
-              controls
-              preload="none"
-              src={song.url}
-              className="mt-2 w-full"
-              onPlay={() => setSongPlaying(true)}
-              onPause={() => setSongPlaying(false)}
-              onEnded={() => setSongPlaying(false)}
-            />
-          </div>
+          <p key="song" className="mt-4 flex items-center gap-1.5 text-sm" style={baseStyle}>
+            <Music className="h-3.5 w-3.5 opacity-70" />
+            {song.title}{song.artist ? ` — ${song.artist}` : ""}
+          </p>
         ) : null;
       default:
         return null;
@@ -686,7 +674,21 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
         <DialogDescription className="sr-only">User profile</DialogDescription>
 
         {/* Banner */}
-        <div className="h-[7.5rem] sm:h-36 w-full overflow-hidden bg-muted">
+        <div className="relative h-[7.5rem] sm:h-36 w-full overflow-hidden bg-muted">
+          {song && (
+            <div className="absolute left-3 top-3 z-10">
+              <ProfileSongDisc song={song} audioRef={songAudioRef} playing={songPlaying} />
+              <audio
+                ref={songAudioRef}
+                preload="none"
+                src={song.url}
+                className="hidden"
+                onPlay={() => setSongPlaying(true)}
+                onPause={() => setSongPlaying(false)}
+                onEnded={() => setSongPlaying(false)}
+              />
+            </div>
+          )}
           {profile?.banner_url && profile.banner_media_kind === "video" ? (
             <video src={profile.banner_url} autoPlay muted loop playsInline className="h-full w-full object-cover" />
           ) : profile?.banner_url ? (
@@ -695,7 +697,6 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
         </div>
 
         <div className="px-4 sm:px-5 pb-5 -mt-10 flex flex-col items-start text-left">
-          <div className="flex items-end gap-1">
           <div className="relative w-fit">
             <Avatar className="h-20 w-20 sm:h-24 sm:w-24 border-4 border-background shadow-md flex-shrink-0">
               <AvatarImage src={profile?.avatar_url || undefined} />
@@ -716,10 +717,6 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
                 }
               />
             )}
-          </div>
-          {song && (
-            <ProfileSongDisc song={song} audioRef={songAudioRef} playing={songPlaying} />
-          )}
           </div>
 
           <div className="mt-3 space-y-1 w-full">
