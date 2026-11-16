@@ -178,6 +178,83 @@ export async function redisDel(...keys) {
   }
 }
 
+// EZMSG write-behind queue (REDIS_EZMSG=true only): message inserts are
+// RPUSHed here and a drain worker persists them to MariaDB. Items move through
+// a processing list so a crash mid-drain does not silently drop messages —
+// ezmsgRecover() returns them to the queue on the next drain.
+const EZMSG_QUEUE = 'veyra:v1:ezmsg:queue';
+const EZMSG_PROCESSING = 'veyra:v1:ezmsg:processing';
+const EZMSG_FAILED = 'veyra:v1:ezmsg:failed';
+
+export async function ezmsgPush(item) {
+  const redis = await readyClient();
+  if (!redis) return false;
+  try {
+    await redis.rPush(EZMSG_QUEUE, JSON.stringify(item));
+    return true;
+  } catch (error) {
+    console.warn('EZMSG enqueue failed:', error.message);
+    redisDisabledUntil = Date.now() + 2000;
+    return false;
+  }
+}
+
+export async function ezmsgPop() {
+  const redis = await readyClient();
+  if (!redis) return null;
+  try { return await redis.sendCommand(['RPOPLPUSH', EZMSG_QUEUE, EZMSG_PROCESSING]); }
+  catch (error) {
+    console.warn('EZMSG dequeue failed:', error.message);
+    redisDisabledUntil = Date.now() + 2000;
+    return null;
+  }
+}
+
+export async function ezmsgAck(raw) {
+  const redis = await readyClient();
+  if (!redis || !raw) return;
+  try { await redis.lRem(EZMSG_PROCESSING, 1, raw); }
+  catch (error) { console.warn('EZMSG acknowledge failed:', error.message); }
+}
+
+export async function ezmsgRecover() {
+  const redis = await readyClient();
+  if (!redis) return;
+  try {
+    const items = await redis.lRange(EZMSG_PROCESSING, 0, -1);
+    if (!items.length) return;
+    await redis.rPush(EZMSG_QUEUE, items);
+    await redis.del(EZMSG_PROCESSING);
+  } catch (error) { console.warn('EZMSG recovery failed:', error.message); }
+}
+
+export async function ezmsgPending(limit = 500) {
+  const redis = await readyClient();
+  if (!redis) return [];
+  try {
+    const items = await redis.lRange(EZMSG_QUEUE, 0, Math.max(0, limit - 1));
+    return items
+      .map((raw) => { try { return JSON.parse(raw); } catch { return null; } })
+      .filter(Boolean);
+  } catch (error) {
+    console.warn('EZMSG pending scan failed:', error.message);
+    redisDisabledUntil = Date.now() + 2000;
+    return [];
+  }
+}
+
+export async function ezmsgMarkFailed(item, error) {
+  const redis = await readyClient();
+  if (!redis) return;
+  try {
+    await redis.rPush(EZMSG_FAILED, JSON.stringify({
+      item,
+      error: String(error?.message || error),
+      at: new Date().toISOString(),
+    }));
+  } catch (redisError) { console.warn('EZMSG failure recording failed:', redisError.message); }
+}
+
 const ROLE_TTL_SECONDS = 300;
 
 // Admin/super-admin flags are read on nearly every API request. Cache them

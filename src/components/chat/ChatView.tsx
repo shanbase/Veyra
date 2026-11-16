@@ -166,6 +166,10 @@ interface ChatViewProps {
 
 const EMOJI_OPTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥"];
 
+// Spam brake: this many sends inside the window triggers the blocking notice.
+const SPAM_WINDOW_MS = 10_000;
+const SPAM_MAX_MESSAGES = 8;
+
 export function ChatView({ conversationId: conversationIdProp, onBack, isMobile = false, channel = "dm", isActive = true }: ChatViewProps) {
   const { user } = useAuth();
   const ownSenderProfile = useMemo(() => {
@@ -467,6 +471,8 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   const receiptRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const receiptWriteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const swipeStateRef = useRef<{ messageId: string; startX: number; active: boolean } | null>(null);
+  const sendTimestampsRef = useRef<number[]>([]);
+  const [showSpamWarning, setShowSpamWarning] = useState(false);
 
   const scrollToMessage = useCallback((messageId: string) => {
     const element = messageRefs.current.get(messageId);
@@ -1188,6 +1194,16 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   ) => {
     if (!conversationId || !user) return;
     if (!canPost) return;
+
+    // Client-side spam brake: too many sends in a short window locks the
+    // composer behind a blocking notice until the user acknowledges it.
+    const now = Date.now();
+    sendTimestampsRef.current = sendTimestampsRef.current.filter((t) => now - t < SPAM_WINDOW_MS);
+    if (sendTimestampsRef.current.length >= SPAM_MAX_MESSAGES) {
+      setShowSpamWarning(true);
+      return;
+    }
+    sendTimestampsRef.current.push(now);
 
     setLoading(true);
     if (isDM) setTyping(false);
@@ -3194,6 +3210,21 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
           })()}
         </SheetContent>
       </Sheet>
+
+      {/* Spam brake notice — blocks all interaction until acknowledged. */}
+      {showSpamWarning && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 p-4">
+          <div className="w-full max-w-sm rounded-2xl border border-border bg-card p-6 shadow-2xl text-center">
+            <h2 className="text-lg font-semibold mb-2">Take a rest</h2>
+            <p className="text-sm text-muted-foreground mb-5">
+              You will kill our server by spamming. Please slow down and try again in a moment.
+            </p>
+            <Button className="w-full" onClick={() => setShowSpamWarning(false)}>
+              OK
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
 
   );

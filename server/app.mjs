@@ -164,9 +164,13 @@ export function createApp() {
       }
       const result = await queryData(req.user.id, req.body);
       const change = changeFromDataRequest(req.body, result);
-      if (change) await publishMariaDbChanges([change], req.user.id);
+      // EZMSG-queued inserts are published by the drain worker once the row
+      // is actually persisted — broadcasting now would point clients at a
+      // message that does not exist in MariaDB yet.
+      if (change && !result.queued) await publishMariaDbChanges([change], req.user.id);
       const response = { ...result };
       delete response.realtimeRows;
+      delete response.queued;
       res.json(response);
     }
     catch (error) {

@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { pool, isPostgres } from './db.mjs';
 import { ensureDirectMessage } from './rpc.mjs';
 import { notifyNewMessage } from './notifications.mjs';
-import { cachedRead, invalidateReadCache, redisGetJson, redisSetJson, cachedUserRoles, invalidateUserRole } from './redis.mjs';
+import { cachedRead, invalidateReadCache, redisGetJson, redisSetJson, cachedUserRoles, invalidateUserRole, ezmsgPush, ezmsgPop, ezmsgAck, ezmsgPending, ezmsgRecover, ezmsgMarkFailed } from './redis.mjs';
 import { decryptRowsForTable, encryptRowForTable } from './encryption.mjs';
+import { publishMariaDbChanges } from './realtime.mjs';
 
 const TABLES = new Set([
   'admin_logs', 'announcement_messages', 'blocked_users', 'conversation_members',
@@ -276,11 +277,25 @@ async function queryDataUncached(userId, payload) {
     if (inputRows.length > MAX_WRITE_ROWS) throw new Error('Too many rows in one request.');
     if (!inputRows.length) return { data: [], count: 0 };
     const inserted = [];
+    const queuedResponses = [];
+    const persistedRows = [];
     for (const input of inputRows) {
       const row = { ...input };
       if (columns.has('id') && !row.id) row.id = randomUUID();
       if (!await canInsert(table, row, userId, access)) throw new Error('Not allowed to insert this row.');
       const normalizedRow = normalizeRowTemporalValues(row, columns);
+      // EZMSG write-behind (REDIS_EZMSG=true): message inserts are queued in
+      // Redis and persisted by the drain worker; the API still returns the
+      // row shape immediately. Falls through to a direct insert when Redis
+      // is unavailable so messaging never depends on the queue.
+      if (operation === 'insert' && EZMSG_ENABLED && MESSAGE_TABLES.has(table)) {
+        const queued = await ezmsgEnqueue(table, normalizedRow, row, userId, columns, requested);
+        if (queued) {
+          queuedResponses.push(queued.response);
+          continue;
+        }
+      }
+      persistedRows.push(row);
       const storedRow = encryptRowForTable(table, normalizedRow);
       const keys = Object.keys(storedRow);
       for (const key of keys) identifier(key, columns);
@@ -317,12 +332,14 @@ async function queryDataUncached(userId, payload) {
     }
     const rows = operation === 'upsert' && table === 'friend_requests'
       ? await fetchUpsertedFriendRequests(inputRows, requested)
-      : await fetchByIds(table, inserted, requested, columns);
+      : [...await fetchByIds(table, inserted, requested, columns), ...queuedResponses];
     if (['messages', 'global_messages', 'announcement_messages'].includes(table)) {
-      for (const row of inputRows) void notifyNewMessage(table, row).catch((error) => console.error('Notification delivery failed:', error));
+      // Queued rows are notified by the drain worker once actually persisted.
+      for (const row of persistedRows) void notifyNewMessage(table, row).catch((error) => console.error('Notification delivery failed:', error));
     }
     if (table === 'user_roles') await invalidateUserRole(...rows.map((row) => row.user_id));
-    return { data: payload.single ? rows[0] ?? null : rows, count: rows.length };
+    const allQueued = queuedResponses.length > 0 && inserted.length === 0;
+    return { data: payload.single ? rows[0] ?? null : rows, count: rows.length, ...(allQueued ? { queued: true } : {}) };
   }
 
   if (operation === 'update') {
@@ -396,6 +413,166 @@ async function queryDataUncached(userId, payload) {
   }
 }
 
+// --- EZMSG write-behind (REDIS_EZMSG=true) ---------------------------------
+// Message inserts are pushed to a Redis list and persisted by a drain worker
+// instead of hitting MariaDB inside the request. Opt-in only; when disabled
+// or Redis is unavailable every path below is skipped and inserts stay direct.
+// Disabled on Vercel: serverless instances freeze after the response, so the
+// unref'd drain timers would never run and queued messages would stall.
+const EZMSG_ENABLED = process.env.REDIS_EZMSG === 'true' && !process.env.VERCEL;
+const EZMSG_DRAIN_BATCH = 200;
+const EZMSG_DRAIN_BUDGET_MS = 4000;
+
+let ezmsgDraining = false;
+let ezmsgDrainTimer = null;
+let ezmsgRecovered = false;
+
+function ezmsgResponseRow(table, row, columns, requested) {
+  // Shape a queued row like fetchByIds would return: every column present,
+  // NULL defaults, then the queued values on top.
+  const shaped = Object.fromEntries([...columns.keys()].map((column) => [column, null]));
+  Object.assign(shaped, row);
+  if (requested !== '*') {
+    const wanted = new Set(String(requested).split(',').map((part) => part.trim().replace(/^`|`$/g, '')));
+    return Object.fromEntries(Object.entries(shaped).filter(([key]) => wanted.has(key)));
+  }
+  return shaped;
+}
+
+async function ezmsgEnqueue(table, normalizedRow, sourceRow, userId, columns, requested) {
+  const now = new Date().toISOString().slice(0, 23).replace('T', ' ');
+  const queuedRow = { ...normalizedRow };
+  if (columns.has('created_at') && queuedRow.created_at == null) queuedRow.created_at = now;
+  if (columns.has('updated_at') && queuedRow.updated_at == null) queuedRow.updated_at = now;
+  const pushed = await ezmsgPush({
+    v: 1,
+    table,
+    row: queuedRow,
+    actorId: userId,
+    queuedAt: Date.now(),
+  });
+  if (!pushed) return null;
+  scheduleEzmsgDrain();
+  return { response: ezmsgResponseRow(table, queuedRow, columns, requested), plain: sourceRow };
+}
+
+function scheduleEzmsgDrain(delay = 0) {
+  if (!EZMSG_ENABLED || ezmsgDrainTimer) return;
+  ezmsgDrainTimer = setTimeout(() => {
+    ezmsgDrainTimer = null;
+    void drainEzmsgQueue();
+  }, delay);
+  ezmsgDrainTimer.unref?.();
+}
+
+async function insertQueuedRow(item) {
+  const { table, row, actorId } = item;
+  const columns = await columnsFor(table);
+  const storedRow = encryptRowForTable(table, normalizeRowTemporalValues(row, columns));
+  const keys = Object.keys(storedRow);
+  for (const key of keys) identifier(key, columns);
+  if (!keys.length) throw new Error('Queued message row is empty.');
+  await pool.execute(
+    `INSERT INTO \`${table}\` (${keys.map((key) => `\`${key}\``).join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`,
+    keys.map((key) => storedRow[key]),
+  );
+  void notifyNewMessage(table, row).catch((error) => console.error('Notification delivery failed:', error));
+  return { table, row, actorId };
+}
+
+async function drainEzmsgQueue() {
+  if (ezmsgDraining) return;
+  ezmsgDraining = true;
+  try {
+    if (!ezmsgRecovered) {
+      ezmsgRecovered = true;
+      await ezmsgRecover();
+    }
+    const deadline = Date.now() + EZMSG_DRAIN_BUDGET_MS;
+    let processed = 0;
+    const changesByActor = new Map();
+    const touchedTables = new Set();
+    while (processed < EZMSG_DRAIN_BATCH && Date.now() < deadline) {
+      const raw = await ezmsgPop();
+      if (!raw) break;
+      let item = null;
+      try { item = JSON.parse(raw); } catch { /* corrupt entry */ }
+      if (!item || typeof item.table !== 'string' || !MESSAGE_TABLES.has(item.table) || !item.row || typeof item.row !== 'object') {
+        await ezmsgAck(raw);
+        continue;
+      }
+      try {
+        const change = await insertQueuedRow(item);
+        await ezmsgAck(raw);
+        processed += 1;
+        touchedTables.add(item.table);
+        const list = changesByActor.get(item.actorId) || [];
+        list.push({
+          table: item.table,
+          operation: 'insert',
+          eventType: 'INSERT',
+          values: item.row,
+          data: item.row,
+        });
+        changesByActor.set(item.actorId, list);
+      } catch (error) {
+        console.error(`EZMSG drain failed for ${item.table} row ${item.row?.id}:`, error);
+        await ezmsgMarkFailed(item, error);
+        await ezmsgAck(raw);
+      }
+    }
+    for (const table of touchedTables) await invalidateReadCache(table);
+    for (const [actorId, changes] of changesByActor) {
+      await publishMariaDbChanges(changes, actorId).catch((error) => console.error('EZMSG realtime publish failed:', error));
+    }
+    // If we hit the batch/budget cap the queue may still have items — keep draining.
+    if (processed >= EZMSG_DRAIN_BATCH) scheduleEzmsgDrain(10);
+  } finally {
+    ezmsgDraining = false;
+  }
+}
+
+if (EZMSG_ENABLED) {
+  // Safety net: drain anything left behind by a restart or a missed trigger.
+  setInterval(() => scheduleEzmsgDrain(), 1000).unref();
+}
+
+// Merge still-queued (not yet drained) message rows into select results so a
+// client refetching right after sending sees its own message. Only applies to
+// the chat-history shape: message tables filtered by conversation_id eq, or
+// the public tables where every queued row is visible anyway.
+async function mergeQueuedSelect(table, payload, result) {
+  if (!EZMSG_ENABLED || !MESSAGE_TABLES.has(table) || !Array.isArray(result?.data)) return result;
+  const pending = await ezmsgPending(500);
+  const relevant = pending.filter((item) => item.table === table);
+  if (!relevant.length) return result;
+  const convEq = (payload.filters || []).find((filter) => filter?.column === 'conversation_id' && filter?.op === 'eq');
+  const columns = await columnsFor(table);
+  const wanted = payload.columns && String(payload.columns).trim() !== '*'
+    ? new Set(String(payload.columns).split(',').map((part) => part.trim()))
+    : null;
+  const rows = relevant
+    .filter((item) => table !== 'messages' || (convEq && item.row.conversation_id === convEq.value))
+    .map((item) => {
+      const shaped = ezmsgResponseRow(table, item.row, columns, wanted ? [...wanted].join(',') : '*');
+      return wanted ? Object.fromEntries(Object.entries(shaped).filter(([key]) => wanted.has(key))) : shaped;
+    });
+  if (!rows.length) return result;
+  const seen = new Set(result.data.map((entry) => entry?.id));
+  const fresh = rows.filter((entry) => entry?.id && !seen.has(entry.id));
+  if (!fresh.length) return result;
+  const orderColumn = payload.order?.[0]?.column || 'created_at';
+  const descending = payload.order?.[0]?.ascending === false;
+  result.data = [...result.data, ...fresh].sort((a, b) => {
+    const av = String(a?.[orderColumn] ?? '');
+    const bv = String(b?.[orderColumn] ?? '');
+    const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+    return descending ? -cmp : cmp;
+  });
+  if (typeof result.count === 'number') result.count += fresh.length;
+  return result;
+}
+
 export async function queryData(userId, payload) {
   const table = payload?.table;
   const operation = payload?.operation || 'select';
@@ -406,7 +583,9 @@ export async function queryData(userId, payload) {
     return result;
   };
   if (operation === 'select') {
-    return cachedRead(userId, table, payload, () => queryDataUncached(userId, payload)).then(withDecryptedData);
+    return cachedRead(userId, table, payload, () => queryDataUncached(userId, payload))
+      .then(withDecryptedData)
+      .then((result) => mergeQueuedSelect(table, payload, result));
   }
   const result = await queryDataUncached(userId, payload);
   if (result?.count > 0) await invalidateReadCache(table);
