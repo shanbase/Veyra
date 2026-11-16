@@ -23,6 +23,7 @@ import {
   type ProfileLayoutSection,
 } from "@/lib/profileFields";
 import type { Json } from "@/integrations/supabase/types";
+import { ProfileSongDisc } from "@/components/profile/ProfileSongDisc";
 
 interface UserProfileDialogProps {
   userId: string | null;
@@ -153,6 +154,7 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
   const navigate = useNavigate();
   const [profile, setProfile] = useState<ProfileData | null>(null);
   const [links, setLinks] = useState<ProfileLinkItem[]>([]);
+  const [songPlaying, setSongPlaying] = useState(false);
   const [loading, setLoading] = useState(false);
   const [rel, setRel] = useState<RelState>("loading");
   const [requestId, setRequestId] = useState<string | null>(null);
@@ -182,6 +184,7 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
   }, [userId, user]);
 
   useEffect(() => {
+    setSongPlaying(false);
     if (!userId) {
       setProfile(null);
       setRel("loading");
@@ -361,7 +364,16 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
               <Music className="h-3 w-3" /> Profile song
             </p>
             <p className="text-sm font-medium" style={baseStyle}>{song.title}{song.artist ? ` — ${song.artist}` : ""}</p>
-            <audio ref={songAudioRef} controls preload="none" src={song.url} className="mt-2 w-full" />
+            <audio
+              ref={songAudioRef}
+              controls
+              preload="none"
+              src={song.url}
+              className="mt-2 w-full"
+              onPlay={() => setSongPlaying(true)}
+              onPause={() => setSongPlaying(false)}
+              onEnded={() => setSongPlaying(false)}
+            />
           </div>
         ) : null;
       default:
@@ -682,6 +694,7 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
         </div>
 
         <div className="px-4 sm:px-5 pb-5 -mt-10 flex flex-col items-start text-left">
+          <div className="flex items-end gap-1">
           <div className="relative w-fit">
             <Avatar className="h-20 w-20 sm:h-24 sm:w-24 border-4 border-background shadow-md flex-shrink-0">
               <AvatarImage src={profile?.avatar_url || undefined} />
@@ -702,6 +715,10 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
                 }
               />
             )}
+          </div>
+          {song && (
+            <ProfileSongDisc song={song} audioRef={songAudioRef} playing={songPlaying} />
+          )}
           </div>
 
           <div className="mt-3 space-y-1 w-full">

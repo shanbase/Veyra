@@ -210,3 +210,15 @@ img, video, a {
     padding-top: 0;
   }
 }
+
+/* Spinning profile-song vinyl disc */
+@keyframes veyra-vinyl-spin {
+  to { transform: rotate(360deg); }
+}
+.veyra-vinyl-disc {
+  animation: veyra-vinyl-spin 3.5s linear infinite;
+  animation-play-state: paused;
+}
+.veyra-vinyl-disc.veyra-vinyl-playing {
+  animation-play-state: running;
+}
