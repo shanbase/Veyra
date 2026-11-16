@@ -8,7 +8,7 @@ import { purgeExpiredAttachments, cleanupExpiredAuthArtifacts } from './maintena
 import { authenticateRequest, registerAuthRoutes } from './auth.mjs';
 import { changesFromRpc, changeFromDataRequest, mariaDbRealtimeTopic, mariaDbConversationTopic, publishMariaDbChanges } from './realtime.mjs';
 import { getSupabaseAdmin } from './supabase-admin.mjs';
-import { invalidateReadCache, consumeRateLimit, redisGetJson, redisSetJson } from './redis.mjs';
+import { invalidateReadCache, consumeRateLimit, redisGetJson, redisSetJson, ezmsgStats } from './redis.mjs';
 import { assertEncryptionConfig, encryptionEnabled } from './encryption.mjs';
 import { assertQueuesConfig } from './queues.mjs';
 
@@ -30,8 +30,23 @@ async function isMaintenanceMode() {
   }
 }
 const PROFILE_UPLOAD_TYPES = new Set(['image/jpeg', 'image/gif']);
+// Banners additionally accept short muted video (clients enforce the 5s cap);
+// avatars stay image-only.
+const BANNER_UPLOAD_TYPES = new Set([...PROFILE_UPLOAD_TYPES, 'video/mp4', 'video/webm']);
 const CHAT_UPLOAD_BUCKETS = new Set(['chat-images', 'chat-videos', 'chat-voice']);
-const MAX_CHAT_UPLOAD_BYTES = 25 * 1024 * 1024;
+// Per-bucket caps mirror the Supabase bucket file-size limits: images and
+// videos get 50 MB, voice notes 45 MB. MAX_CHAT_UPLOAD_BYTES is a hard global
+// ceiling regardless of bucket so a misconfigured map can never exceed it.
+const CHAT_UPLOAD_LIMITS = {
+  'chat-images': 50 * 1024 * 1024,
+  'chat-videos': 50 * 1024 * 1024,
+  'chat-voice': 45 * 1024 * 1024,
+};
+const MAX_CHAT_UPLOAD_BYTES = Math.max(...Object.values(CHAT_UPLOAD_LIMITS));
+
+function chatUploadLimitLabel(bytes) {
+  return `${Math.round(bytes / (1024 * 1024))} MB`;
+}
 
 // In-memory fixed-window fallback for rate limits when Redis is not
 // configured, mirroring auth.mjs's allowRequest buckets.
@@ -258,6 +273,18 @@ export function createApp() {
       res.status(status).json({ error: error.message || 'Database action failed.' });
     }
   });
+  // Admin-only EZMSG write-behind diagnostics: queue depth, in-flight
+  // processing items, parked retries, and dead-letter count. Returns nulls
+  // when Redis is not configured (EZMSG is off in that case anyway).
+  app.get('/api/admin/ezmsg-stats', async (req, res) => {
+    try {
+      const [rows] = await pool.execute("SELECT 1 FROM user_roles WHERE user_id = ? AND role IN ('admin','super_admin') LIMIT 1", [req.user.id]);
+      if (!rows.length) return res.status(403).json({ error: 'Admin access required.' });
+      res.json({ ezmsg: await ezmsgStats(), enabled: process.env.REDIS_EZMSG === 'true' && !process.env.VERCEL });
+    } catch {
+      res.status(500).json({ error: 'Could not read queue stats.' });
+    }
+  });
   app.post('/api/notifications/test', async (req, res) => {
     try { res.json(await sendTestNotification(req.user.id)); }
     catch (error) { res.status(400).json({ ok: false, error: error.message }); }
@@ -282,7 +309,10 @@ export function createApp() {
   app.post('/api/storage/profile-upload', async (req, res) => {
     const { bucket, contentType, size } = req.body || {};
     if (!['avatars', 'banners'].includes(bucket)) return res.status(400).json({ error: 'Unsupported profile image bucket.' });
-    if (!PROFILE_UPLOAD_TYPES.has(contentType)) return res.status(400).json({ error: 'Only JPEG and GIF profile images are supported.' });
+    const allowedTypes = bucket === 'banners' ? BANNER_UPLOAD_TYPES : PROFILE_UPLOAD_TYPES;
+    if (!allowedTypes.has(contentType)) {
+      return res.status(400).json({ error: bucket === 'banners' ? 'Only JPEG, GIF, and MP4/WebM banner media are supported.' : 'Only JPEG and GIF profile images are supported.' });
+    }
     if (!Number.isFinite(size) || size <= 0 || size > MAX_PROFILE_IMAGE_BYTES) {
       return res.status(413).json({ error: 'Maximum file size is 25 MB.' });
     }
@@ -325,8 +355,9 @@ export function createApp() {
     if (limited && !limited.allowed) {
       return res.status(429).json({ error: 'Too many uploads. Please slow down and try again.' });
     }
-    if (!Number.isFinite(size) || size <= 0 || size > MAX_CHAT_UPLOAD_BYTES) {
-      return res.status(413).json({ error: 'Maximum file size is 25 MB.' });
+    const maxBytes = Math.min(CHAT_UPLOAD_LIMITS[bucket] ?? MAX_CHAT_UPLOAD_BYTES, MAX_CHAT_UPLOAD_BYTES);
+    if (!Number.isFinite(size) || size <= 0 || size > maxBytes) {
+      return res.status(413).json({ error: `Maximum file size is ${chatUploadLimitLabel(maxBytes)}.` });
     }
     try {
       const { data, error } = await getSupabaseAdmin().storage.from(bucket).createSignedUploadUrl(path);

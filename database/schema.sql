@@ -370,3 +370,48 @@ CREATE TABLE IF NOT EXISTS message_reports (
   CONSTRAINT fk_message_reports_reporter FOREIGN KEY (reporter_id) REFERENCES profiles(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ---------------------------------------------------------------------------
+-- 1.2.8 additions (idempotent — safe to re-run on existing databases)
+-- ---------------------------------------------------------------------------
+
+-- Profile customization: manual presence mode plus structured social fields.
+-- The JSON columns are validated/normalized by the API before writes.
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS status_mode VARCHAR(20) NOT NULL DEFAULT 'online';
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS interests JSON NULL;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS languages_spoken JSON NULL;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS profile_song JSON NULL;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS profile_layout JSON NULL;
+-- Animated banner media: 'image' (jpeg/gif) or 'video' (mp4/webm, <=5s).
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banner_media_kind VARCHAR(16) NOT NULL DEFAULT 'image';
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banner_media_duration_ms INT NULL;
+-- Where a friend request originated: 'search', 'qr', or 'link'.
+ALTER TABLE friend_requests ADD COLUMN IF NOT EXISTS source VARCHAR(16) NOT NULL DEFAULT 'search';
+
+-- Public social links on a profile. Owner-managed rows; readable by anyone.
+CREATE TABLE IF NOT EXISTS profile_links (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  user_id CHAR(36) NOT NULL,
+  label VARCHAR(80) NOT NULL,
+  url VARCHAR(2048) NOT NULL,
+  position INT NOT NULL DEFAULT 0,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_profile_links_user (user_id, position),
+  CONSTRAINT fk_profile_links_user FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- QR friend codes. `code` is a bearer credential shown inside the user's QR
+-- code — treat it like a password: revocable (revoked_at) and rotatable.
+-- One row per user; rotate updates the same row so history stays singular.
+CREATE TABLE IF NOT EXISTS profile_friend_codes (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  user_id CHAR(36) NOT NULL,
+  code VARCHAR(64) NOT NULL,
+  auto_accept BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  rotated_at DATETIME(3) NULL,
+  revoked_at DATETIME(3) NULL,
+  UNIQUE KEY uq_profile_friend_codes_user (user_id),
+  UNIQUE KEY uq_profile_friend_codes_code (code),
+  CONSTRAINT fk_profile_friend_codes_user FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

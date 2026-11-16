@@ -50,7 +50,7 @@ import { signMessageMedia, encodeFile, decodeFile, encodeMusic, decodeMusic } fr
 import { compressImageForUpload } from "@/lib/imageCompress";
 import { getCachedMessages, setCachedMessages } from "@/lib/chatCache";
 import { parseServerDate, serverDateMs } from "@/lib/dates";
-import { exceedsMaxUploadSize, MAX_UPLOAD_SIZE_LABEL } from "@/lib/uploadLimits";
+import { exceedsChatUploadSize, chatUploadLimitLabel, type ChatUploadBucket } from "@/lib/uploadLimits";
 import { MessageFileCard } from "@/components/chat/MessageFileCard";
 import { ChatImage } from "@/components/chat/ChatImage";
 import { MessageMusicPlayer } from "@/components/chat/MessageMusicPlayer";
@@ -639,10 +639,10 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   const handleVoiceRecordingComplete = useCallback(async (blob: Blob, duration: number) => {
     if (!user || !conversationId) return;
     if (!canPost) return;
-    if (exceedsMaxUploadSize(blob)) {
+    if (exceedsChatUploadSize(blob, "chat-voice")) {
       toast({
         title: "Voice message is too large",
-        description: `Maximum file size is ${MAX_UPLOAD_SIZE_LABEL}.`,
+        description: `Maximum file size is ${chatUploadLimitLabel("chat-voice")}.`,
         variant: "destructive",
       });
       return;
@@ -1594,15 +1594,19 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
         });
         continue;
       }
-      if (exceedsMaxUploadSize(file)) {
+      const kind = classifyFile(file);
+      // Non-video attachments (images, music, generic files) land in
+      // chat-images; videos go to chat-videos — validate against that bucket's
+      // cap, matching the server-side per-bucket limits.
+      const bucket: ChatUploadBucket = kind === "video" ? "chat-videos" : "chat-images";
+      if (exceedsChatUploadSize(file, bucket)) {
         toast({
           title: `${file.name} is too large`,
-          description: `Maximum file size is ${MAX_UPLOAD_SIZE_LABEL}.`,
+          description: `Maximum file size is ${chatUploadLimitLabel(bucket)}.`,
           variant: "destructive",
         });
         continue;
       }
-      const kind = classifyFile(file);
       validFiles.push({
         file,
         url: URL.createObjectURL(file),
@@ -2023,7 +2027,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
           <div className="text-center">
             <Paperclip className="h-10 w-10 mx-auto mb-2 text-primary" />
             <p className="text-sm font-medium">Drop files to attach</p>
-            <p className="text-xs text-muted-foreground">Up to {MAX_UPLOAD_SIZE_LABEL} each</p>
+            <p className="text-xs text-muted-foreground">Up to {chatUploadLimitLabel("chat-images")} each</p>
           </div>
         </div>
       )}

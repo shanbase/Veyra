@@ -175,6 +175,13 @@ export async function notifyNewMessage(table, row) {
   const placeholders = ids.map(() => '?').join(',');
   const [prefs] = await pool.execute(`SELECT * FROM notification_preferences WHERE user_id IN (${placeholders})`, ids);
   const [profiles] = await pool.execute(`SELECT id, username FROM profiles WHERE id IN (${placeholders})`, ids);
+  // status_mode is a 1.2.8 column — query it defensively so notifications keep
+  // working if the API deploys ahead of the schema migration.
+  const statusModeById = new Map();
+  try {
+    const [modes] = await pool.execute(`SELECT id, status_mode FROM profiles WHERE id IN (${placeholders})`, ids);
+    for (const row of modes) statusModeById.set(row.id, row.status_mode);
+  } catch { /* column not migrated yet */ }
   const usernameById = new Map(profiles.map((p) => [p.id, p.username]));
   // FCM device tokens for the same recipient set (empty when FCM isn't used).
   const [tokenRows] = await pool.execute(`SELECT user_id, token FROM native_push_tokens WHERE user_id IN (${placeholders}) AND enabled = TRUE`, ids);
@@ -200,6 +207,9 @@ export async function notifyNewMessage(table, row) {
     // A direct @mention (or @everyone) overrides the channel's default mode so
     // people actually see they were called out.
     const mentioned = channel !== 'dm' && (mentionAll || mentionsUser(content, usernameById.get(userId)));
+    // do_not_disturb suppresses push/ntfy delivery but the user still shows as
+    // online; direct @mentions break through since they are explicit calls.
+    if (statusModeById.get(userId) === 'do_not_disturb' && !mentioned) continue;
     if (mentioned) mode = 'every';
     let title;
     let message;

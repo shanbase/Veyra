@@ -136,12 +136,20 @@ async function recipientsFor(change, actorId, membershipCache) {
   } else if (change.table === 'blocked_users') {
     if (keys.blocker_id) users.add(keys.blocker_id);
     if (keys.blocked_id) users.add(keys.blocked_id);
-  } else if (change.table === 'profiles' && keys.id) {
-    const [rows] = await pool.execute(
-      "SELECT sender_id, receiver_id FROM friend_requests WHERE status = 'accepted' AND (sender_id = ? OR receiver_id = ?)",
-      [keys.id, keys.id],
-    );
-    for (const row of rows) users.add(row.sender_id === keys.id ? row.receiver_id : row.sender_id);
+  } else if (['profiles', 'profile_links'].includes(change.table)) {
+    // Profile-shaped changes fan out to accepted friends so friend lists and
+    // open profile dialogs refresh live. profiles keys on `id`; the 1.2.8
+    // profile_links table keys on `user_id`.
+    // (profile_friend_codes is deliberately excluded — code rotation must not
+    // broadcast to friends.)
+    const profileId = keys.id || keys.user_id;
+    if (profileId) {
+      const [rows] = await pool.execute(
+        "SELECT sender_id, receiver_id FROM friend_requests WHERE status = 'accepted' AND (sender_id = ? OR receiver_id = ?)",
+        [profileId, profileId],
+      );
+      for (const row of rows) users.add(row.sender_id === profileId ? row.receiver_id : row.sender_id);
+    }
   }
 
   if (conversationId) {
@@ -314,6 +322,15 @@ const RPC_CHANGES = {
   mark_message_delivered: (args) => [{ table: 'messages', eventType: 'UPDATE', operation: 'rpc', values: { id: args._message_id }, columns: ['delivered_at'] }],
   mark_conversation_read: (args, result) => result > 0 ? [{ table: 'messages', eventType: 'UPDATE', operation: 'rpc', values: { conversation_id: args._conversation_id }, columns: ['read_at', 'delivered_at'] }] : [],
   mark_conversation_delivered: (args) => [{ table: 'messages', eventType: 'UPDATE', operation: 'rpc', values: { conversation_id: args._conversation_id }, columns: ['delivered_at'] }],
+  redeem_friend_code: (args, result) => result?.friend_request_id ? [
+    {
+      table: 'friend_requests',
+      eventType: 'INSERT',
+      operation: 'rpc',
+      values: { id: result.friend_request_id, sender_id: result.sender_id, receiver_id: result.receiver_id },
+      columns: ['id', 'sender_id', 'receiver_id', 'status', 'source'],
+    },
+  ] : [],
   finalize_poll: (args) => [{ table: 'polls', eventType: 'UPDATE', operation: 'rpc', values: { id: args._poll_id }, columns: ['closed_at'] }],
   create_poll: (args, result) => {
     if (!result?.poll_id || !result?.message) return [];

@@ -189,18 +189,23 @@ export async function redisDel(...keys) {
 }
 
 // EZMSG write-behind queue (REDIS_EZMSG=true only): message inserts are
-// RPUSHed here and a drain worker persists them to MariaDB. Items move through
-// a processing list so a crash mid-drain does not silently drop messages —
-// ezmsgRecover() returns them to the queue on the next drain.
+// LPUSHed here and a drain worker persists them to MariaDB. LPUSH + RPOPLPUSH
+// makes the list FIFO — the tail is always the oldest pending item. Items move
+// through a processing list so a crash mid-drain does not silently drop
+// messages — ezmsgRecover() returns them to the queue on the next drain.
+// Transiently failing items are parked in a delayed-retry sorted set and moved
+// back onto the queue once their backoff expires; permanently failing items go
+// to the dead-letter list.
 const EZMSG_QUEUE = 'veyra:v1:ezmsg:queue';
 const EZMSG_PROCESSING = 'veyra:v1:ezmsg:processing';
 const EZMSG_FAILED = 'veyra:v1:ezmsg:failed';
+const EZMSG_RETRY = 'veyra:v1:ezmsg:retry';
 
 export async function ezmsgPush(item) {
   const redis = await readyClient();
   if (!redis) return false;
   try {
-    await redis.rPush(EZMSG_QUEUE, JSON.stringify(item));
+    await redis.lPush(EZMSG_QUEUE, JSON.stringify(item));
     return true;
   } catch (error) {
     console.warn('EZMSG enqueue failed:', error.message);
@@ -266,6 +271,87 @@ export async function ezmsgMarkFailed(item, error) {
     // without bound — keep the newest 1000 entries.
     await redis.lTrim(EZMSG_FAILED, -1000, -1);
   } catch (redisError) { console.warn('EZMSG failure recording failed:', redisError.message); }
+}
+
+// Delayed retries live in a sorted set scored by `notBefore` (epoch ms). The
+// drain moves due members back onto the queue tail — the pop side — so retried
+// (older) messages persist before anything enqueued after them. The Lua script
+// keeps ZREM+RPUSH atomic; iterating members newest-due-first means the
+// oldest-due item lands at the tail and drains first.
+const EZMSG_MOVE_DUE_LUA = `
+local members = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+for i = #members, 1, -1 do
+  redis.call('ZREM', KEYS[1], members[i])
+  redis.call('RPUSH', KEYS[2], members[i])
+end
+return #members
+`;
+
+export async function ezmsgScheduleRetry(item) {
+  const redis = await readyClient();
+  if (!redis) return false;
+  try {
+    await redis.zAdd(EZMSG_RETRY, { score: Number(item.notBefore) || Date.now(), value: JSON.stringify(item) });
+    return true;
+  } catch (error) {
+    console.warn('EZMSG retry scheduling failed:', error.message);
+    redisDisabledUntil = Date.now() + 2000;
+    return false;
+  }
+}
+
+export async function ezmsgMoveDueRetries(limit = 200) {
+  const redis = await readyClient();
+  if (!redis) return 0;
+  try {
+    return await redis.sendCommand(['EVAL', EZMSG_MOVE_DUE_LUA, '2', EZMSG_RETRY, EZMSG_QUEUE, String(Date.now()), String(limit)]);
+  } catch (error) {
+    console.warn('EZMSG retry move failed:', error.message);
+    redisDisabledUntil = Date.now() + 2000;
+    return 0;
+  }
+}
+
+export async function ezmsgStats() {
+  const redis = await readyClient();
+  if (!redis) return null;
+  try {
+    const [pending, processing, retrying, failed] = await Promise.all([
+      redis.lLen(EZMSG_QUEUE),
+      redis.lLen(EZMSG_PROCESSING),
+      redis.zCard(EZMSG_RETRY),
+      redis.lLen(EZMSG_FAILED),
+    ]);
+    return { pending, processing, retrying, failed };
+  } catch (error) {
+    console.warn('EZMSG stats failed:', error.message);
+    return null;
+  }
+}
+
+// Drain error classification: transient failures (connection loss, deadlocks,
+// pool exhaustion, timeouts) are retried with backoff; everything else —
+// constraint violations, bad payloads, unknown tables — dead-letters
+// immediately. ER_DUP_ENTRY is handled separately by the idempotent insert.
+const TRANSIENT_EZMSG_CODES = new Set([
+  'ER_LOCK_DEADLOCK',
+  'ER_LOCK_WAIT_TIMEOUT',
+  'ER_CON_COUNT_ERROR',
+  'ER_OUT_OF_RESOURCES',
+  'ER_NET_READ_ERROR',
+  'ER_NET_WRITE_ERROR',
+  'ER_SERVER_SHUTDOWN',
+]);
+// PostgreSQL SQLSTATEs that normalizePgError leaves as ER_PG_*: serialization
+// failures, deadlocks, too-many-connections, admin shutdown, connection errors.
+const TRANSIENT_PG_SQLSTATES = /^(?:40001|40P01|53300|57P0[123]|08\d{3})$/;
+const TRANSIENT_MESSAGE = /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|ECONNRESET|EPIPE|PROTOCOL_CONNECTION_LOST|ECONNABORTED|pool|timeout|timed out|connect|deadlock|lock wait|too many connections|server has gone away|connection/i;
+
+export function isTransientQueueError(error) {
+  const code = String(error?.code || '');
+  if (TRANSIENT_EZMSG_CODES.has(code)) return true;
+  if (code.startsWith('ER_PG_') && TRANSIENT_PG_SQLSTATES.test(code.slice(6))) return true;
+  return TRANSIENT_MESSAGE.test(String(error?.message || '')) || TRANSIENT_MESSAGE.test(code);
 }
 
 // Short TTL: role changes are security-sensitive, so out-of-band edits

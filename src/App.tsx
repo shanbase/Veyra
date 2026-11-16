@@ -15,6 +15,7 @@ const NotFound = lazy(() => import("./pages/NotFound"));
 const ResetPassword = lazy(() => import("./pages/ResetPassword"));
 const Pair = lazy(() => import("./pages/Pair"));
 const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
+const AddFriend = lazy(() => import("./pages/AddFriend"));
 const ChatLayout = lazy(() => import("./components/chat/ChatLayout"));
 
 const queryClient = new QueryClient();
@@ -46,6 +47,7 @@ const App = () => (
               <Route path="/global-chat" element={<ChatLayout />} />
               <Route path="/announcements" element={<ChatLayout />} />
               <Route path="/settings" element={<Settings />} />
+              <Route path="/add-friend" element={<AddFriend />} />
               <Route path="/admin" element={<AdminDashboard />} />
               <Route path="*" element={<NotFound />} />
             </Routes>

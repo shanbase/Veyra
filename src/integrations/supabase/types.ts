@@ -190,6 +190,7 @@ export type Database = {
           id: string
           receiver_id: string
           sender_id: string
+          source: string
           status: string
           updated_at: string
         }
@@ -198,6 +199,7 @@ export type Database = {
           id?: string
           receiver_id: string
           sender_id: string
+          source?: string
           status?: string
           updated_at?: string
         }
@@ -206,6 +208,7 @@ export type Database = {
           id?: string
           receiver_id?: string
           sender_id?: string
+          source?: string
           status?: string
           updated_at?: string
         }
@@ -653,12 +656,71 @@ export type Database = {
         }
         Relationships: []
       }
+      profile_friend_codes: {
+        Row: {
+          auto_accept: boolean
+          code: string
+          created_at: string
+          id: string
+          revoked_at: string | null
+          rotated_at: string | null
+          user_id: string
+        }
+        Insert: {
+          auto_accept?: boolean
+          code: string
+          created_at?: string
+          id?: string
+          revoked_at?: string | null
+          rotated_at?: string | null
+          user_id: string
+        }
+        Update: {
+          auto_accept?: boolean
+          code?: string
+          created_at?: string
+          id?: string
+          revoked_at?: string | null
+          rotated_at?: string | null
+          user_id?: string
+        }
+        Relationships: []
+      }
+      profile_links: {
+        Row: {
+          created_at: string
+          id: string
+          label: string
+          position: number
+          url: string
+          user_id: string
+        }
+        Insert: {
+          created_at?: string
+          id?: string
+          label: string
+          position?: number
+          url: string
+          user_id: string
+        }
+        Update: {
+          created_at?: string
+          id?: string
+          label?: string
+          position?: number
+          url?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
       profiles: {
         Row: {
           allow_friend_requests: boolean
           announcements_last_read_at: string
           avatar_url: string | null
           banner_gradient: string | null
+          banner_media_duration_ms: number | null
+          banner_media_kind: string
           banner_url: string | null
           bio: string | null
           created_at: string
@@ -670,8 +732,13 @@ export type Database = {
           global_mentions_last_read_at: string | null
           global_muted: boolean
           id: string
+          interests: Json | null
+          languages_spoken: Json | null
+          profile_layout: Json | null
+          profile_song: Json | null
           pronouns: string | null
           status: string | null
+          status_mode: string
           updated_at: string
           username: string
           username_set: boolean
@@ -681,6 +748,8 @@ export type Database = {
           announcements_last_read_at?: string
           avatar_url?: string | null
           banner_gradient?: string | null
+          banner_media_duration_ms?: number | null
+          banner_media_kind?: string
           banner_url?: string | null
           bio?: string | null
           created_at?: string
@@ -692,8 +761,13 @@ export type Database = {
           global_mentions_last_read_at?: string | null
           global_muted?: boolean
           id: string
+          interests?: Json | null
+          languages_spoken?: Json | null
+          profile_layout?: Json | null
+          profile_song?: Json | null
           pronouns?: string | null
           status?: string | null
+          status_mode?: string
           updated_at?: string
           username: string
           username_set?: boolean
@@ -703,6 +777,8 @@ export type Database = {
           announcements_last_read_at?: string
           avatar_url?: string | null
           banner_gradient?: string | null
+          banner_media_duration_ms?: number | null
+          banner_media_kind?: string
           banner_url?: string | null
           bio?: string | null
           created_at?: string
@@ -714,8 +790,13 @@ export type Database = {
           global_mentions_last_read_at?: string | null
           global_muted?: boolean
           id?: string
+          interests?: Json | null
+          languages_spoken?: Json | null
+          profile_layout?: Json | null
+          profile_song?: Json | null
           pronouns?: string | null
           status?: string | null
+          status_mode?: string
           updated_at?: string
           username?: string
           username_set?: boolean
@@ -761,6 +842,18 @@ export type Database = {
       get_admin_analytics_counts: { Args: never; Returns: Json }
       get_admin_daily_stats: { Args: { days_count?: number }; Returns: Json }
       get_admin_top_users: { Args: { limit_count?: number }; Returns: Json }
+      get_my_friend_code: {
+        Args: never
+        Returns: {
+          auto_accept: boolean
+          code: string
+          created_at: string
+          id: string
+          revoked_at: string | null
+          rotated_at: string | null
+          user_id: string
+        }
+      }
       get_or_create_dm: { Args: { _other_user_id: string }; Returns: string }
       get_user_dm_list: {
         Args: never
@@ -775,6 +868,7 @@ export type Database = {
           other_custom_status_text: string
           other_display_name: string
           other_status: string
+          other_status_mode: string
           other_user_id: string
           other_username: string
           unread_count: number
@@ -845,6 +939,17 @@ export type Database = {
         Returns: undefined
       }
       mark_message_read: { Args: { _message_id: string }; Returns: undefined }
+      redeem_friend_code: {
+        Args: { _code: string }
+        Returns: {
+          already: boolean
+          friend_request_id: string | null
+          other_user_id: string
+          receiver_id: string
+          sender_id: string
+          status: string
+        }
+      }
       register_native_push_token: {
         Args: { p_device_id?: string; p_platform: string; p_token: string }
         Returns: undefined
@@ -857,7 +962,19 @@ export type Database = {
         Args: { _conv: string; _name: string }
         Returns: undefined
       }
+      revoke_friend_code: {
+        Args: never
+        Returns: { revoked: boolean }
+      }
       revoke_user_session: { Args: { _session_id: string }; Returns: undefined }
+      rotate_friend_code: {
+        Args: never
+        Returns: { code: string; rotated_at: string }
+      }
+      set_friend_code_auto_accept: {
+        Args: { _enabled: boolean }
+        Returns: { auto_accept: boolean }
+      }
       set_member_role: {
         Args: { _conv: string; _role: string; _user_id: string }
         Returns: undefined

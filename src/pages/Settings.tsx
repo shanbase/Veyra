@@ -18,10 +18,22 @@ import NotificationSettings from "@/components/settings/NotificationSettings";
 import PasswordSettings from "@/components/settings/PasswordSettings";
 import PrivacySettings from "@/components/settings/PrivacySettings";
 import AvatarCropDialog from "@/components/settings/AvatarCropDialog";
+import { ProfileDetailsEditor } from "@/components/settings/ProfileDetailsEditor";
+import { FriendCodeCard } from "@/components/settings/FriendCodeCard";
 import { Textarea } from "@/components/ui/textarea";
 import { MessageMarkdown } from "@/components/chat/MessageMarkdown";
 import { stripBioHeadings } from "@/lib/bio";
 import { Switch } from "@/components/ui/switch";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 
 const BIO_MAX = 500;
@@ -33,6 +45,25 @@ const AVATAR_COOLDOWN_MS = 5 * 60 * 1000;
 const USERNAME_COOLDOWN_MS = 5 * 60 * 1000;
 const BANNER_COOLDOWN_MS = 5 * 60 * 1000;
 const BANNER_ASPECT = 2; // 2:1 banner (1.5x taller than the previous 3:1)
+const MAX_BANNER_VIDEO_MS = 5_000;
+
+// Reads a video file's duration without uploading it; used to enforce the
+// 5-second cap on animated banner media before the upload link is requested.
+const probeVideoDurationMs = (file: File) =>
+  new Promise<number>((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.onloadedmetadata = () => {
+      URL.revokeObjectURL(url);
+      resolve(Math.round(video.duration * 1000));
+    };
+    video.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Could not read the video file."));
+    };
+    video.src = url;
+  });
 
 type ProfileGradient = { enabled: boolean; from: string; to: string };
 const DEFAULT_GRADIENT: ProfileGradient = { enabled: false, from: "#5865F2", to: "#EB459E" };
@@ -101,6 +132,8 @@ export default function Settings() {
   const [uploadingBanner, setUploadingBanner] = useState(false);
   const [cropFile, setCropFile] = useState<File | null>(null);
   const [cropBannerFile, setCropBannerFile] = useState<File | null>(null);
+  const [bannerVideo, setBannerVideo] = useState<{ file: File; durationMs: number } | null>(null);
+  const [bannerMediaKind, setBannerMediaKind] = useState<"image" | "video">("image");
   const [shellVersion, setShellVersion] = useState<string | null>(null);
   const [checkingUpdates, setCheckingUpdates] = useState(false);
 
@@ -144,7 +177,7 @@ export default function Settings() {
       if (!user) return;
       const { data } = await supabase
         .from("profiles")
-        .select("username, avatar_url, banner_url, banner_gradient, bio, pronouns")
+        .select("username, avatar_url, banner_url, banner_gradient, bio, pronouns, banner_media_kind")
         .eq("id", user.id)
         .single();
       if (data) {
@@ -159,6 +192,7 @@ export default function Settings() {
         setBio((data as any).bio ?? "");
         setCurrentPronouns((data as any).pronouns ?? "");
         setPronouns((data as any).pronouns ?? "");
+        setBannerMediaKind((data as any).banner_media_kind === "video" ? "video" : "image");
       }
     };
     fetchProfile();
@@ -268,17 +302,60 @@ export default function Settings() {
       return;
     }
 
-    if (!file.type.startsWith("image/")) {
-      toast({ title: "Please select an image file", variant: "destructive" });
+    const isVideo = file.type.startsWith("video/");
+    if (!file.type.startsWith("image/") && !isVideo) {
+      toast({ title: "Please select an image or video file", variant: "destructive" });
       return;
     }
 
     if (file.size > MAX_UPLOAD_SIZE_BYTES) {
-      toast({ title: `Image must be ${MAX_UPLOAD_SIZE_LABEL} or smaller`, variant: "destructive" });
+      toast({ title: `File must be ${MAX_UPLOAD_SIZE_LABEL} or smaller`, variant: "destructive" });
+      return;
+    }
+
+    if (isVideo) {
+      // Banner videos skip the crop dialog (they are already composed) but
+      // must obey the 5-second animated-media cap enforced server-side too.
+      try {
+        const durationMs = await probeVideoDurationMs(file);
+        if (durationMs > MAX_BANNER_VIDEO_MS) {
+          toast({ title: "Banner videos must be 5 seconds or shorter", variant: "destructive" });
+          return;
+        }
+        setBannerVideo({ file, durationMs });
+      } catch {
+        toast({ title: "Could not read that video file", variant: "destructive" });
+      }
       return;
     }
 
     setCropBannerFile(file);
+  };
+
+  const handleBannerVideoUpload = async () => {
+    if (!user || !bannerVideo) return;
+    setBannerVideo(null);
+    setUploadingBanner(true);
+    try {
+      const contentType = bannerVideo.file.type === "video/webm" ? "video/webm" : "video/mp4";
+      const newUrl = await uploadProfileImage("banners", bannerVideo.file, contentType, "banner_url");
+      if (newUrl) {
+        await supabase
+          .from("profiles")
+          .update({ banner_media_kind: "video", banner_media_duration_ms: bannerVideo.durationMs } as any)
+          .eq("id", user.id);
+        setBannerUrl(newUrl);
+        setBannerMediaKind("video");
+        const next = Date.now() + BANNER_COOLDOWN_MS;
+        localStorage.setItem(`rl:banner:${user.id}`, String(next));
+        setBannerNextAt(next);
+        toast({ title: "Banner updated!" });
+      }
+    } catch (error: any) {
+      toast({ title: "Error uploading banner", description: error.message, variant: "destructive" });
+    } finally {
+      setUploadingBanner(false);
+    }
   };
 
   const handleCroppedBannerUpload = async (blob: Blob) => {
@@ -294,7 +371,12 @@ export default function Settings() {
         "banner_url"
       );
       if (newUrl) {
+        await supabase
+          .from("profiles")
+          .update({ banner_media_kind: "image", banner_media_duration_ms: null } as any)
+          .eq("id", user.id);
         setBannerUrl(newUrl);
+        setBannerMediaKind("image");
         const next = Date.now() + BANNER_COOLDOWN_MS;
         localStorage.setItem(`rl:banner:${user.id}`, String(next));
         setBannerNextAt(next);
@@ -491,9 +573,11 @@ export default function Settings() {
                   }`}
                   onClick={() => bannerRemaining === 0 && bannerInputRef.current?.click()}
                 >
-                  {bannerUrl && (
+                  {bannerUrl && bannerMediaKind === "video" ? (
+                    <video src={bannerUrl} autoPlay muted loop playsInline className="h-full w-full object-cover" />
+                  ) : bannerUrl ? (
                     <img src={bannerUrl} alt="Profile banner image" className="h-full w-full object-cover" />
-                  )}
+                  ) : null}
                   {uploadingBanner && (
                     <div className="absolute inset-0 flex items-center justify-center bg-background/50">
                       <div className="animate-spin h-6 w-6 border-2 border-primary border-t-transparent rounded-full" />
@@ -507,13 +591,13 @@ export default function Settings() {
                   <input
                     ref={bannerInputRef}
                     type="file"
-                    accept="image/*"
+                    accept="image/*,video/mp4,video/webm"
                     onChange={handleBannerSelect}
                     className="hidden"
                   />
                 </div>
                 <div className="text-sm text-muted-foreground mt-3">
-                  <p>Recommended ratio 2:1. You'll be able to crop and zoom (GIFs stay animated).</p>
+                  <p>Recommended ratio 2:1. Images can be cropped and zoomed (GIFs stay animated); MP4/WebM videos up to 5 seconds play muted on your profile.</p>
                   <p>Max file size: {MAX_UPLOAD_SIZE_LABEL}</p>
                   {bannerRemaining > 0 ? (
                     <p className="text-amber-500 mt-1">
@@ -525,6 +609,10 @@ export default function Settings() {
                 </div>
               </CardContent>
             </Card>
+
+            <ProfileDetailsEditor />
+
+            <FriendCodeCard />
 
 
 
@@ -851,6 +939,23 @@ export default function Settings() {
         onCropped={handleCroppedUpload}
         title="Crop your profile picture"
       />
+
+      <AlertDialog open={!!bannerVideo} onOpenChange={(open) => { if (!open) setBannerVideo(null); }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Use this video as your banner?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {bannerVideo
+                ? `${bannerVideo.file.name} — ${(bannerVideo.durationMs / 1000).toFixed(1)}s, ${(bannerVideo.file.size / (1024 * 1024)).toFixed(1)} MB. It will play muted and looped on your profile.`
+                : ""}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={handleBannerVideoUpload}>Upload</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AvatarCropDialog
         open={!!cropBannerFile}
