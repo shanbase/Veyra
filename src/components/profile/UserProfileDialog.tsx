@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import {
@@ -19,6 +19,7 @@ import {
   parseProfileLayout,
   parseProfileSong,
   parseStringArray,
+  profileSongAutoplayEnabled,
   type ProfileLayoutSection,
 } from "@/lib/profileFields";
 import type { Json } from "@/integrations/supabase/types";
@@ -293,11 +294,22 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
   const interests = parseStringArray(profile?.interests ?? null);
   const languages = parseLanguages(profile?.languages_spoken ?? null);
   const song = parseProfileSong(profile?.profile_song ?? null);
+  const songAudioRef = useRef<HTMLAudioElement>(null);
   const layoutOrder = parseProfileLayout(profile?.profile_layout ?? null);
   const statusModeLabel =
     profile?.status_mode === "idle" ? "Idle"
     : profile?.status_mode === "do_not_disturb" ? "Do not disturb"
     : null;
+
+  // Autoplay the profile song when the dialog opens, unless the viewer turned
+  // it off in Settings. Browsers may still block unmuted autoplay without a
+  // prior user gesture — the audio controls stay visible as the fallback.
+  useEffect(() => {
+    if (!open || !song?.url || !profileSongAutoplayEnabled()) return;
+    const audio = songAudioRef.current;
+    if (!audio) return;
+    audio.play().catch(() => { /* autoplay blocked — user can press play */ });
+  }, [open, song?.url]);
 
   const renderProfileSection = (section: ProfileLayoutSection) => {
     const baseStyle = textColor ? { color: textColor } : undefined;
@@ -349,7 +361,7 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
               <Music className="h-3 w-3" /> Profile song
             </p>
             <p className="text-sm font-medium" style={baseStyle}>{song.title}{song.artist ? ` — ${song.artist}` : ""}</p>
-            <audio controls preload="none" src={song.url} className="mt-2 w-full" />
+            <audio ref={songAudioRef} controls preload="none" src={song.url} className="mt-2 w-full" />
           </div>
         ) : null;
       default:

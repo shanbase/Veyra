@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { PROFILE_SONG_AUTOPLAY_KEY, profileSongAutoplayEnabled } from "@/lib/profileFields";
 import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/hooks/useAuth";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -76,6 +77,7 @@ export function ProfileDetailsEditor() {
   const [songQuery, setSongQuery] = useState("");
   const [songResults, setSongResults] = useState<SongResult[] | null>(null);
   const [songSearching, setSongSearching] = useState(false);
+  const [autoplaySongs, setAutoplaySongs] = useState(() => profileSongAutoplayEnabled());
 
   const [layout, setLayout] = useState<ProfileLayoutSection[]>([]);
   const [savedLayout, setSavedLayout] = useState<ProfileLayoutSection[]>([]);
@@ -472,6 +474,19 @@ export function ProfileDetailsEditor() {
               ))}
             </div>
           )}
+          <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
+            <div>
+              <p className="text-sm font-medium">Autoplay profile songs</p>
+              <p className="text-xs text-muted-foreground">Start playing a profile's song automatically when you open it. Applies to profiles you view.</p>
+            </div>
+            <Switch
+              checked={autoplaySongs}
+              onCheckedChange={(value) => {
+                setAutoplaySongs(value);
+                try { localStorage.setItem(PROFILE_SONG_AUTOPLAY_KEY, value ? "1" : "0"); } catch { /* ignore */ }
+              }}
+            />
+          </div>
           {song && (
             <div className="rounded-lg border border-border p-3">
               <p className="text-sm font-medium">{song.title}{song.artist ? ` — ${song.artist}` : ""}</p>

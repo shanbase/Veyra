@@ -98,6 +98,14 @@ export const ORDERED_LAYOUT_SECTIONS: ProfileLayoutSection[] = ["bio", "links", 
 
 export const DEFAULT_PROFILE_LAYOUT: ProfileLayoutSection[] = [...ORDERED_LAYOUT_SECTIONS];
 
+// Per-device preference: whether profile songs start playing automatically
+// when someone opens a profile. Default ON; stored in localStorage so it
+// follows the viewer, not the profile owner.
+export const PROFILE_SONG_AUTOPLAY_KEY = "veyra:profile-song-autoplay";
+export function profileSongAutoplayEnabled(): boolean {
+  try { return localStorage.getItem(PROFILE_SONG_AUTOPLAY_KEY) !== "0"; } catch { return true; }
+}
+
 export function parseProfileLayout(value: Json | string | null | undefined): ProfileLayoutSection[] {
   const parsed = parseJsonValue(value);
   if (!Array.isArray(parsed)) return DEFAULT_PROFILE_LAYOUT;
