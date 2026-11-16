@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { ThemeProvider } from "@/components/ThemeProvider";
 import { AndroidUpdateCheck } from "@/components/AndroidUpdateCheck";
+import { MaintenanceGate } from "@/components/MaintenanceGate";
 
 const Index = lazy(() => import("./pages/Index"));
 const Auth = lazy(() => import("./pages/Auth"));
@@ -34,6 +35,7 @@ const App = () => (
         <Toaster />
         <Sonner />
         <BrowserRouter>
+          <MaintenanceGate>
           <Suspense fallback={<RouteLoading />}>
             <Routes>
               <Route path="/" element={<Index />} />
@@ -48,6 +50,7 @@ const App = () => (
               <Route path="*" element={<NotFound />} />
             </Routes>
           </Suspense>
+          </MaintenanceGate>
         </BrowserRouter>
       </TooltipProvider>
     </ThemeProvider>

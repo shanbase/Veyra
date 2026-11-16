@@ -13,6 +13,22 @@ import { assertEncryptionConfig, encryptionEnabled } from './encryption.mjs';
 import { assertQueuesConfig } from './queues.mjs';
 
 const MAX_PROFILE_IMAGE_BYTES = 25 * 1024 * 1024;
+
+// Maintenance mode: env MAINTENANCE_MODE=true forces it on, =false forces it
+// off; otherwise a Redis flag (veyra:v1:maintenance = 1) toggles it at runtime
+// without a redeploy. Redis is best-effort — unreachable means "off".
+const MAINTENANCE_REDIS_KEY = 'veyra:v1:maintenance';
+async function isMaintenanceMode() {
+  const env = String(process.env.MAINTENANCE_MODE || '').trim().toLowerCase();
+  if (env === 'true' || env === '1' || env === 'yes') return true;
+  if (env === 'false' || env === '0' || env === 'no') return false;
+  try {
+    const flag = await redisGetJson(MAINTENANCE_REDIS_KEY);
+    return flag === 1 || flag === '1' || flag === true;
+  } catch {
+    return false;
+  }
+}
 const PROFILE_UPLOAD_TYPES = new Set(['image/jpeg', 'image/gif']);
 const CHAT_UPLOAD_BUCKETS = new Set(['chat-images', 'chat-videos', 'chat-voice']);
 const MAX_CHAT_UPLOAD_BYTES = 25 * 1024 * 1024;
@@ -119,6 +135,31 @@ export function createApp() {
   const RELEASE_METADATA_URL = process.env.RELEASE_METADATA_URL
     || `https://github.com/${process.env.GITHUB_REPOSITORY || 'ShanLim655/Veyra'}/releases/latest/download/latest.json`;
   let releaseCache = { at: 0, body: null };
+  app.get('/api/maintenance', async (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ maintenance: await isMaintenanceMode() });
+  });
+  // Admin-only runtime toggle. Registered before the /api auth middleware so
+  // it stays reachable while maintenance is on (otherwise you could never
+  // turn maintenance off through the API). Requires Redis — without it, use
+  // the MAINTENANCE_MODE env var instead.
+  app.post('/api/maintenance', (req, res) => {
+    authenticateRequest(req, res, async () => {
+      try {
+        const [rows] = await pool.execute("SELECT 1 FROM user_roles WHERE user_id = ? AND role IN ('admin','super_admin') LIMIT 1", [req.user.id]);
+        if (!rows.length) return res.status(403).json({ error: 'Admin access required.' });
+        const enabled = req.body?.enabled === true || req.body?.enabled === 'true' || req.body?.enabled === 1 || req.body?.enabled === '1';
+        await redisSetJson(MAINTENANCE_REDIS_KEY, enabled ? 1 : 0);
+        const confirmed = await isMaintenanceMode();
+        if (confirmed !== enabled) {
+          return res.status(503).json({ error: 'Redis is unavailable — set MAINTENANCE_MODE env var instead.' });
+        }
+        res.json({ maintenance: enabled });
+      } catch {
+        res.status(500).json({ error: 'Could not update maintenance mode.' });
+      }
+    });
+  });
   app.get('/api/app-version', async (_req, res) => {
     try {
       if (releaseCache.body && Date.now() - releaseCache.at < 5 * 60_000) {
@@ -151,6 +192,11 @@ export function createApp() {
     if (req.path === '/queues/deliver' && process.env.QUEUES_WORKER_SECRET && req.get('x-queue-worker-secret') === process.env.QUEUES_WORKER_SECRET) {
       req.queueWorkerAuthorized = true;
       return next();
+    }
+    // Maintenance mode locks down every API route except the public status
+    // probe itself (registered above, so it never reaches this middleware).
+    if (await isMaintenanceMode()) {
+      return res.status(503).json({ error: 'maintenance' });
     }
     authenticateRequest(req, res, next);
   });
