@@ -2025,7 +2025,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
 
 
       <ScrollArea className="flex-1 overscroll-contain relative [&>[data-radix-scroll-area-viewport]>div]:!block [&>[data-radix-scroll-area-viewport]>div]:!min-w-0 [&>[data-radix-scroll-area-viewport]>div]:!w-full" ref={scrollAreaRef} onScrollCapture={handleScroll}>
-        <div className="px-3 sm:px-4 py-2 sm:p-4 space-y-2 flex flex-col min-h-full w-full min-w-0 max-w-full overflow-x-hidden">
+        <div className="px-3 sm:px-4 py-2 sm:p-4 flex flex-col min-h-full w-full min-w-0 max-w-full overflow-x-hidden">
           {loadingMore && (
             <div className="flex justify-center py-2">
               <div className="h-5 w-5 border-2 border-primary border-t-transparent rounded-full animate-spin" />
@@ -2122,7 +2122,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                   ref={(el) => {
                     if (el) messageRefs.current.set(message.id, el);
                   }}
-                  className={`relative flex gap-1.5 sm:gap-3 group transition-colors duration-500 rounded-lg px-2 sm:px-3 ${isChainStart ? 'py-1' : 'py-0.5'} hover:bg-muted/50 items-start overflow-hidden min-w-0 ${
+                  className={`relative flex gap-1.5 sm:gap-3 group transition-colors duration-500 rounded-lg px-2 sm:px-3 ${isChainStart ? 'py-1' : 'py-0'} hover:bg-muted/50 items-start overflow-hidden min-w-0 ${
                     messageMentionsMe(message.content, myUsername) && message.sender_id !== user?.id
                       ? "ring-1 ring-destructive/40 bg-destructive/[0.04]"
                       : ""
@@ -2244,13 +2244,8 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                   />
                 )}
                 {!isChainStart && isOwn && isChainEnd && (
-                  <span className="absolute bottom-1 right-2 inline-flex items-center">
+                  <span className="absolute bottom-0.5 right-2 inline-flex items-center">
                     {getStatusIcon(message, isOwn)}
-                  </span>
-                )}
-                {!isChainStart && (
-                  <span className={`absolute bottom-1 ${isOwn && isChainEnd ? 'right-9' : 'right-2'} text-[10px] text-muted-foreground/60 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none`}>
-                    {formatMessageTime(message.created_at)}
                   </span>
                 )}
 
@@ -2523,6 +2518,11 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                             );
                           })()}
                           {message.content && renderMessageBody(message)}
+                          {!isChainStart && (
+                            <span className="hidden group-hover:inline text-[10px] text-muted-foreground/60 ml-1.5 whitespace-nowrap align-middle">
+                              {formatMessageTime(message.created_at)}
+                            </span>
+                          )}
 
                         </div>
 
