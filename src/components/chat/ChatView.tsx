@@ -2243,8 +2243,13 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                     title="You were mentioned"
                   />
                 )}
+                {!isChainStart && isOwn && isChainEnd && (
+                  <span className="absolute bottom-1 right-2 inline-flex items-center">
+                    {getStatusIcon(message, isOwn)}
+                  </span>
+                )}
                 {!isChainStart && (
-                  <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground/60 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                  <span className={`absolute bottom-1 ${isOwn && isChainEnd ? 'right-9' : 'right-2'} text-[10px] text-muted-foreground/60 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none`}>
                     {formatMessageTime(message.created_at)}
                   </span>
                 )}
@@ -2348,11 +2353,6 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                               title={`Edited ${formatMessageDate(message.edited_at)}`}
                             >
                               (edited)
-                            </span>
-                          )}
-                          {!isChainStart && isOwn && isChainEnd && (
-                            <span className="inline-flex items-center mr-1.5 align-middle">
-                              {getStatusIcon(message, isOwn)}
                             </span>
                           )}
                           {message.replied_message && (
