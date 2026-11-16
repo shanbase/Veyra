@@ -89,6 +89,81 @@ async function uploadChatMedia(bucket: "chat-images" | "chat-videos" | "chat-voi
   if (error) throw error;
   return signed.publicUrl;
 }
+
+// Preloads remote media into the browser cache so swapping a message's
+// image_url from local blob: previews to signed https URLs renders instantly
+// instead of flashing blank while the network fetch catches up.
+function preloadOneMedia(raw: string): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      let url = raw;
+      let kind: "image" | "video" | "audio" | "skip" = "image";
+      if (raw.startsWith("video:")) {
+        kind = "video";
+        url = raw.slice(6);
+      } else if (raw.startsWith("audio:")) {
+        kind = "audio";
+        url = raw.slice(6).replace(/:\d+$/, "");
+      } else {
+        const fileMeta = decodeFile(raw);
+        const musicMeta = fileMeta ? null : decodeMusic(raw);
+        if (fileMeta) {
+          kind = "audio";
+          url = fileMeta.url;
+        } else if (musicMeta) {
+          kind = "audio";
+          url = musicMeta.url;
+        } else if (raw.startsWith("expired:")) {
+          resolve();
+          return;
+        }
+      }
+      if (!url || url.startsWith("blob:") || url.startsWith("data:")) {
+        resolve();
+        return;
+      }
+      const done = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(done, 2500);
+      if (kind === "image") {
+        const img = new Image();
+        img.onload = done;
+        img.onerror = done;
+        img.src = url;
+      } else if (kind === "video") {
+        const video = document.createElement("video");
+        video.preload = "metadata";
+        video.onloadeddata = done;
+        video.onerror = done;
+        video.src = url;
+      } else if (kind === "audio") {
+        const audio = new Audio();
+        audio.preload = "metadata";
+        audio.onloadedmetadata = done;
+        audio.onerror = done;
+        audio.src = url;
+      } else {
+        done();
+      }
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function preloadChatMedia(imageUrlJson: string | null): Promise<void> {
+  if (!imageUrlJson) return Promise.resolve();
+  let urls: string[] = [];
+  try {
+    const parsed = JSON.parse(imageUrlJson);
+    urls = Array.isArray(parsed) ? parsed : [String(parsed)];
+  } catch {
+    return Promise.resolve();
+  }
+  return Promise.all(urls.map((url) => preloadOneMedia(String(url)))).then(() => undefined);
+}
 export interface Reaction {
   id: string;
   emoji: string;
@@ -257,7 +332,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     };
   }, [user?.id]);
 
-  const { typingUsers, setTyping } = usePresence(isDM ? conversationIdProp ?? null : null);
+  const { typingUsers, setTyping } = usePresence(conversationIdProp ?? null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState("");
@@ -463,6 +538,10 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   const initialScrollSettledRef = useRef(false);
   const wasActiveRef = useRef(isActive);
   const userScrolledRef = useRef(false);
+  // True while the user is parked at the bottom (or just sent a message): new
+  // incoming messages then snap the view down. Scrolling up releases the
+  // stick; returning to the bottom re-engages it.
+  const stickToBottomRef = useRef(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const pendingOutgoingMessagesRef = useRef(new Map<string, {
     content: string;
@@ -591,6 +670,8 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
       _status: "sending",
     };
     if (stillActive) {
+      // Sending always returns the view to the latest message.
+      stickToBottomRef.current = true;
       setMessages((prev) => [...prev, optimisticMessage]);
       const viewport = scrollAreaRef.current?.querySelector("[data-radix-scroll-area-viewport]") as HTMLElement | null;
       if (viewport && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 250) {
@@ -648,16 +729,28 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
           }
           if (index < 0) return prev;
           const next = prev.slice();
+          const finalImageUrl = signedJson ?? data.image_url;
           next[index] = {
             ...prev[index],
             ...data,
-            image_url: signedJson ?? data.image_url,
+            // Keep the local blob preview until the signed remote URL is
+            // cached — see dispatchMessage for why this prevents flicker.
+            image_url: localJson ?? finalImageUrl,
             reactions: prev[index].reactions || [],
             _status: "sent",
           };
           return next;
         });
-        URL.revokeObjectURL(localBlobUrl);
+        const finalImageUrl = signedJson ?? data.image_url;
+        if (localJson && finalImageUrl && finalImageUrl !== localJson) {
+          void preloadChatMedia(finalImageUrl).then(() => {
+            setMessages((prev) => prev.map((message) =>
+              message.id === data.id ? { ...message, image_url: finalImageUrl } : message));
+            setTimeout(() => URL.revokeObjectURL(localBlobUrl), 500);
+          });
+        } else {
+          URL.revokeObjectURL(localBlobUrl);
+        }
       }
     } catch (error: any) {
       toast({ title: "Error sending voice message", description: error.message, variant: "destructive" });
@@ -851,6 +944,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
       isInitialLoad.current = false;
       initialScrollSettledRef.current = false;
       userScrolledRef.current = false;
+      stickToBottomRef.current = true;
 
       const viewport = scrollAreaRef.current?.querySelector(
         "[data-radix-scroll-area-viewport]",
@@ -900,6 +994,15 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
       };
     }
   }, [isActive, messages.length, scrollToBottom]);
+
+  // Stick-to-bottom: whenever the tail message changes (send or receive),
+  // snap to the latest — but only while the user hasn't scrolled up into
+  // history. Returning to the bottom re-engages via handleScroll.
+  const lastMessageId = messages.length ? messages[messages.length - 1].id : null;
+  useEffect(() => {
+    if (!stickToBottomRef.current || !lastMessageId) return;
+    scrollToBottom("instant");
+  }, [lastMessageId, scrollToBottom]);
 
   // Track the currently-loaded conversation so async writes (debounced cache
   // persistence, in-flight fetches) can refuse to apply when the conversation
@@ -1167,16 +1270,21 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
       // Check if scrolled up to show jump button
       const isNearBottom = distanceFromBottom < 150;
       setShowScrollButton(!isNearBottom);
+      // Track whether new messages should pull the view down. 100px of slack
+      // keeps the stick engaged through small layout shifts (media loads).
+      stickToBottomRef.current = distanceFromBottom < 100;
     }
   }, [hasMore, conversationId]);
 
   const lastTypingSentRef = useRef(0);
   const handleTyping = useCallback(() => {
-    if (!isDM) return;
+    // DMs and group conversations both have a presence channel; broadcast
+    // channels (global/announcements) don't.
+    if (!conversationIdProp) return;
     // Throttle the realtime "typing" broadcast so it fires at most once every
-    // 1.5s instead of on every keystroke (keeps typing snappy on mobile).
+    // 1.2s instead of on every keystroke (keeps typing snappy on mobile).
     const now = Date.now();
-    if (now - lastTypingSentRef.current > 1500) {
+    if (now - lastTypingSentRef.current > 1200) {
       lastTypingSentRef.current = now;
       setTyping(true);
     }
@@ -1188,8 +1296,8 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     typingTimeoutRef.current = setTimeout(() => {
       lastTypingSentRef.current = 0;
       setTyping(false);
-    }, 2000);
-  }, [setTyping, isDM]);
+    }, 2500);
+  }, [setTyping, conversationIdProp]);
 
   const dispatchMessage = async (
     contentToSend: string,
@@ -1210,7 +1318,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     sendTimestampsRef.current.push(now);
 
     setLoading(true);
-    if (isDM) setTyping(false);
+    setTyping(false);
     if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
 
     setNewMessage("");
@@ -1268,6 +1376,8 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     };
 
     if (stillActive) {
+      // Sending always returns the view to the latest message.
+      stickToBottomRef.current = true;
       setMessages((prev) => [...prev, optimisticMessage]);
       const viewport = scrollAreaRef.current?.querySelector("[data-radix-scroll-area-viewport]") as HTMLElement | null;
       if (viewport && viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 250) {
@@ -1380,16 +1490,30 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
         }
         if (index < 0) return prev;
         const next = prev.slice();
+        const finalImageUrl = optimisticImageUrl ?? data.image_url;
         next[index] = {
           ...prev[index],
           ...data,
-          image_url: optimisticImageUrl ?? data.image_url,
+          // Keep the local blob preview mounted — the signed remote URLs are
+          // swapped in below only after they've been fetched into cache, so
+          // media never flashes blank between the two.
+          image_url: localImageUrlJson ?? finalImageUrl,
           reactions: prev[index].reactions || [],
           _status: "sent",
         };
         return next;
       });
-      previewsToSend.forEach((preview) => URL.revokeObjectURL(preview.url));
+      const finalImageUrl = optimisticImageUrl ?? data.image_url;
+      if (localImageUrlJson && finalImageUrl && finalImageUrl !== localImageUrlJson) {
+        void preloadChatMedia(finalImageUrl).then(() => {
+          setMessages((prev) => prev.map((message) =>
+            message.id === data.id ? { ...message, image_url: finalImageUrl } : message));
+          // Let React commit the signed URLs before releasing the blobs.
+          setTimeout(() => previewsToSend.forEach((preview) => URL.revokeObjectURL(preview.url)), 500);
+        });
+      } else {
+        previewsToSend.forEach((preview) => URL.revokeObjectURL(preview.url));
+      }
     }
     setLoading(false);
   };
