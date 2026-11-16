@@ -16,23 +16,41 @@ const TABLES = new Set([
 ]);
 const columnCache = new Map();
 
+function columnCacheKey(table) {
+  return `veyra:v1:cols:${isPostgres ? 'pg' : 'my'}:${table}`;
+}
+
+async function fetchColumns(table) {
+  const [rows] = await pool.query(`SHOW COLUMNS FROM \`${table}\``);
+  const columns = new Map(rows.map((row) => [row.Field, row.Type]));
+  columnCache.set(table, columns);
+  await redisSetJson(columnCacheKey(table), Object.fromEntries(columns), 3600);
+  return columns;
+}
+
 async function columnsFor(table) {
   if (!TABLES.has(table)) throw new Error('Unknown table.');
   if (!columnCache.has(table)) {
     // Schema metadata is stable — share it through Redis so every serverless
     // instance doesn't pay 19 SHOW COLUMNS queries on cold start.
-    const cacheKey = `veyra:v1:cols:${isPostgres ? 'pg' : 'my'}:${table}`;
-    const cached = await redisGetJson(cacheKey);
+    const cached = await redisGetJson(columnCacheKey(table));
     if (cached && typeof cached === 'object') {
       columnCache.set(table, new Map(Object.entries(cached)));
       return columnCache.get(table);
     }
-    const [rows] = await pool.query(`SHOW COLUMNS FROM \`${table}\``);
-    const columns = new Map(rows.map((row) => [row.Field, row.Type]));
-    columnCache.set(table, columns);
-    await redisSetJson(cacheKey, Object.fromEntries(columns), 3600);
+    await fetchColumns(table);
   }
   return columnCache.get(table);
+}
+
+// Force-refresh one table's column map in memory and Redis. Used when a query
+// hits 'Unsupported column' — the caches can lag a schema migration by up to
+// the 1h Redis TTL (or indefinitely for a long-running in-memory copy), which
+// otherwise breaks every query touching the new columns until a restart.
+async function refreshColumns(table) {
+  if (!TABLES.has(table)) return;
+  columnCache.delete(table);
+  await fetchColumns(table);
 }
 
 function identifier(value, columns) {
@@ -631,6 +649,19 @@ async function mergeQueuedSelect(table, payload, result) {
   return result;
 }
 
+// A stale schema cache (pre-migration column map) surfaces as
+// 'Unsupported column: <name>'. Refresh that table's columns once and retry —
+// genuinely unknown columns simply fail again on the second pass.
+async function queryDataWithSchemaRetry(userId, payload) {
+  try {
+    return await queryDataUncached(userId, payload);
+  } catch (error) {
+    if (!String(error?.message || '').startsWith('Unsupported column:')) throw error;
+    await refreshColumns(payload?.table).catch((refreshError) => console.error('Column cache refresh failed:', refreshError));
+    return await queryDataUncached(userId, payload);
+  }
+}
+
 export async function queryData(userId, payload) {
   const table = payload?.table;
   const operation = payload?.operation || 'select';
@@ -641,11 +672,11 @@ export async function queryData(userId, payload) {
     return result;
   };
   if (operation === 'select') {
-    return cachedRead(userId, table, payload, () => queryDataUncached(userId, payload))
+    return cachedRead(userId, table, payload, () => queryDataWithSchemaRetry(userId, payload))
       .then(withDecryptedData)
       .then((result) => mergeQueuedSelect(table, payload, result));
   }
-  const result = await queryDataUncached(userId, payload);
+  const result = await queryDataWithSchemaRetry(userId, payload);
   if (result?.count > 0) await invalidateReadCache(table);
   return withDecryptedData(result);
 }

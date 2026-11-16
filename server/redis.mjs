@@ -178,6 +178,23 @@ export async function redisSetJson(key, value, ttlSeconds) {
   }
 }
 
+export async function redisDeletePattern(pattern) {
+  const redis = await readyClient();
+  if (!redis) return 0;
+  try {
+    let deleted = 0;
+    for await (const key of redis.scanIterator({ MATCH: pattern, COUNT: 500 })) {
+      await redis.del(key);
+      deleted += 1;
+    }
+    return deleted;
+  } catch (error) {
+    console.warn('Redis pattern delete failed:', error.message);
+    redisDisabledUntil = Date.now() + 2000;
+    return 0;
+  }
+}
+
 export async function redisDel(...keys) {
   const redis = await readyClient();
   if (!redis || !keys.length) return;
