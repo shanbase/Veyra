@@ -311,6 +311,7 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
     if (!open || !song?.url || !profileSongAutoplayEnabled()) return;
     const audio = songAudioRef.current;
     if (!audio) return;
+    audio.volume = 0.5;
     audio.play().catch(() => { /* autoplay blocked — user can press play */ });
   }, [open, song?.url]);
 

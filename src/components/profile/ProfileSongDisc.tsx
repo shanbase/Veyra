@@ -1,4 +1,4 @@
-import { useState, type RefObject } from "react";
+import { useEffect, useState, type RefObject } from "react";
 import { Music, Pause, Play, Square, Volume2, VolumeX } from "lucide-react";
 import type { ProfileSong } from "@/lib/profileFields";
 
@@ -11,8 +11,18 @@ interface ProfileSongDiscProps {
 // A vinyl-style disc beside the avatar. Click toggles play/pause; hovering
 // expands a small horizontal control bar with stop and volume.
 export function ProfileSongDisc({ song, audioRef, playing }: ProfileSongDiscProps) {
-  const [volume, setVolume] = useState(1);
+  // Profile songs start at a comfortable 50% — full volume is jump-scarey.
+  const [volume, setVolume] = useState(0.5);
   const [muted, setMuted] = useState(false);
+
+  useEffect(() => {
+    const el = audioRef.current;
+    if (el) {
+      el.volume = 0.5;
+      el.muted = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const audio = () => audioRef.current;
 
