@@ -43,7 +43,7 @@ import { VoiceRecordingIndicator } from "@/components/chat/VoiceRecordingIndicat
 import {
   Send, Check, CheckCheck, Clock, MoreHorizontal, Pencil, X,
   Trash2, Smile, ArrowLeft, ImagePlus, ArrowDown, Reply,
-  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff, Forward
+  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff, Forward, Hash, Flag
 } from "lucide-react";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { signMessageMedia, encodeFile, decodeFile, encodeMusic, decodeMusic } from "@/lib/mediaUrl";
@@ -1678,6 +1678,14 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     }
   };
 
+  // The action menu must stay inside the chat scroll area — clamping to the
+  // window would let it slide under the composer on the latest messages.
+  const getChatMenuBounds = () => {
+    const root = scrollAreaRef.current;
+    const viewport = root?.querySelector?.("[data-radix-scroll-area-viewport]") as HTMLElement | null;
+    return (viewport ?? root)?.getBoundingClientRect() ?? null;
+  };
+
   const getStatusIcon = (message: Message, isOwn: boolean, showReadStatus = true) => {
     if (!isOwn) return null;
     if (!showReceipts) return null;
@@ -2182,7 +2190,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                   } ${isMobile ? 'select-none [-webkit-touch-callout:none] [touch-action:pan-y]' : ''}`}
 
                   style={{ willChange: 'transform' }}
-                  onContextMenu={(e) => {
+                  onContextMenuCapture={(e) => {
                     e.preventDefault();
                     if (isMobile) return;
                     setActionMenu({ x: e.clientX, y: e.clientY, message });
@@ -2580,8 +2588,13 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                           })()}
                           {message.content && renderMessageBody(message, hoverTime)}
                           {/* Fallback for media-only / poll messages where the
-                              markdown suffix can't reach the last text line. */}
-                          {!isChainStart && (!message.content || message.content.startsWith("[[poll:")) && hoverTime}
+                              markdown suffix can't reach the last text line —
+                              pinned to the bottom-right corner of the message. */}
+                          {!isChainStart && (!message.content || message.content.startsWith("[[poll:")) && (
+                            <span className={`absolute bottom-1 ${isOwn && isChainEnd ? "right-10" : "right-2"} text-[10px] text-muted-foreground/60 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none`}>
+                              {formatMessageTime(message.created_at)}
+                            </span>
+                          )}
 
                         </div>
 
@@ -3072,6 +3085,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
         isOwn={actionMenu?.message.sender_id === user?.id}
         isSuperAdmin={isSuperAdmin}
         canPost={canPost}
+        getBounds={getChatMenuBounds}
         onAction={(action) => {
           if (actionMenu) handleMessageMenuAction(actionMenu.message as Message, action);
         }}
@@ -3274,6 +3288,34 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                       <span className="text-base">Reply</span>
                     </button>
                   )}
+                  {own && m.content && (
+                    <button
+                      type="button"
+                      onClick={() => { startEditing(m); close(); }}
+                      className="flex items-center gap-3 px-5 py-3 text-left hover:bg-muted active:bg-muted/80 transition-colors"
+                    >
+                      <Pencil className="h-5 w-5 text-muted-foreground" />
+                      <span className="text-base">Edit message</span>
+                    </button>
+                  )}
+                  {(own || isSuperAdmin) && (
+                    <button
+                      type="button"
+                      onClick={() => { setDeleteMessageId(m.id); close(); }}
+                      className="flex items-center gap-3 px-5 py-3 text-left text-destructive hover:bg-destructive/10 active:bg-destructive/20 transition-colors"
+                    >
+                      <Trash2 className="h-5 w-5" />
+                      <span className="text-base">Delete message{!own && isSuperAdmin && " (Mod)"}</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => { setForwardMessage(m); close(); }}
+                    className="flex items-center gap-3 px-5 py-3 text-left hover:bg-muted active:bg-muted/80 transition-colors"
+                  >
+                    <Forward className="h-5 w-5 text-muted-foreground" />
+                    <span className="text-base">Forward message</span>
+                  </button>
                   {m.content && (
                     <button
                       type="button"
@@ -3292,16 +3334,22 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                       <span className="text-base">Copy text</span>
                     </button>
                   )}
-                  {(own || isSuperAdmin) && m.content && (
-                    <button
-                      type="button"
-                      onClick={() => { startEditing(m); close(); }}
-                      className="flex items-center gap-3 px-5 py-3 text-left hover:bg-muted active:bg-muted/80 transition-colors"
-                    >
-                      <Pencil className="h-5 w-5 text-muted-foreground" />
-                      <span className="text-base">Edit message{!own && isSuperAdmin && " (Mod)"}</span>
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(m.id);
+                        toast({ title: "Message ID copied" });
+                      } catch {
+                        toast({ title: "Could not copy", variant: "destructive" });
+                      }
+                      close();
+                    }}
+                    className="flex items-center gap-3 px-5 py-3 text-left hover:bg-muted active:bg-muted/80 transition-colors"
+                  >
+                    <Hash className="h-5 w-5 text-muted-foreground" />
+                    <span className="text-base">Copy message ID</span>
+                  </button>
                   {supportsPinning && (own || isSuperAdmin) && (
                     <button
                       type="button"
@@ -3312,14 +3360,14 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                       <span className="text-base">{m.is_pinned ? "Unpin message" : "Pin message"}</span>
                     </button>
                   )}
-                  {(own || isSuperAdmin) && (
+                  {!own && (
                     <button
                       type="button"
-                      onClick={() => { setDeleteMessageId(m.id); close(); }}
+                      onClick={() => { setReportMessage(m); close(); }}
                       className="flex items-center gap-3 px-5 py-3 text-left text-destructive hover:bg-destructive/10 active:bg-destructive/20 transition-colors"
                     >
-                      <Trash2 className="h-5 w-5" />
-                      <span className="text-base">Delete message{!own && isSuperAdmin && " (Mod)"}</span>
+                      <Flag className="h-5 w-5" />
+                      <span className="text-base">Report message</span>
                     </button>
                   )}
                 </div>

@@ -29,11 +29,20 @@ export interface MessageActionMenuState {
   message: ActionMenuMessage;
 }
 
+interface MenuBounds {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
 interface MessageActionMenuProps {
   state: MessageActionMenuState | null;
   isOwn: boolean;
   isSuperAdmin: boolean;
   canPost: boolean;
+  /** Visible area the menu must stay inside (the chat scroll viewport). */
+  getBounds?: () => MenuBounds | null;
   onAction: (action: string) => void;
   onClose: () => void;
 }
@@ -52,6 +61,7 @@ function MenuItem({
   return (
     <button
       type="button"
+      role="menuitem"
       onClick={onClick}
       className={cn(
         "flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm outline-none transition-colors",
@@ -70,41 +80,37 @@ export function MessageActionMenu({
   isOwn,
   isSuperAdmin,
   canPost,
+  getBounds,
   onAction,
   onClose,
 }: MessageActionMenuProps) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ x: 0, y: 0 });
 
-  // Clamp the menu inside the viewport once its real size is known.
+  // Clamp the menu inside the chat viewport once its real size is known, and
+  // cap its height so every item stays reachable on short screens.
   useLayoutEffect(() => {
     if (!state) return;
     const el = menuRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    let x = state.x;
-    let y = state.y;
-    if (x + rect.width > window.innerWidth - 8) x = window.innerWidth - rect.width - 8;
-    if (y + rect.height > window.innerHeight - 8) y = window.innerHeight - rect.height - 8;
-    x = Math.max(8, x);
-    y = Math.max(8, y);
+    const bounds = getBounds?.() ?? null;
+    const minX = bounds ? bounds.left + 8 : 8;
+    const minY = bounds ? bounds.top + 8 : 8;
+    const maxX = (bounds ? bounds.right : window.innerWidth) - rect.width - 8;
+    const maxY = (bounds ? bounds.bottom : window.innerHeight) - rect.height - 8;
+    const x = Math.min(Math.max(state.x, minX), Math.max(minX, maxX));
+    const y = Math.min(Math.max(state.y, minY), Math.max(minY, maxY));
     setPos({ x, y });
-  }, [state]);
+  }, [state, getBounds]);
 
   useEffect(() => {
     if (!state) return;
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
     };
-    const onScroll = () => onClose();
     window.addEventListener("keydown", onKey);
-    window.addEventListener("scroll", onScroll, true);
-    window.addEventListener("resize", onClose);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("scroll", onScroll, true);
-      window.removeEventListener("resize", onClose);
-    };
+    return () => window.removeEventListener("keydown", onKey);
   }, [state, onClose]);
 
   if (!state) return null;
@@ -122,59 +128,63 @@ export function MessageActionMenu({
         ref={menuRef}
         role="menu"
         style={{ left: pos.x, top: pos.y }}
-        className="fixed z-[61] w-60 overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-xl"
+        className="fixed z-[61] flex max-h-[min(70vh,calc(100vh-16px))] w-60 flex-col overflow-hidden rounded-lg border border-border bg-popover text-popover-foreground shadow-xl"
       >
-        {/* Quick reactions */}
-        <div className="flex items-center justify-center gap-1 px-2 py-2">
-          {QUICK_REACTIONS.map((emoji) => (
-            <button
-              key={emoji}
-              type="button"
-              role="menuitem"
-              onClick={() => run(`react:${emoji}`)}
-              className="flex h-9 w-9 items-center justify-center rounded-md text-xl transition-all hover:scale-110 hover:bg-accent"
-            >
-              {emoji}
-            </button>
-          ))}
+        <div className="shrink-0 overflow-y-auto">
+          {/* Quick reactions */}
+          <div className="flex items-center justify-center gap-1 px-2 py-2">
+            {QUICK_REACTIONS.map((emoji) => (
+              <button
+                key={emoji}
+                type="button"
+                role="menuitem"
+                onClick={() => run(`react:${emoji}`)}
+                className="flex h-9 w-9 items-center justify-center rounded-md text-xl transition-all hover:scale-110 hover:bg-accent"
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+          <div className="mx-2 border-t border-border" />
         </div>
-        <div className="mx-2 border-t border-border" />
 
-        {canPost && (
-          <MenuItem icon={Reply} label="Reply" onClick={() => run("reply")} />
-        )}
-        {isOwn && state.message.content && (
-          <MenuItem icon={Pencil} label="Edit Message" onClick={() => run("edit")} />
-        )}
-        <MenuItem icon={SmilePlus} label="React" onClick={() => run("react")} />
-        {canModerate && (
-          <MenuItem
-            icon={Trash2}
-            label={isOwn ? "Delete Message" : "Delete Message (Mod)"}
-            destructive
-            onClick={() => run("delete")}
-          />
-        )}
-        <MenuItem icon={Forward} label="Forward Message" onClick={() => run("forward")} />
-        {state.message.content && (
-          <MenuItem icon={Copy} label="Copy Text" onClick={() => run("copyText")} />
-        )}
-        <MenuItem icon={Hash} label="Copy Message ID" onClick={() => run("copyId")} />
-        {canModerate && (
-          <MenuItem
-            icon={Pin}
-            label={state.message.is_pinned ? "Unpin Message" : "Pin Message"}
-            onClick={() => run("pin")}
-          />
-        )}
-        {!isOwn && (
-          <MenuItem
-            icon={Flag}
-            label="Report Message"
-            destructive
-            onClick={() => run("report")}
-          />
-        )}
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {canPost && (
+            <MenuItem icon={Reply} label="Reply" onClick={() => run("reply")} />
+          )}
+          {isOwn && state.message.content && (
+            <MenuItem icon={Pencil} label="Edit Message" onClick={() => run("edit")} />
+          )}
+          <MenuItem icon={SmilePlus} label="React" onClick={() => run("react")} />
+          {canModerate && (
+            <MenuItem
+              icon={Trash2}
+              label={isOwn ? "Delete Message" : "Delete Message (Mod)"}
+              destructive
+              onClick={() => run("delete")}
+            />
+          )}
+          <MenuItem icon={Forward} label="Forward Message" onClick={() => run("forward")} />
+          {state.message.content && (
+            <MenuItem icon={Copy} label="Copy Text" onClick={() => run("copyText")} />
+          )}
+          <MenuItem icon={Hash} label="Copy Message ID" onClick={() => run("copyId")} />
+          {canModerate && (
+            <MenuItem
+              icon={Pin}
+              label={state.message.is_pinned ? "Unpin Message" : "Pin Message"}
+              onClick={() => run("pin")}
+            />
+          )}
+          {!isOwn && (
+            <MenuItem
+              icon={Flag}
+              label="Report Message"
+              destructive
+              onClick={() => run("report")}
+            />
+          )}
+        </div>
       </div>
     </>
   );
