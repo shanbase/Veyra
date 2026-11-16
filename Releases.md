@@ -4,25 +4,47 @@ GitHub Releases are the public update source for the Windows desktop and Android
 
 ## Veyra 1.2.7
 
-Security-hardening and scale release on top of 1.2.6:
+Security-hardening, scale, and UX release on top of 1.2.6. Everything below shipped after the 1.2.6 tag.
 
-- **Write-path lockdown:** the generic data API no longer lets users forge receipt timestamps (`read_at`/`delivered_at`), rewrite reply links, or backdate messages; bulk updates/deletes/inserts are capped at 200 rows per request and filter sizes are bounded.
-- **Realtime scales past 200 members:** conversation-scoped tables (messages, reactions, polls) now broadcast on per-conversation topics instead of fanning out to every member's user topic, so large groups get live updates for all members. Sidebar unread badges still refresh via lightweight activity pings.
-- **Rate limits without Redis:** `/api/data`, profile uploads, and chat uploads now fall back to an in-memory limiter when `REDIS_URL` is unset; pairing, email-verify, and password-reset endpoints gained rate limits.
-- **Push token ownership:** an FCM token is bound to the newest account that registers it, fixing push delivery when two accounts share one device.
-- **Infra errors no longer leak:** database connection failures return a generic 503 instead of raw driver messages.
-- **Group cap:** groups are limited to 500 members.
-- **Content-Security-Policy** header added to all responses.
-- **Optional Redis write-behind (`REDIS_EZMSG=true`):** message inserts can be queued in Redis and drained to the database asynchronously, with pending-read merging so senders still see their messages instantly. Off by default and disabled on Vercel.
-- **Client spam brake:** sending too many messages in a short window shows a blocking notice until acknowledged.
-- **Chat UX:** consecutive messages from the same sender within 5 minutes now group into a chain (avatar/name/timestamp shown once, per-message time on hover); delivery status is icon-only — clock while sending, single check sent, double check delivered/read.
-- **Attachment cap:** up to 10 files per message.
-- **Android self-update:** the app now downloads APK updates in-app with progress and hands off to the system installer automatically, instead of opening a browser page.
-- **Discord-style message menu:** right-click a message (or use the hover "…" button) for quick reactions, reply, edit (own messages), react, delete, forward, copy text, copy message ID, pin, and report. The mobile long-press sheet mirrors the same actions. Forwarded messages render with a "Forwarded" header and accent line; reports land in the new `message_reports` table for moderator review.
-- **Typing indicator, faster and in groups:** typing now rides Supabase Realtime broadcast (fire-and-forget) instead of presence state sync — near-instant delivery, receivers self-expire after 3s, and it works in group chats too (previously DMs only).
-- **Chat sticks to the latest message:** the view stays pinned to the bottom on new messages unless you scroll up into history; it re-engages at the bottom, survives media loads/edits via a resize observer, and applies before paint.
-- **Media sends no longer flicker:** image/video/voice/file previews stay on screen until the signed remote URLs are cached, then swap seamlessly.
-- **Redis hardening:** rate-limit counters are atomic (Lua `INCR`+`PEXPIRE`, crash-safe), the admin-role cache TTL dropped to 60s so out-of-band role changes propagate quickly, and the EZMSG dead-letter list is capped.
+### Security & integrity
+
+- **Write-path lockdown:** the generic data API no longer lets users forge receipt timestamps (`read_at`/`delivered_at`), rewrite reply links, backdate messages, or flip server-managed flags like `is_forwarded`; bulk inserts/updates/deletes are capped at 200 rows and filter/`in`/`OR` clause sizes are bounded.
+- **Rate limits everywhere:** `/api/data`, profile uploads, chat uploads, pairing, email-verify, and password-reset endpoints are all limited — shared Redis counters when `REDIS_URL` is set, in-memory fallback otherwise. Auth limiter maps are cleaned up so they can't grow unbounded.
+- **Infra errors don't leak:** database/network failures return a generic `503` instead of raw driver messages.
+- **Content-Security-Policy** header on all responses.
+- **Push token ownership:** an FCM token binds to the newest account that registers it — fixes push delivery when two accounts share one device.
+- **Message reports:** new `message_reports` table; users can report any visible message but can only file their own reports and can't read them back — admins can review all reports.
+
+### Scale & reliability
+
+- **Realtime past 200 members:** conversation-scoped tables broadcast on per-conversation HMAC topics instead of fanning out to every member; group membership and recipient fan-out are capped, and groups are limited to 500 members.
+- **Optional Redis write-behind (`REDIS_EZMSG=true`):** message inserts can queue in Redis and drain to MariaDB asynchronously with pending-read merging — off by default, disabled on Vercel, falls back to direct writes on Redis failure.
+- **Redis hardening:** rate-limit counters are atomic Lua (`INCR`+`PEXPIRE`, crash-safe, self-healing TTLs); admin-role cache TTL is 60s so role changes propagate fast; EZMSG dead-letter list capped at 1,000 entries.
+- **Clients resync on reconnect:** conversation history refetches when the realtime channel recovers; native API `401`s emit auth-state events so apps re-authenticate instead of failing silently.
+- **Dead code cleanup:** unsupported RPCs and unused paths removed.
+
+### Chat UX
+
+- **Message chaining:** consecutive messages from the same sender within 5 minutes group visually — avatar/name/time once at the top, compact continuations, per-message timestamp on hover at the end of the text (or bottom-right for media).
+- **Icon receipts:** outgoing status is clock while sending, single check sent, double check delivered, green double check read — no more text labels; ticks show at the end of your chain.
+- **Attachment cap:** up to 10 files per message across picker, paste, and drag/drop.
+- **Discord-style message menu:** right-click (desktop) or the hover "…" button opens quick reactions plus reply, edit (own messages), react, delete, forward, copy text, copy message ID, pin, and report. The menu anchors at the cursor, flips at screen edges, stays inside the chat area, and the mobile long-press sheet mirrors the same actions.
+- **Forwarding:** sends a copy (text + media) to any DM or group, rendered with a "Forwarded" label and accent line via the new `is_forwarded` flag.
+- **Typing indicator:** moved to Supabase Realtime broadcast — near-instant, works in group chats (was DM-only), receivers self-expire after ~3s.
+- **Stick-to-bottom:** the chat stays pinned to the latest message on send/receive unless you scroll up; it re-engages at the bottom and a resize observer keeps it pinned through media loads, edits, and reactions — applied before paint.
+- **Flicker-free media sends:** image/video/voice/file previews stay visible until signed remote URLs are cached, then swap seamlessly.
+- **Client spam brake:** too many sends in a short window shows a blocking "Take a rest" notice until acknowledged.
+
+### Android
+
+- **In-app self-update:** downloads the APK natively with live progress, then hands off to the system installer automatically — no more browser hand-off.
+- **Native failover:** the app loads `https://veyra.go.altare.global` and automatically retries `https://veyra-pink-mu.vercel.app` if the primary host fails.
+- **Permissions:** generated manifest now declares `REQUEST_INSTALL_PACKAGES`, `POST_NOTIFICATIONS`, and microphone permissions via configure scripts (generated `android/` stays gitignored).
+
+### Desktop
+
+- **Native failover:** same primary/secondary pair — the window hops to Vercel on load failure, retries the primary after 30s if both are down, and update checks try both origins.
+- **Update UX:** dedicated update window with download progress, integrity-checked installers, and restart-to-update flow (carried from earlier work).
 
 ### Downloads (once published)
 

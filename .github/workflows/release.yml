@@ -118,8 +118,20 @@ jobs:
           cat > release-assets/latest.json <<EOF
           {"version":"$VERSION","tag":"$RELEASE_VERSION","windows":{"file":"Veyra$VERSION.exe","url":"https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION/Veyra$VERSION.exe","sha256":"$WIN_SHA"},"android":{"file":"AndroidVeyra$VERSION.apk","url":"https://github.com/$REPOSITORY/releases/download/$RELEASE_VERSION/AndroidVeyra$VERSION.apk","sha256":"$APK_SHA"}}
           EOF
+      - name: Extract changelog
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          # Pull this version's section out of Releases.md so the GitHub
+          # release notes match the curated changelog instead of raw commits.
+          awk -v heading="## Veyra ${RELEASE_VERSION#v}" '
+            $0 == heading { capture = 1; print; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' Releases.md > release-notes.md
+          test -s release-notes.md
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" release-assets/* --title "Veyra ${TAG#v}" --generate-notes
+        run: gh release create "$TAG" release-assets/* --title "Veyra ${TAG#v}" --notes-file release-notes.md
