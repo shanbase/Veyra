@@ -419,7 +419,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     };
   }, [isActive, isDM, isAnnouncements, channel, conversationIdProp]);
 
-  const renderMessageBody = (msg: { id: string; content: string | null }) => {
+  const renderMessageBody = (msg: { id: string; content: string | null }, suffix?: React.ReactNode) => {
     if (!msg.content) return null;
     const pollMarker = msg.content.match(/^\[\[poll:([0-9a-f-]{36})\]\]\s*$/i);
     if (pollMarker) return <PollCard pollId={pollMarker[1]} />;
@@ -431,6 +431,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
         isOwn={false}
         myUsername={myUsername}
         className="text-[13px] sm:text-sm leading-snug whitespace-pre-wrap break-words"
+        suffix={suffix}
       />
     );
   };
@@ -2118,6 +2119,11 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
               || !Number.isFinite(nextGap)
               || nextGap < 0
               || nextGap > 5 * 60 * 1000;
+            const hoverTime = !isChainStart ? (
+              <span className="hidden group-hover:inline text-[10px] text-muted-foreground/60 ml-1.5 whitespace-nowrap align-middle">
+                {formatMessageTime(message.created_at)}
+              </span>
+            ) : null;
             const isEditing = editingMessageId === message.id;
             const groupedReactions = groupReactions(message.reactions || []);
 
@@ -2563,12 +2569,10 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                               </div>
                             );
                           })()}
-                          {message.content && renderMessageBody(message)}
-                          {!isChainStart && (
-                            <span className="hidden group-hover:inline text-[10px] text-muted-foreground/60 ml-1.5 whitespace-nowrap align-middle">
-                              {formatMessageTime(message.created_at)}
-                            </span>
-                          )}
+                          {message.content && renderMessageBody(message, hoverTime)}
+                          {/* Fallback for media-only / poll messages where the
+                              markdown suffix can't reach the last text line. */}
+                          {!isChainStart && (!message.content || message.content.startsWith("[[poll:")) && hoverTime}
 
                         </div>
 

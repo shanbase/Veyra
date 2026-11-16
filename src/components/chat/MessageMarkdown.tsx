@@ -23,6 +23,8 @@ interface MessageMarkdownProps {
   className?: string;
   /** Lowercased username of the viewer — used to color @mentions red when they target you. */
   myUsername?: string | null;
+  /** Inline node appended inside the last paragraph (e.g. hover timestamp). */
+  suffix?: React.ReactNode;
 }
 
 
@@ -466,8 +468,15 @@ function renderInlineWithBreaks(text: string, isOwn: boolean, keyPrefix: string,
   return out;
 }
 
-export function MessageMarkdown({ content, isOwn = false, className, myUsername }: MessageMarkdownProps) {
+export function MessageMarkdown({ content, isOwn = false, className, myUsername, suffix }: MessageMarkdownProps) {
   const blocks = React.useMemo(() => parseBlocks(content), [content]);
+  // The suffix belongs at the end of the message's last text line — find the
+  // last paragraph block so it lands inside the inline flow, not below it.
+  let lastParagraphIndex = -1;
+  blocks.forEach((block, idx) => {
+    if (block.type === "p" && block.lines.join("\n").trim() !== "") lastParagraphIndex = idx;
+  });
+  const suffixNode = suffix ?? null;
 
 
   return (
@@ -539,11 +548,13 @@ export function MessageMarkdown({ content, isOwn = false, className, myUsername 
             return (
               <p key={key} className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
                 {renderInlineWithBreaks(text, isOwn, key, myUsername)}
+                {idx === lastParagraphIndex ? suffixNode : null}
               </p>
             );
           }
         }
       })}
+      {lastParagraphIndex === -1 ? suffixNode : null}
     </div>
   );
 }
