@@ -78,12 +78,27 @@ export function ForwardMessageDialog({
   const forward = async (target: ForwardTarget) => {
     if (!user || !message || sendingId) return;
     setSendingId(target.id);
+    // The in-memory message carries *signed* media URLs that expire after a
+    // few hours — forwarding them would leave the recipient with a dead
+    // voice note / image. Pull the raw stored payload so the new message
+    // goes through the normal signing pipeline like any other media message.
+    let imageUrl = message.image_url ?? null;
+    try {
+      const { data: raw } = await supabase
+        .from("messages")
+        .select("image_url")
+        .eq("id", message.id)
+        .maybeSingle();
+      if (raw?.image_url) imageUrl = raw.image_url;
+    } catch {
+      // Fall back to whatever the message object carries.
+    }
     const { error } = await supabase.from("messages").insert({
       id: crypto.randomUUID(),
       sender_id: user.id,
       conversation_id: target.id,
       content: message.content ?? "",
-      image_url: message.image_url ?? null,
+      image_url: imageUrl,
       reply_to_id: null,
       is_forwarded: true,
     });
