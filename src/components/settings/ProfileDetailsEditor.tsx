@@ -41,6 +41,14 @@ interface LanguageDraft {
   label: string;
 }
 
+interface SongResult {
+  trackId: number;
+  trackName: string;
+  artistName: string;
+  previewUrl?: string;
+  artworkUrl100?: string;
+}
+
 export function ProfileDetailsEditor() {
   const { user } = useAuth();
   const [loading, setLoading] = useState(true);
@@ -65,6 +73,9 @@ export function ProfileDetailsEditor() {
   const [song, setSong] = useState<ProfileSong | null>(null);
   const [songDraft, setSongDraft] = useState({ title: "", artist: "", url: "", artwork_url: "" });
   const [savingSong, setSavingSong] = useState(false);
+  const [songQuery, setSongQuery] = useState("");
+  const [songResults, setSongResults] = useState<SongResult[] | null>(null);
+  const [songSearching, setSongSearching] = useState(false);
 
   const [layout, setLayout] = useState<ProfileLayoutSection[]>([]);
   const [savedLayout, setSavedLayout] = useState<ProfileLayoutSection[]>([]);
@@ -196,6 +207,36 @@ export function ProfileDetailsEditor() {
     setSavingSong(true);
     if (await updateProfile({ profile_song: value }, "Profile song saved")) setSong(value);
     setSavingSong(false);
+  };
+
+  // Free catalog search via the iTunes Search API — no key required. Returns
+  // ~30s preview MP3s plus artwork, which is what profile_song stores.
+  const searchSongs = async () => {
+    const term = songQuery.trim();
+    if (!term) return;
+    setSongSearching(true);
+    try {
+      const response = await fetch(
+        `https://itunes.apple.com/search?term=${encodeURIComponent(term)}&media=music&entity=song&limit=10`,
+      );
+      const data = await response.json();
+      setSongResults(((data?.results || []) as SongResult[]).filter((entry) => entry.previewUrl));
+    } catch {
+      toast.error("Song search failed — check your connection.");
+      setSongResults([]);
+    }
+    setSongSearching(false);
+  };
+
+  const pickSong = (result: SongResult) => {
+    setSongDraft({
+      title: result.trackName.slice(0, 200),
+      artist: result.artistName.slice(0, 200),
+      url: result.previewUrl!,
+      artwork_url: result.artworkUrl100?.replace("100x100bb", "600x600bb") ?? "",
+    });
+    setSongResults(null);
+    setSongQuery("");
   };
 
   const clearSong = async () => {
@@ -394,9 +435,43 @@ export function ProfileDetailsEditor() {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2"><Music className="h-5 w-5" />Profile song</CardTitle>
-          <CardDescription>One track others can play from your profile. HTTPS audio URL only.</CardDescription>
+          <CardDescription>Search for a song — others hear a ~30s preview on your profile. You can also paste any HTTPS audio URL manually.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
+          <div className="flex gap-2">
+            <Input
+              value={songQuery}
+              onChange={(e) => setSongQuery(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); void searchSongs(); } }}
+              placeholder="Search songs or artists (e.g. Nirvana)"
+            />
+            <Button variant="outline" onClick={searchSongs} disabled={songSearching || !songQuery.trim()}>
+              {songSearching ? <Loader2 className="h-4 w-4 animate-spin" /> : "Search"}
+            </Button>
+          </div>
+          {songResults && (
+            <div className="max-h-56 space-y-1 overflow-y-auto rounded-lg border border-border">
+              {songResults.length === 0 && (
+                <p className="px-3 py-2 text-sm text-muted-foreground">No songs with previews found.</p>
+              )}
+              {songResults.map((result) => (
+                <button
+                  key={result.trackId}
+                  type="button"
+                  onClick={() => pickSong(result)}
+                  className="flex w-full items-center gap-3 px-3 py-2 text-left hover:bg-muted/60"
+                >
+                  {result.artworkUrl100 && (
+                    <img src={result.artworkUrl100} alt="" className="h-9 w-9 rounded object-cover" />
+                  )}
+                  <span className="min-w-0">
+                    <span className="block truncate text-sm font-medium">{result.trackName}</span>
+                    <span className="block truncate text-xs text-muted-foreground">{result.artistName}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
           {song && (
             <div className="rounded-lg border border-border p-3">
               <p className="text-sm font-medium">{song.title}{song.artist ? ` — ${song.artist}` : ""}</p>
