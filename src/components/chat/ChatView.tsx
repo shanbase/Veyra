@@ -2122,7 +2122,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                   ref={(el) => {
                     if (el) messageRefs.current.set(message.id, el);
                   }}
-                  className={`relative flex gap-1.5 sm:gap-3 group transition-colors duration-500 rounded-lg px-2 sm:px-3 py-1 hover:bg-muted/50 items-start overflow-hidden min-w-0 ${
+                  className={`relative flex gap-1.5 sm:gap-3 group transition-colors duration-500 rounded-lg px-2 sm:px-3 ${isChainStart ? 'py-1' : 'py-0.5'} hover:bg-muted/50 items-start overflow-hidden min-w-0 ${
                     messageMentionsMe(message.content, myUsername) && message.sender_id !== user?.id
                       ? "ring-1 ring-destructive/40 bg-destructive/[0.04]"
                       : ""
@@ -2243,6 +2243,11 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                     title="You were mentioned"
                   />
                 )}
+                {!isChainStart && (
+                  <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[10px] text-muted-foreground/60 opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none">
+                    {formatMessageTime(message.created_at)}
+                  </span>
+                )}
 
                 {!isChainStart ? (
                   <div className="w-7 sm:w-8 flex-shrink-0" />
@@ -2337,11 +2342,6 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
 
 
                         <div className="text-foreground break-words min-w-0">
-                          {!isChainStart && (
-                            <span className="hidden group-hover:inline text-[10px] text-muted-foreground/60 mr-1.5">
-                              {formatMessageTime(message.created_at)}
-                            </span>
-                          )}
                           {!isChainStart && message.edited_at && (
                             <span
                               className="text-[10px] italic text-muted-foreground/80 mr-1"
