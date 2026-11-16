@@ -126,36 +126,41 @@ export function AndroidUpdateCheck() {
     };
   }, []);
 
+  const checkForUpdate = async () => {
+    try {
+      const installed = await installedVersion();
+      setCurrentVersion(installed);
+      const response = await fetch(RELEASE_URL, { cache: 'no-store' });
+      if (response.status === 404) return; // No published release yet.
+      if (!response.ok) throw new Error(`Release check failed (HTTP ${response.status}).`);
+      const info = await response.json() as ReleaseInfo;
+      // Only prompt when the installed shell is older than the required
+      // minimum — the web content is always live, so a newer release tag
+      // alone doesn't justify an APK download. Older latest.json files
+      // without the field fall back to comparing the release version.
+      const required = normalizeVersion(info.min_app_version || info.version || '');
+      if (!info.version || !info.android?.url || !required || compareVersions(required, installed) <= 0) return;
+      setRelease(info);
+      setOpen(true);
+    } catch (error) {
+      console.warn('Could not check for Android updates:', error);
+      toast({
+        title: 'Update check failed',
+        description: 'Veyra could not reach the release server. You are still running the current version.',
+        variant: 'destructive',
+      });
+    }
+  };
+
+  // Updates are manual-only: Settings dispatches this event when the user
+  // taps "Check for updates". The app stays on its installed version until
+  // then — the web content is always live anyway.
   useEffect(() => {
     if (!Capacitor.isNativePlatform() || Capacitor.getPlatform() !== 'android') return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const installed = await installedVersion();
-        if (cancelled) return;
-        setCurrentVersion(installed);
-        const response = await fetch(RELEASE_URL, { cache: 'no-store' });
-        if (response.status === 404) return; // No published release yet.
-        if (!response.ok) throw new Error(`Release check failed (HTTP ${response.status}).`);
-        const info = await response.json() as ReleaseInfo;
-        // Only prompt when the installed shell is older than the required
-        // minimum — the web content is always live, so a newer release tag
-        // alone doesn't justify an APK download. Older latest.json files
-        // without the field fall back to comparing the release version.
-        const required = normalizeVersion(info.min_app_version || info.version || '');
-        if (cancelled || !info.version || !info.android?.url || !required || compareVersions(required, installed) <= 0) return;
-        setRelease(info);
-        setOpen(true);
-      } catch (error) {
-        console.warn('Could not check for Android updates:', error);
-        toast({
-          title: 'Update check failed',
-          description: 'Veyra could not reach the release server. You are still running the current version.',
-          variant: 'destructive',
-        });
-      }
-    })();
-    return () => { cancelled = true; };
+    const onManualCheck = () => void checkForUpdate();
+    window.addEventListener('veyra:check-app-updates', onManualCheck);
+    return () => window.removeEventListener('veyra:check-app-updates', onManualCheck);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Auto-start the download as soon as an update is found — the native side

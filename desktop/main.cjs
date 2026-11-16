@@ -96,6 +96,14 @@ ipcMain.handle('veyra:set-session-token', (_event, token) => {
 ipcMain.handle('veyra:clear-session-token', () => {
   try { fs.unlinkSync(SESSION_PATH); } catch {}
 });
+ipcMain.handle('veyra:get-version', () => app.getVersion());
+// Updates are manual-only: the renderer triggers this from Settings. The app
+// is a web shell, so installed builds stay on their version until the user
+// asks for an update.
+ipcMain.handle('veyra:check-updates', () => {
+  void checkForUpdates();
+  return true;
+});
 ipcMain.handle('veyra:open-external', async (_event, target) => {
   const url = new URL(String(target));
   if (!APP_ORIGINS.has(url.origin) || url.protocol !== 'https:') throw new Error('Only Veyra sign-in links can be opened.');
@@ -326,12 +334,8 @@ app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return;
   if (!app.isDefaultProtocolClient('veyra')) app.setAsDefaultProtocolClient('veyra');
   createWindow();
-  // Update checks run in the background so a slow or unreachable release
-  // feed can never block or break app startup. Re-check every 6 hours so a
-  // release published while Veyra stays open is still picked up.
-  void checkForUpdates();
-  const updateTimer = setInterval(() => void checkForUpdates(), 6 * 60 * 60 * 1000);
-  updateTimer.unref?.();
+  // No automatic update checks — the user triggers them from Settings. The
+  // shell only needs a new binary for native changes anyway.
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });

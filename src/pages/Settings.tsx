@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
-import { apiFetch } from "@/lib/nativeSession";
+import { apiFetch, isNativeVeyraApp } from "@/lib/nativeSession";
+import { Capacitor } from "@capacitor/core";
+import { App } from "@capacitor/app";
 import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/components/ThemeProvider";
 import { Button } from "@/components/ui/button";
@@ -11,7 +13,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "@/hooks/use-toast";
 import { exceedsMaxUploadSize, MAX_UPLOAD_SIZE_BYTES, MAX_UPLOAD_SIZE_LABEL } from "@/lib/uploadLimits";
-import { ArrowLeft, Camera, Sun, Moon, Monitor, LogOut, User, Bell, Palette, Shield, Image as ImageIcon } from "lucide-react";
+import { ArrowLeft, Camera, Sun, Moon, Monitor, LogOut, User, Bell, Palette, Shield, Image as ImageIcon, Download } from "lucide-react";
 import NotificationSettings from "@/components/settings/NotificationSettings";
 import PasswordSettings from "@/components/settings/PasswordSettings";
 import PrivacySettings from "@/components/settings/PrivacySettings";
@@ -99,6 +101,25 @@ export default function Settings() {
   const [uploadingBanner, setUploadingBanner] = useState(false);
   const [cropFile, setCropFile] = useState<File | null>(null);
   const [cropBannerFile, setCropBannerFile] = useState<File | null>(null);
+  const [shellVersion, setShellVersion] = useState<string | null>(null);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+
+  // Native shells only: show the installed binary version in the updates card.
+  useEffect(() => {
+    if (!isNativeVeyraApp()) return;
+    void (async () => {
+      try {
+        if (window.veyraDesktop?.getVersion) {
+          setShellVersion(await window.veyraDesktop.getVersion());
+        } else if (Capacitor.isNativePlatform()) {
+          const info = await App.getInfo();
+          if (info?.version) setShellVersion(info.version);
+        }
+      } catch {
+        // Version display is cosmetic — ignore failures.
+      }
+    })();
+  }, []);
 
   const [avatarNextAt, setAvatarNextAt] = useState<number | null>(null);
   const [usernameNextAt, setUsernameNextAt] = useState<number | null>(null);
@@ -767,6 +788,43 @@ export default function Settings() {
           <TabsContent value="account" className="space-y-6 mt-6">
             <PasswordSettings />
             <PrivacySettings />
+
+            {isNativeVeyraApp() && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Download className="h-5 w-5" />
+                    App updates
+                  </CardTitle>
+                  <CardDescription>
+                    The app only needs a new download when the native shell changes — the chat itself is always up to date.
+                    {shellVersion ? ` Installed version: ${shellVersion}.` : ""}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <Button
+                    variant="outline"
+                    disabled={checkingUpdates}
+                    onClick={() => {
+                      setCheckingUpdates(true);
+                      try {
+                        if (window.veyraDesktop?.checkForUpdates) {
+                          void window.veyraDesktop.checkForUpdates();
+                        } else {
+                          window.dispatchEvent(new Event("veyra:check-app-updates"));
+                        }
+                      } finally {
+                        // The native side takes over from here (update window
+                        // on desktop, dialog on Android) — nothing to await.
+                        setTimeout(() => setCheckingUpdates(false), 1500);
+                      }
+                    }}
+                  >
+                    {checkingUpdates ? "Checking…" : "Check for updates"}
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
 
             <Card>
               <CardHeader>

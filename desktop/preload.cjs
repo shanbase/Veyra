@@ -10,4 +10,6 @@ contextBridge.exposeInMainWorld('veyraDesktop', {
     ipcRenderer.on('veyra:pair-callback', listener);
   },
   showNotification: (title, body) => ipcRenderer.send('veyra:show-notification', { title, body }),
+  checkForUpdates: () => ipcRenderer.invoke('veyra:check-updates'),
+  getVersion: () => ipcRenderer.invoke('veyra:get-version'),
 });

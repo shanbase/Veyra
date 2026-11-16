@@ -14,6 +14,8 @@ declare global {
       clearSessionToken(): Promise<void>;
       onPairCallback(callback: (url: string) => void): void;
       showNotification?(title: string, body: string): void;
+      checkForUpdates?(): Promise<unknown>;
+      getVersion?(): Promise<string>;
     };
   }
 }
