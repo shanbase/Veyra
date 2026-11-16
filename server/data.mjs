@@ -9,7 +9,7 @@ import { publishMariaDbChanges } from './realtime.mjs';
 const TABLES = new Set([
   'admin_logs', 'announcement_messages', 'blocked_users', 'conversation_members',
   'conversations', 'friend_requests', 'global_messages', 'message_reactions',
-  'messages', 'native_push_tokens', 'notification_digest_state',
+  'messages', 'message_reports', 'native_push_tokens', 'notification_digest_state',
   'notification_preferences', 'notification_trigger_events', 'pinned_conversations',
   'poll_options', 'poll_votes', 'polls', 'profiles', 'user_roles',
 ]);
@@ -87,6 +87,14 @@ async function policy(table, userId, operation) {
   };
 
   if (table === 'notification_trigger_events') return { sql: '1 = 0', args: [] };
+  if (table === 'message_reports') {
+    if (admin) return { sql: '1 = 1', args: [] };
+    // Reports are write-only for regular users — nobody reads other people's
+    // reports back through the generic data API.
+    return operation === 'insert'
+      ? { sql: 'reporter_id = ?', args: [userId] }
+      : { sql: '1 = 0', args: [] };
+  }
   if (table === 'admin_logs') return admin
     ? { sql: operation === 'insert' ? '1 = 1' : '1 = 1', args: [] }
     : { sql: '1 = 0', args: [] };
@@ -612,6 +620,12 @@ async function canInsert(table, row, userId, access) {
   if (table === 'profiles') return row.id === userId;
   if (table === 'user_roles') return await isSuperAdmin(userId) && ['user', 'admin', 'super_admin'].includes(row.role);
   if (table === 'notification_trigger_events') return false;
+  if (table === 'message_reports') {
+    return row.reporter_id === userId
+      && ['messages', 'global_messages', 'announcement_messages'].includes(row.message_table)
+      && typeof row.message_id === 'string' && row.message_id.length > 0 && row.message_id.length <= 64
+      && (row.reason == null || String(row.reason).length <= 2000);
+  }
   if (table === 'notification_preferences' || table === 'notification_digest_state' || table === 'native_push_tokens' || table === 'pinned_conversations') return row.user_id === userId;
   if (table === 'blocked_users') return row.blocker_id === userId && row.blocked_id !== userId;
   if (table === 'friend_requests') {

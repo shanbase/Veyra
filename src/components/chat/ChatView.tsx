@@ -12,12 +12,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -46,8 +40,8 @@ import { MessageMarkdown } from "@/components/chat/MessageMarkdown";
 import { Textarea } from "@/components/ui/textarea";
 import { AutoResizeTextarea } from "./AutoResizeTextarea";
 import { VoiceRecordingIndicator } from "@/components/chat/VoiceRecordingIndicator";
-import { 
-  Send, Check, CheckCheck, Clock, MoreVertical, Pencil, X, 
+import {
+  Send, Check, CheckCheck, Clock, MoreHorizontal, Pencil, X,
   Trash2, Smile, ArrowLeft, ImagePlus, ArrowDown, Reply,
   ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff
 } from "lucide-react";
@@ -80,6 +74,9 @@ import { GroupSettingsDialog } from "@/components/chat/GroupSettingsDialog";
 import { handleMessageRealtimePayload, handleReactionRealtimePayload } from "./messageRealtime";
 import { fetchConversationMessages } from "./messageFetch";
 import { reconcileLiveMessage as reconcileLiveMessageState } from "./reconcileMessage";
+import { MessageActionMenu, type MessageActionMenuState } from "./MessageActionMenu";
+import { ForwardMessageDialog } from "./ForwardMessageDialog";
+import { ReportMessageDialog } from "./ReportMessageDialog";
 
 
 
@@ -441,6 +438,9 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const [profileUserId, setProfileUserId] = useState<string | null>(null);
   const [mobileActionMessage, setMobileActionMessage] = useState<Message | null>(null);
+  const [actionMenu, setActionMenu] = useState<MessageActionMenuState | null>(null);
+  const [forwardMessage, setForwardMessage] = useState<Message | null>(null);
+  const [reportMessage, setReportMessage] = useState<Message | null>(null);
   const [myUsername, setMyUsername] = useState<string | null>(null);
   const [notifPrefs, setNotifPrefs] = useState<Record<string, unknown> | null>(null);
   const desktopDigestRef = useRef<Record<string, number>>({});
@@ -1630,6 +1630,50 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     }
   };
 
+  // Shared dispatcher for the Discord-style message menu (right-click and the
+  // hover "…" button both feed into this).
+  const handleMessageMenuAction = (menuMessage: Message, action: string) => {
+    if (action.startsWith("react:")) {
+      void toggleReaction(menuMessage.id, action.slice("react:".length));
+      return;
+    }
+    switch (action) {
+      case "reply":
+        setReplyingTo(menuMessage);
+        break;
+      case "edit":
+        startEditing(menuMessage);
+        break;
+      case "react":
+        setOpenEmojiPopover(`inline-${menuMessage.id}`);
+        break;
+      case "delete":
+        setDeleteMessageId(menuMessage.id);
+        break;
+      case "pin":
+        void togglePin(menuMessage);
+        break;
+      case "forward":
+        setForwardMessage(menuMessage);
+        break;
+      case "copyText":
+        void navigator.clipboard
+          .writeText(menuMessage.content || "")
+          .then(() => toast({ title: "Copied to clipboard" }))
+          .catch(() => toast({ title: "Copy failed", variant: "destructive" }));
+        break;
+      case "copyId":
+        void navigator.clipboard
+          .writeText(menuMessage.id)
+          .then(() => toast({ title: "Message ID copied" }))
+          .catch(() => toast({ title: "Copy failed", variant: "destructive" }));
+        break;
+      case "report":
+        setReportMessage(menuMessage);
+        break;
+    }
+  };
+
   const getStatusIcon = (message: Message, isOwn: boolean, showReadStatus = true) => {
     if (!isOwn) return null;
     if (!showReceipts) return null;
@@ -2130,7 +2174,9 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
 
                   style={{ willChange: 'transform' }}
                   onContextMenu={(e) => {
-                    if (isMobile) e.preventDefault();
+                    e.preventDefault();
+                    if (isMobile) return;
+                    setActionMenu({ x: e.clientX, y: e.clientY, message });
                   }}
                   onTouchStart={(e) => {
                     if (!isMobile) return;
@@ -2607,38 +2653,22 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
                           </PopoverContent>
                         </Popover>
 
-                        {(isOwn || isSuperAdmin) && (
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <Button
-                                size="icon"
-                                variant="ghost"
-                                className="h-7 w-7"
-                              >
-                                <MoreVertical className="h-4 w-4" />
-                              </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end">
-                              <DropdownMenuItem onClick={() => togglePin(message)}>
-                                <Pin className="h-4 w-4 mr-2" />
-                                {message.is_pinned ? "Unpin" : "Pin"}
-                              </DropdownMenuItem>
-                              {message.content && (
-                                <DropdownMenuItem onClick={() => startEditing(message)}>
-                                  <Pencil className="h-4 w-4 mr-2" />
-                                  Edit {!isOwn && isSuperAdmin && "(Mod)"}
-                                </DropdownMenuItem>
-                              )}
-                              <DropdownMenuItem
-                                onClick={() => setDeleteMessageId(message.id)}
-                                className="text-destructive"
-                              >
-                                <Trash2 className="h-4 w-4 mr-2" />
-                                Delete {!isOwn && isSuperAdmin && "(Mod)"}
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                        )}
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          className="h-7 w-7"
+                          title="Message options"
+                          onClick={(e) => {
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            setActionMenu({
+                              x: Math.max(8, rect.right - 240),
+                              y: rect.bottom + 4,
+                              message,
+                            });
+                          }}
+                        >
+                          <MoreHorizontal className="h-4 w-4" />
+                        </Button>
                       </div>
                       )}
                     </div>
@@ -3022,6 +3052,28 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Discord-style message action menu (right-click / hover "…") */}
+      <MessageActionMenu
+        state={actionMenu}
+        isOwn={actionMenu?.message.sender_id === user?.id}
+        isSuperAdmin={isSuperAdmin}
+        canPost={canPost}
+        onAction={(action) => {
+          if (actionMenu) handleMessageMenuAction(actionMenu.message as Message, action);
+        }}
+        onClose={() => setActionMenu(null)}
+      />
+      <ForwardMessageDialog
+        message={forwardMessage}
+        excludeConversationId={conversationId}
+        onClose={() => setForwardMessage(null)}
+      />
+      <ReportMessageDialog
+        message={reportMessage}
+        messageTable={messagesTable}
+        onClose={() => setReportMessage(null)}
+      />
 
       {/* Lightbox for viewing images */}
       <Dialog open={lightboxImages.length > 0} onOpenChange={() => setLightboxImages([])}>

@@ -355,3 +355,17 @@ JOIN conversation_members a ON a.conversation_id = c.id
 JOIN conversation_members b ON b.conversation_id = c.id AND b.user_id > a.user_id
 WHERE c.is_group = 0
   AND (SELECT COUNT(*) FROM conversation_members cm WHERE cm.conversation_id = c.id) = 2;
+
+-- User-submitted message reports for moderator review. message_id is
+-- polymorphic across the three message tables, tracked by message_table.
+CREATE TABLE IF NOT EXISTS message_reports (
+  id CHAR(36) NOT NULL PRIMARY KEY,
+  message_table VARCHAR(32) NOT NULL,
+  message_id CHAR(36) NOT NULL,
+  reporter_id CHAR(36) NOT NULL,
+  reason TEXT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  KEY idx_message_reports_message (message_table, message_id),
+  KEY idx_message_reports_reporter (reporter_id),
+  CONSTRAINT fk_message_reports_reporter FOREIGN KEY (reporter_id) REFERENCES profiles(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

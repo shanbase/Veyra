@@ -384,3 +384,17 @@ JOIN conversation_members b ON b.conversation_id = c.id AND b.user_id > a.user_i
 WHERE c.is_group = FALSE
   AND (SELECT COUNT(*) FROM conversation_members cm WHERE cm.conversation_id = c.id) = 2
 ON CONFLICT DO NOTHING;
+
+-- User-submitted message reports for moderator review. message_id is
+-- polymorphic across the three message tables, tracked by message_table.
+CREATE TABLE IF NOT EXISTS message_reports (
+  id VARCHAR(36) NOT NULL PRIMARY KEY,
+  message_table VARCHAR(32) NOT NULL,
+  message_id VARCHAR(36) NOT NULL,
+  reporter_id VARCHAR(36) NOT NULL,
+  reason TEXT NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT NOW(),
+  CONSTRAINT fk_message_reports_reporter FOREIGN KEY (reporter_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_message_reports_message ON message_reports (message_table, message_id);
+CREATE INDEX IF NOT EXISTS idx_message_reports_reporter ON message_reports (reporter_id);

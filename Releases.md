@@ -18,6 +18,7 @@ Security-hardening and scale release on top of 1.2.6:
 - **Chat UX:** consecutive messages from the same sender within 5 minutes now group into a chain (avatar/name/timestamp shown once, per-message time on hover); delivery status is icon-only — clock while sending, single check sent, double check delivered/read.
 - **Attachment cap:** up to 10 files per message.
 - **Android self-update:** the app now downloads APK updates in-app with progress and hands off to the system installer automatically, instead of opening a browser page.
+- **Discord-style message menu:** right-click a message (or use the hover "…" button) for quick reactions, reply, edit (own messages), react, delete, forward, copy text, copy message ID, pin, and report. Forward sends a copy to any DM or group; reports land in the new `message_reports` table for moderator review.
 
 ### Downloads (once published)
 
