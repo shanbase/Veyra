@@ -183,9 +183,12 @@ export async function redisDeletePattern(pattern) {
   if (!redis) return 0;
   try {
     let deleted = 0;
-    for await (const key of redis.scanIterator({ MATCH: pattern, COUNT: 500 })) {
-      await redis.del(key);
-      deleted += 1;
+    // scanIterator yields batches of keys (arrays) in redis v6.
+    for await (const batch of redis.scanIterator({ MATCH: pattern, COUNT: 500 })) {
+      for (const key of batch) {
+        await redis.sendCommand(['DEL', key]);
+        deleted += 1;
+      }
     }
     return deleted;
   } catch (error) {
