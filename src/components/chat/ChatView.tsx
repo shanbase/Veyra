@@ -997,12 +997,39 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
 
   // Stick-to-bottom: whenever the tail message changes (send or receive),
   // snap to the latest — but only while the user hasn't scrolled up into
-  // history. Returning to the bottom re-engages via handleScroll.
+  // history. useLayoutEffect keeps the pin applied before paint so the jump
+  // is never visible as a flash. Returning to the bottom re-engages via
+  // handleScroll.
   const lastMessageId = messages.length ? messages[messages.length - 1].id : null;
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!stickToBottomRef.current || !lastMessageId) return;
     scrollToBottom("instant");
   }, [lastMessageId, scrollToBottom]);
+
+  // Height-pin: media finishing loading, edits, and reaction chips all resize
+  // the message list AFTER the tail-scroll above already ran — without this
+  // the view silently drifts off the bottom. While stuck, re-pin on any
+  // content resize (rAF-throttled so bursts coalesce).
+  useEffect(() => {
+    const viewport = scrollAreaRef.current?.querySelector(
+      "[data-radix-scroll-area-viewport]",
+    ) as HTMLElement | null;
+    const content = viewport?.firstElementChild as HTMLElement | null;
+    if (!viewport || !content) return;
+    let raf = 0;
+    const observer = new ResizeObserver(() => {
+      if (!stickToBottomRef.current) return;
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        if (stickToBottomRef.current) viewport.scrollTop = viewport.scrollHeight;
+      });
+    });
+    observer.observe(content);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(raf);
+    };
+  }, []);
 
   // Track the currently-loaded conversation so async writes (debounced cache
   // persistence, in-flight fetches) can refuse to apply when the conversation

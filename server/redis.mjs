@@ -2,6 +2,9 @@ import { createHash } from 'node:crypto';
 import { createClient } from 'redis';
 
 const redisUrl = String(process.env.REDIS_URL || '').trim();
+if (redisUrl && process.env.NODE_ENV === 'production' && redisUrl.startsWith('redis://')) {
+  console.warn('REDIS_URL uses redis:// without TLS; use rediss:// for encrypted transport in production.');
+}
 const inFlight = new Map();
 const MAX_IN_FLIGHT = 500;
 let client;
@@ -85,6 +88,17 @@ export async function cachedRead(userId, table, payload, operation) {
 
 const RATE_LIMIT_PREFIX = 'veyra:v1:ratelimit:';
 
+// Atomic INCR+PEXPIRE: a crash between separate commands could leave a
+// counter with no TTL (permanent lockout), and legacy no-TTL keys are
+// healed on the next hit. EVAL keeps it to a single roundtrip.
+const RATE_LIMIT_LUA = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 or redis.call('PTTL', KEYS[1]) == -1 then
+  redis.call('PEXPIRE', KEYS[1], ARGV[1])
+end
+return count
+`;
+
 // Fixed-window rate limit backed by Redis so limits hold across serverless
 // instances and restarts. Returns null when Redis is unavailable so callers
 // can fall back to their local in-memory limiter.
@@ -93,8 +107,7 @@ export async function consumeRateLimit(key, limit, windowMs) {
   if (!redis) return null;
   try {
     const fullKey = `${RATE_LIMIT_PREFIX}${key}`;
-    const count = await redis.incr(fullKey);
-    if (count === 1) await redis.pExpire(fullKey, windowMs);
+    const count = await redis.sendCommand(['EVAL', RATE_LIMIT_LUA, '1', fullKey, String(windowMs)]);
     return { allowed: count <= limit, count, limit };
   } catch (error) {
     console.warn('Redis rate limit failed; caller should use its fallback:', error.message);
@@ -252,10 +265,16 @@ export async function ezmsgMarkFailed(item, error) {
       error: String(error?.message || error),
       at: new Date().toISOString(),
     }));
+    // Cap the dead-letter list so a sustained drain failure cannot grow it
+    // without bound — keep the newest 1000 entries.
+    await redis.lTrim(EZMSG_FAILED, -1000, -1);
   } catch (redisError) { console.warn('EZMSG failure recording failed:', redisError.message); }
 }
 
-const ROLE_TTL_SECONDS = 300;
+// Short TTL: role changes are security-sensitive, so out-of-band edits
+// (direct SQL, another admin path) propagate within a minute even if the
+// explicit invalidation on user_roles writes is somehow bypassed.
+const ROLE_TTL_SECONDS = 60;
 
 // Admin/super-admin flags are read on nearly every API request. Cache them
 // per user; writes to user_roles invalidate the specific users' keys (see
