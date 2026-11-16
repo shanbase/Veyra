@@ -45,11 +45,9 @@ if (isProduction) {
 // This file is only the standalone/self-hosted entrypoint — Vercel uses
 // server/vercel-handler.mjs instead, so it always listens. Binding 0.0.0.0 is
 // required on container platforms (Altare allocates the port, not the host).
-// On EADDRINUSE we retry for a bounded window: zero-downtime platforms keep
-// the old version on the port until the new one is healthy, then release it —
-// exiting immediately just forces a failed deploy record and a restart.
-const EADDRINUSE_RETRY_MS = 90_000;
-const bindDeadline = Date.now() + EADDRINUSE_RETRY_MS;
+// On EADDRINUSE we exit immediately: zero-downtime platforms keep the old
+// version on the port until this process exits, then restart it — retrying
+// in-process just stalls the deploy.
 const server = app.listen(port, '0.0.0.0');
 
 server.once('listening', () => {
@@ -57,13 +55,6 @@ server.once('listening', () => {
 });
 
 server.on('error', (error) => {
-  if (error?.code === 'EADDRINUSE' && Date.now() < bindDeadline) {
-    console.warn(`Port ${port} still held by previous version; retrying bind…`);
-    // Not unref'd: the retry timer is what keeps the process alive while the
-    // platform finishes the zero-downtime handoff.
-    setTimeout(() => server.listen(port, '0.0.0.0'), 1000);
-    return;
-  }
   console.error('Veyra API failed to listen:', error);
   process.exit(1);
 });
