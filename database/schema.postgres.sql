@@ -399,3 +399,44 @@ CREATE TABLE IF NOT EXISTS message_reports (
 CREATE INDEX IF NOT EXISTS idx_message_reports_message ON message_reports (message_table, message_id);
 CREATE INDEX IF NOT EXISTS idx_message_reports_reporter ON message_reports (reporter_id);
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS is_forwarded BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- ---------------------------------------------------------------------------
+-- 1.2.8 additions (idempotent — safe to re-run on existing databases)
+-- ---------------------------------------------------------------------------
+
+-- Profile customization: manual presence mode plus structured social fields.
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS status_mode VARCHAR(20) NOT NULL DEFAULT 'online' CHECK (status_mode IN ('online','idle','do_not_disturb'));
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS interests JSONB NULL;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS languages_spoken JSONB NULL;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS profile_song JSONB NULL;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS profile_layout JSONB NULL;
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banner_media_kind VARCHAR(16) NOT NULL DEFAULT 'image' CHECK (banner_media_kind IN ('image','video'));
+ALTER TABLE profiles ADD COLUMN IF NOT EXISTS banner_media_duration_ms INTEGER NULL;
+ALTER TABLE friend_requests ADD COLUMN IF NOT EXISTS source VARCHAR(16) NOT NULL DEFAULT 'search' CHECK (source IN ('search','qr','link'));
+
+-- Public social links on a profile. Owner-managed rows; readable by anyone.
+CREATE TABLE IF NOT EXISTS profile_links (
+  id VARCHAR(36) NOT NULL PRIMARY KEY,
+  user_id VARCHAR(36) NOT NULL,
+  label VARCHAR(80) NOT NULL,
+  url VARCHAR(2048) NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT NOW(),
+  CONSTRAINT fk_profile_links_user FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_profile_links_user ON profile_links (user_id, position);
+
+-- QR friend codes. `code` is a bearer credential shown inside the user's QR
+-- code — treat it like a password: revocable (revoked_at) and rotatable.
+CREATE TABLE IF NOT EXISTS profile_friend_codes (
+  id VARCHAR(36) NOT NULL PRIMARY KEY,
+  user_id VARCHAR(36) NOT NULL,
+  code VARCHAR(64) NOT NULL,
+  auto_accept BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT NOW(),
+  rotated_at TIMESTAMP(3) NULL,
+  revoked_at TIMESTAMP(3) NULL,
+  CONSTRAINT uq_profile_friend_codes_user UNIQUE (user_id),
+  CONSTRAINT uq_profile_friend_codes_code UNIQUE (code),
+  CONSTRAINT fk_profile_friend_codes_user FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
+);

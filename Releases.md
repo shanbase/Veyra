@@ -4,6 +4,35 @@ GitHub Releases are the public update source for the Windows desktop and Android
 
 Both apps are web shells around the deployed site, so `latest.json` carries a `min_app_version` field (sourced from `minAppVersion` in `package.json`): apps only prompt for a native update when the installed shell is older than that floor. Bump `minAppVersion` only when the native shell itself changes (plugins, permissions, updater, failover) — website-only releases do not require an app update.
 
+## Veyra 1.2.8
+
+Reliability and profile-customization release on top of 1.2.7.
+
+### Reliability
+
+- **Per-bucket upload limits:** chat media now enforces the real Supabase bucket caps instead of one flat 25 MB — `chat-images`/`chat-videos` 50 MB, `chat-voice` 45 MB — mirrored client-side in `src/lib/uploadLimits.ts`. Profile images/banners keep the 25 MB cap.
+- **EZMSG write-behind hardened (`REDIS_EZMSG=true`):** the Redis queue is now FIFO (was LIFO), inserts are idempotent on the client-generated message ID (duplicate keys ack without re-publishing realtime or re-sending notifications), transient failures retry with exponential backoff, and permanent failures dead-letter immediately. Queue depth/retry/dead-letter stats are exposed to admins at `GET /api/admin/ezmsg-stats`.
+- **Animated profile banners:** banners accept MP4/WebM videos up to 5 seconds (muted, looping) in addition to images and GIFs; `banner_media_kind`/`banner_media_duration_ms` track which renderer to use.
+
+### Profile customization
+
+- **Presence modes:** profiles get `status_mode` — online, idle, or do-not-disturb. Do-not-disturb suppresses push/ntfy delivery (direct @mentions still get through) while the user remains online.
+- **Richer profiles:** interests tags, languages, social links (`profile_links` table), and a profile song (HTTPS audio URL with optional artwork) are editable in Settings and rendered on the profile dialog in the owner's chosen section order (`profile_layout`).
+- **QR friend codes:** every user gets a friend code (`profile_friend_codes` table) rendered as a QR in Settings at `/settings`. Codes rotate (60s cooldown), revoke, and support opt-in auto-accept. Friends scan the QR or open `/add-friend?code=…` to send a friend request — or be added instantly when auto-accept is on. Camera scanning uses the browser `BarcodeDetector` API with a manual-entry fallback.
+
+### Operations
+
+- **Database strategy documented:** [docs/database-replication.md](docs/database-replication.md) records the decision — MariaDB and PostgreSQL remain alternative primary databases (no live replication), with `db:migrate:postgres` for planned cutovers and managed backups/PITR for disaster recovery.
+- **Load-test harness:** `node scripts/load-test.mjs --url <staging> --users email:pass,...` measures login/send/history p50/p95/p99 under concurrent load.
+
+Requires `npm run db:migrate` for the new profile columns and tables (`profile_links`, `profile_friend_codes`, `friend_requests.source`, profile JSON fields).
+
+### Downloads (once published)
+
+- Windows: `Veyra1.2.8.exe`
+- Android: `AndroidVeyra1.2.8.apk`
+- Update metadata: `latest.json`
+
 ## Veyra 1.2.7
 
 Security-hardening, scale, and UX release on top of 1.2.6. Everything below shipped after the 1.2.6 tag.

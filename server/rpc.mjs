@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
 import { pool, isPostgres } from './db.mjs';
 import { encryptField } from './encryption.mjs';
 import { notifyNewMessage } from './notifications.mjs';
@@ -43,6 +43,7 @@ async function userDmList(userId) {
     `SELECT c.id AS conversation_id, other.user_id AS other_user_id,
       p.username AS other_username, p.display_name AS other_display_name,
       p.avatar_url AS other_avatar_url, p.status AS other_status,
+      p.status_mode AS other_status_mode,
       p.custom_status_text AS other_custom_status_text,
       p.custom_status_emoji AS other_custom_status_emoji,
       p.custom_status_expires_at AS other_custom_status_expires_at,
@@ -153,6 +154,11 @@ export async function callRpc(userId, name, args = {}) {
       const [rows] = await pool.execute('SELECT closed_at FROM polls WHERE id = ?', [args._poll_id]);
       return rows[0]?.closed_at ?? null;
     }
+    case 'get_my_friend_code': return getOrCreateFriendCode(userId);
+    case 'rotate_friend_code': return rotateFriendCode(userId);
+    case 'set_friend_code_auto_accept': return setFriendCodeAutoAccept(userId, args._enabled);
+    case 'revoke_friend_code': return revokeFriendCode(userId);
+    case 'redeem_friend_code': return redeemFriendCode(userId, args._code);
     case 'get_user_sessions':
     case 'revoke_user_session':
       throw new Error('Session management is not available through the data RPC API.');
@@ -283,6 +289,143 @@ export async function ensureDirectMessage(userId, otherId) {
 }
 
 const getOrCreateDm = ensureDirectMessage;
+
+// --- QR friend codes ---------------------------------------------------------
+// A friend code is a bearer credential embedded in the user's profile QR code.
+// It is stored plaintext (like a password equivalent) so the owner can re-render
+// the QR at any time; rotation and revocation are the mitigation, and redeem is
+// rate-limited by the /api/rpc route's shared throttles. Auto-accept is opt-in
+// per code and off by default.
+const FRIEND_CODE_LENGTH = 10;
+const FRIEND_CODE_ROTATE_COOLDOWN_MS = 60_000;
+// Unambiguous alphabet: no 0/O, 1/I/L.
+const FRIEND_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+const FRIEND_CODE_COLUMNS = 'id, code, auto_accept, created_at, rotated_at, revoked_at';
+
+function generateFriendCode() {
+  return [...randomBytes(FRIEND_CODE_LENGTH)]
+    .map((byte) => FRIEND_CODE_ALPHABET[byte % FRIEND_CODE_ALPHABET.length])
+    .join('');
+}
+
+async function getOrCreateFriendCode(userId) {
+  const [rows] = await pool.execute(`SELECT ${FRIEND_CODE_COLUMNS} FROM profile_friend_codes WHERE user_id = ? LIMIT 1`, [userId]);
+  if (rows[0]) {
+    if (rows[0].revoked_at) throw new Error('Your friend code was revoked. Generate a new one.');
+    return rows[0];
+  }
+  try {
+    await pool.execute('INSERT INTO profile_friend_codes (id, user_id, code) VALUES (?, ?, ?)', [randomUUID(), userId, generateFriendCode()]);
+  } catch (error) {
+    // Concurrent first-load race: the other request won the unique user_id.
+    if (error?.code !== 'ER_DUP_ENTRY') throw error;
+  }
+  const [created] = await pool.execute(`SELECT ${FRIEND_CODE_COLUMNS} FROM profile_friend_codes WHERE user_id = ? LIMIT 1`, [userId]);
+  if (!created[0]) throw new Error('Could not create a friend code.');
+  return created[0];
+}
+
+async function rotateFriendCode(userId) {
+  // DATETIME(3) columns store 'YYYY-MM-DD HH:MM:SS.mmm' — match that format so
+  // the comparison works identically on MariaDB and PostgreSQL.
+  const cutoff = new Date(Date.now() - FRIEND_CODE_ROTATE_COOLDOWN_MS).toISOString().slice(0, 23).replace('T', ' ');
+  const [rows] = await pool.execute(
+    `SELECT id, COALESCE(rotated_at, created_at) > ? AS rotated_recently FROM profile_friend_codes WHERE user_id = ? LIMIT 1`,
+    [cutoff, userId],
+  );
+  if (rows[0]?.rotated_recently) {
+    throw new Error('Please wait a minute before generating a new friend code.');
+  }
+  const code = generateFriendCode();
+  if (rows[0]) {
+    await pool.execute('UPDATE profile_friend_codes SET code = ?, rotated_at = CURRENT_TIMESTAMP(3), revoked_at = NULL WHERE id = ?', [code, rows[0].id]);
+  } else {
+    try {
+      await pool.execute('INSERT INTO profile_friend_codes (id, user_id, code) VALUES (?, ?, ?)', [randomUUID(), userId, code]);
+    } catch (error) {
+      if (error?.code !== 'ER_DUP_ENTRY') throw error;
+      await pool.execute('UPDATE profile_friend_codes SET code = ?, rotated_at = CURRENT_TIMESTAMP(3), revoked_at = NULL WHERE user_id = ?', [code, userId]);
+    }
+  }
+  return { code, rotated_at: new Date().toISOString() };
+}
+
+async function setFriendCodeAutoAccept(userId, enabled) {
+  const [result] = await pool.execute(
+    'UPDATE profile_friend_codes SET auto_accept = ? WHERE user_id = ? AND revoked_at IS NULL',
+    [boolParam(enabled === true || enabled === 'true' || enabled === 1 || enabled === '1'), userId],
+  );
+  if (!result.affectedRows) throw new Error('Generate a friend code first.');
+  return { auto_accept: Boolean(enabled === true || enabled === 'true' || enabled === 1 || enabled === '1') };
+}
+
+async function revokeFriendCode(userId) {
+  const [result] = await pool.execute(
+    'UPDATE profile_friend_codes SET revoked_at = CURRENT_TIMESTAMP(3) WHERE user_id = ? AND revoked_at IS NULL',
+    [userId],
+  );
+  return { revoked: result.affectedRows > 0 };
+}
+
+// Redeems a scanned/shared friend code. Auto-accept codes create an accepted
+// friendship directly (and the DM, matching the normal accept path); all other
+// codes create a normal pending request tagged source='qr'.
+async function redeemFriendCode(userId, rawCode) {
+  const code = String(rawCode || '').trim().toUpperCase();
+  if (!new RegExp(`^[A-Z2-9]{${FRIEND_CODE_LENGTH}}$`).test(code)) throw new Error('Invalid friend code.');
+  const [codes] = await pool.execute(
+    'SELECT id, user_id, auto_accept FROM profile_friend_codes WHERE code = ? AND revoked_at IS NULL LIMIT 1',
+    [code],
+  );
+  const owner = codes[0];
+  if (!owner) throw new Error('This friend code is invalid or has been revoked.');
+  if (owner.user_id === userId) throw new Error('This is your own friend code.');
+  const [blocked] = await pool.execute(
+    'SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1',
+    [userId, owner.user_id, owner.user_id, userId],
+  );
+  if (blocked.length) throw new Error('This user is unavailable.');
+
+  const [existing] = await pool.execute(
+    "SELECT id, status, sender_id, receiver_id FROM friend_requests WHERE (sender_id = ? AND receiver_id = ?) OR (sender_id = ? AND receiver_id = ?) LIMIT 1",
+    [userId, owner.user_id, owner.user_id, userId],
+  );
+  const friendship = existing[0];
+  if (friendship?.status === 'accepted') {
+    return { friend_request_id: friendship.id, status: 'accepted', sender_id: friendship.sender_id, receiver_id: friendship.receiver_id, other_user_id: owner.user_id, already: true };
+  }
+  if (friendship?.status === 'pending') {
+    return { friend_request_id: friendship.id, status: 'pending', sender_id: friendship.sender_id, receiver_id: friendship.receiver_id, other_user_id: owner.user_id, already: true };
+  }
+
+  let status = 'pending';
+  if (owner.auto_accept) {
+    status = 'accepted';
+  } else {
+    const [profiles] = await pool.execute('SELECT allow_friend_requests FROM profiles WHERE id = ? LIMIT 1', [owner.user_id]);
+    if (profiles[0] && !profiles[0].allow_friend_requests) {
+      throw new Error('This user is not accepting friend requests.');
+    }
+  }
+
+  const requestId = randomUUID();
+  try {
+    await pool.execute(
+      "INSERT INTO friend_requests (id, sender_id, receiver_id, status, source) VALUES (?, ?, ?, ?, 'qr')",
+      [requestId, userId, owner.user_id, status],
+    );
+  } catch (error) {
+    if (error?.code !== 'ER_DUP_ENTRY') throw error;
+    const [rows] = await pool.execute('SELECT id, status FROM friend_requests WHERE sender_id = ? AND receiver_id = ? LIMIT 1', [userId, owner.user_id]);
+    return { friend_request_id: rows[0]?.id ?? null, status: rows[0]?.status ?? 'pending', sender_id: userId, receiver_id: owner.user_id, other_user_id: owner.user_id, already: true };
+  }
+
+  if (status === 'accepted') {
+    // Mirror the data-API accept path, which creates the DM on acceptance.
+    await ensureDirectMessage(userId, owner.user_id).catch((error) => console.error('Friend-code DM creation failed:', error));
+  }
+  return { friend_request_id: requestId, status, sender_id: userId, receiver_id: owner.user_id, other_user_id: owner.user_id, already: false };
+}
 
 // Groups are capped so fan-out work (notifications, member lists, realtime
 // recipient resolution) stays bounded per message.

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { pool, isPostgres } from './db.mjs';
 import { ensureDirectMessage } from './rpc.mjs';
 import { notifyNewMessage } from './notifications.mjs';
-import { cachedRead, invalidateReadCache, redisGetJson, redisSetJson, cachedUserRoles, invalidateUserRole, ezmsgPush, ezmsgPop, ezmsgAck, ezmsgPending, ezmsgRecover, ezmsgMarkFailed } from './redis.mjs';
+import { cachedRead, invalidateReadCache, redisGetJson, redisSetJson, cachedUserRoles, invalidateUserRole, ezmsgPush, ezmsgPop, ezmsgAck, ezmsgPending, ezmsgRecover, ezmsgMarkFailed, ezmsgScheduleRetry, ezmsgMoveDueRetries, isTransientQueueError } from './redis.mjs';
 import { decryptRowsForTable, encryptRowForTable } from './encryption.mjs';
 import { publishMariaDbChanges } from './realtime.mjs';
 
@@ -12,6 +12,7 @@ const TABLES = new Set([
   'messages', 'message_reports', 'native_push_tokens', 'notification_digest_state',
   'notification_preferences', 'notification_trigger_events', 'pinned_conversations',
   'poll_options', 'poll_votes', 'polls', 'profiles', 'user_roles',
+  'profile_links', 'profile_friend_codes',
 ]);
 const columnCache = new Map();
 
@@ -101,6 +102,20 @@ async function policy(table, userId, operation) {
   if (table === 'profiles') return operation === 'select'
     ? { sql: '1 = 1', args: [] }
     : { sql: 'id = ?', args: [userId] };
+  if (table === 'profile_links') {
+    // Links are public profile content; only the owner writes them.
+    return operation === 'select'
+      ? { sql: '1 = 1', args: [] }
+      : { sql: 'user_id = ?', args: [userId] };
+  }
+  if (table === 'profile_friend_codes') {
+    // The code is a bearer credential: owner reads it for the QR card, but
+    // every mutation goes through the friend-code RPCs so rotation rate
+    // limits and redeem rules cannot be bypassed via the generic data API.
+    return operation === 'select'
+      ? { sql: 'user_id = ?', args: [userId] }
+      : { sql: '1 = 0', args: [] };
+  }
   if (table === 'user_roles') return await isSuperAdmin(userId)
     ? { sql: '1 = 1', args: [] }
     : { sql: 'user_id = ?', args: [userId] };
@@ -292,6 +307,7 @@ async function queryDataUncached(userId, payload) {
       if (columns.has('id') && !row.id) row.id = randomUUID();
       if (!await canInsert(table, row, userId, access)) throw new Error('Not allowed to insert this row.');
       const normalizedRow = normalizeRowTemporalValues(row, columns);
+      if (table === 'profiles') sanitizeProfileFields(normalizedRow);
       // EZMSG write-behind (REDIS_EZMSG=true): message inserts are queued in
       // Redis and persisted by the drain worker; the API still returns the
       // row shape immediately. Falls through to a direct insert when Redis
@@ -351,14 +367,17 @@ async function queryDataUncached(userId, payload) {
   }
 
   if (operation === 'update') {
-    const patch = encryptRowForTable(table, normalizeRowTemporalValues(payload.values || {}, columns));
+    const normalizedPatch = normalizeRowTemporalValues(payload.values || {}, columns);
+    if (table === 'profiles') sanitizeProfileFields(normalizedPatch);
+    if (table === 'profile_links') validateProfileLinkPatch(normalizedPatch);
+    const patch = encryptRowForTable(table, normalizedPatch);
     const keys = Object.keys(patch);
     for (const key of keys) identifier(key, columns);
     if (!keys.length) return { data: [], count: 0 };
     const protectedColumns = new Set(['id']);
     const protectedByTable = {
       profiles: ['id', 'created_at'], user_roles: ['user_id'], conversations: ['created_by', 'is_group', 'created_at'],
-      conversation_members: ['conversation_id', 'user_id', 'role', 'joined_at'], friend_requests: ['sender_id', 'receiver_id'],
+      conversation_members: ['conversation_id', 'user_id', 'role', 'joined_at'], friend_requests: ['sender_id', 'receiver_id', 'source'],
       // Receipt timestamps and thread linkage are server-managed: a sender
       // must not be able to forge read/delivered state or rewrite replies.
       // Content/edited_at/pin fields stay writable — the composer uses them.
@@ -370,6 +389,7 @@ async function queryDataUncached(userId, payload) {
       polls: ['created_by', 'conversation_id'], poll_options: ['poll_id'],
       poll_votes: ['poll_id', 'option_id', 'user_id'], notification_preferences: ['user_id'],
       notification_digest_state: ['user_id', 'channel_key'], native_push_tokens: ['user_id'],
+      profile_links: ['id', 'user_id', 'created_at'], profile_friend_codes: ['id', 'user_id', 'created_at'],
     };
     for (const column of protectedByTable[table] || []) protectedColumns.add(column);
     if (keys.some((key) => protectedColumns.has(key))) throw new Error('This field cannot be changed.');
@@ -430,6 +450,10 @@ async function queryDataUncached(userId, payload) {
 const EZMSG_ENABLED = process.env.REDIS_EZMSG === 'true' && !process.env.VERCEL;
 const EZMSG_DRAIN_BATCH = 200;
 const EZMSG_DRAIN_BUDGET_MS = 4000;
+// Transient failures retry with exponential backoff (1s → 2s → 5s → 15s →
+// 60s cap) up to this many attempts before dead-lettering.
+const EZMSG_MAX_ATTEMPTS = 8;
+const EZMSG_RETRY_DELAYS_MS = [1000, 2000, 5000, 15000, 60000];
 
 let ezmsgDraining = false;
 let ezmsgDrainTimer = null;
@@ -480,10 +504,19 @@ async function insertQueuedRow(item) {
   const keys = Object.keys(storedRow);
   for (const key of keys) identifier(key, columns);
   if (!keys.length) throw new Error('Queued message row is empty.');
-  await pool.execute(
-    `INSERT INTO \`${table}\` (${keys.map((key) => `\`${key}\``).join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`,
-    keys.map((key) => storedRow[key]),
-  );
+  try {
+    await pool.execute(
+      `INSERT INTO \`${table}\` (${keys.map((key) => `\`${key}\``).join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`,
+      keys.map((key) => storedRow[key]),
+    );
+  } catch (error) {
+    // Message ids are client-generated UUIDs, so a duplicate key means a
+    // previous drain already persisted this exact row (crash between insert
+    // and ack, or a retry overlap). Ack without re-publishing or re-notifying —
+    // the first successful insert already did both.
+    if (error?.code === 'ER_DUP_ENTRY') return { duplicate: true };
+    throw error;
+  }
   void notifyNewMessage(table, row).catch((error) => console.error('Notification delivery failed:', error));
   return { table, row, actorId };
 }
@@ -496,6 +529,9 @@ async function drainEzmsgQueue() {
       ezmsgRecovered = true;
       await ezmsgRecover();
     }
+    // Parked retries whose backoff expired go back onto the queue (tail = pop
+    // side) before new work is drained.
+    await ezmsgMoveDueRetries(EZMSG_DRAIN_BATCH);
     const deadline = Date.now() + EZMSG_DRAIN_BUDGET_MS;
     let processed = 0;
     const changesByActor = new Map();
@@ -513,6 +549,9 @@ async function drainEzmsgQueue() {
         const change = await insertQueuedRow(item);
         await ezmsgAck(raw);
         processed += 1;
+        // Duplicate-key recovery: the row is already persisted, so skip the
+        // realtime publish and notification fan-out the first insert ran.
+        if (change?.duplicate) continue;
         touchedTables.add(item.table);
         const list = changesByActor.get(item.actorId) || [];
         list.push({
@@ -524,8 +563,19 @@ async function drainEzmsgQueue() {
         });
         changesByActor.set(item.actorId, list);
       } catch (error) {
-        console.error(`EZMSG drain failed for ${item.table} row ${item.row?.id}:`, error);
-        await ezmsgMarkFailed(item, error);
+        const attempts = (Number(item.attempts) || 0) + 1;
+        const annotated = { ...item, attempts, lastError: String(error?.message || error) };
+        console.error(`EZMSG drain failed for ${item.table} row ${item.row?.id} (attempt ${attempts}):`, error);
+        if (isTransientQueueError(error) && attempts < EZMSG_MAX_ATTEMPTS) {
+          annotated.notBefore = Date.now() + EZMSG_RETRY_DELAYS_MS[Math.min(attempts - 1, EZMSG_RETRY_DELAYS_MS.length - 1)];
+          // If the delayed set is unavailable, fall back to an immediate
+          // requeue so the message is never dropped; the ack below may also
+          // no-op while Redis is down, leaving the item in processing for
+          // ezmsgRecover — the idempotent insert makes either path safe.
+          if (!await ezmsgScheduleRetry(annotated)) await ezmsgPush(annotated);
+        } else {
+          await ezmsgMarkFailed(annotated, error);
+        }
         await ezmsgAck(raw);
       }
     }
@@ -613,6 +663,146 @@ function messagePayloadAllowed(row) {
   return true;
 }
 
+// --- Profile customization validation (1.2.8) --------------------------------
+// Social/profile fields are public, so the API is the trust boundary: status
+// modes, JSON payloads, and link rows are normalized or rejected here rather
+// than trusted from the client.
+
+const PROFILE_STATUS_MODES = new Set(['online', 'idle', 'do_not_disturb']);
+const PROFILE_BANNER_MEDIA_KINDS = new Set(['image', 'video']);
+const MAX_BANNER_MEDIA_DURATION_MS = 10_000;
+const PROFILE_LAYOUT_SECTIONS = new Set(['bio', 'banner', 'links', 'interests', 'languages', 'song', 'custom_status', 'badges']);
+const MAX_PROFILE_INTERESTS = 10;
+const MAX_PROFILE_INTEREST_LENGTH = 32;
+const MAX_PROFILE_LANGUAGES = 10;
+const MAX_PROFILE_LANGUAGE_LABEL = 40;
+const MAX_PROFILE_LANGUAGE_CODE = 8;
+const MAX_PROFILE_SONG_URL = 2048;
+const MAX_PROFILE_LINKS = 10;
+const FRIEND_REQUEST_SOURCES = new Set(['search', 'qr', 'link']);
+
+function parseJsonField(value, label) {
+  if (value == null) return null;
+  if (typeof value === 'string') {
+    try { value = JSON.parse(value); } catch { throw new Error(`Invalid ${label}.`); }
+  }
+  return value;
+}
+
+function isHttpsUrl(value, maxLength = MAX_PROFILE_SONG_URL) {
+  return typeof value === 'string' && value.length <= maxLength && /^https:\/\//i.test(value);
+}
+
+// Mutates `row` in place, replacing raw client values with normalized ones.
+// Throws on anything outside the whitelist so bad payloads never reach SQL.
+function sanitizeProfileFields(row) {
+  if ('status_mode' in row) {
+    if (!PROFILE_STATUS_MODES.has(row.status_mode)) throw new Error('Invalid status mode.');
+  }
+  if ('banner_media_kind' in row) {
+    if (!PROFILE_BANNER_MEDIA_KINDS.has(row.banner_media_kind)) throw new Error('Invalid banner media kind.');
+  }
+  if ('banner_media_duration_ms' in row) {
+    const duration = row.banner_media_duration_ms;
+    if (duration != null) {
+      const parsed = Number(duration);
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > MAX_BANNER_MEDIA_DURATION_MS) {
+        throw new Error('Invalid banner media duration.');
+      }
+      row.banner_media_duration_ms = parsed;
+    }
+  }
+  if ('interests' in row) {
+    const value = parseJsonField(row.interests, 'interests');
+    if (value == null) { row.interests = null; }
+    else {
+      if (!Array.isArray(value)) throw new Error('Interests must be a list.');
+      const tags = [...new Set(value.map((entry) => String(entry ?? '').trim().toLowerCase()).filter(Boolean))];
+      if (tags.length > MAX_PROFILE_INTERESTS || tags.some((tag) => tag.length > MAX_PROFILE_INTEREST_LENGTH)) {
+        throw new Error('Too many or invalid interests.');
+      }
+      row.interests = JSON.stringify(tags);
+    }
+  }
+  if ('languages_spoken' in row) {
+    const value = parseJsonField(row.languages_spoken, 'languages');
+    if (value == null) { row.languages_spoken = null; }
+    else {
+      if (!Array.isArray(value)) throw new Error('Languages must be a list.');
+      const languages = value.map((entry) => {
+        if (typeof entry === 'string') {
+          const label = entry.trim();
+          if (!label || label.length > MAX_PROFILE_LANGUAGE_LABEL) throw new Error('Invalid language entry.');
+          return { code: '', label };
+        }
+        const label = String(entry?.label ?? '').trim();
+        const code = String(entry?.code ?? '').trim().toLowerCase();
+        if (!label || label.length > MAX_PROFILE_LANGUAGE_LABEL || code.length > MAX_PROFILE_LANGUAGE_CODE || !/^[a-z0-9-]*$/.test(code)) {
+          throw new Error('Invalid language entry.');
+        }
+        return { code, label };
+      });
+      if (languages.length > MAX_PROFILE_LANGUAGES) throw new Error('Too many languages.');
+      row.languages_spoken = JSON.stringify(languages);
+    }
+  }
+  if ('profile_song' in row) {
+    const value = parseJsonField(row.profile_song, 'profile song');
+    if (value == null) { row.profile_song = null; }
+    else {
+      if (typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid profile song.');
+      const title = String(value.title ?? '').trim();
+      const artist = String(value.artist ?? '').trim();
+      const url = String(value.url ?? '').trim();
+      const artworkUrl = value.artwork_url == null ? null : String(value.artwork_url).trim();
+      if (!title || title.length > 200 || artist.length > 200 || !isHttpsUrl(url) || (artworkUrl && !isHttpsUrl(artworkUrl))) {
+        throw new Error('Invalid profile song.');
+      }
+      row.profile_song = JSON.stringify({ title, artist, url, ...(artworkUrl ? { artwork_url: artworkUrl } : {}) });
+    }
+  }
+  if ('profile_layout' in row) {
+    const value = parseJsonField(row.profile_layout, 'profile layout');
+    if (value == null) { row.profile_layout = null; }
+    else {
+      if (!Array.isArray(value)) throw new Error('Invalid profile layout.');
+      const sections = [...new Set(value.map((entry) => String(entry)))];
+      if (sections.length > PROFILE_LAYOUT_SECTIONS.size || sections.some((section) => !PROFILE_LAYOUT_SECTIONS.has(section))) {
+        throw new Error('Invalid profile layout.');
+      }
+      row.profile_layout = JSON.stringify(sections);
+    }
+  }
+}
+
+function isValidProfileLink(row) {
+  const label = String(row.label ?? '').trim();
+  const url = String(row.url ?? '').trim();
+  const position = Number(row.position ?? 0);
+  return label.length > 0 && label.length <= 80
+    && url.length <= 2048 && /^https?:\/\//i.test(url)
+    && Number.isInteger(position) && position >= 0 && position <= 1000;
+}
+
+// Update patches are partial — validate only the fields being changed.
+function validateProfileLinkPatch(patch) {
+  if ('label' in patch) {
+    const label = String(patch.label ?? '').trim();
+    if (!label || label.length > 80) throw new Error('Invalid link label.');
+    patch.label = label;
+  }
+  if ('url' in patch) {
+    const url = String(patch.url ?? '').trim();
+    if (!url || url.length > 2048 || !/^https?:\/\//i.test(url)) throw new Error('Links must be http(s) URLs.');
+    patch.url = url;
+  }
+  if ('position' in patch) {
+    const position = Number(patch.position);
+    if (!Number.isInteger(position) || position < 0 || position > 1000) throw new Error('Invalid link position.');
+    patch.position = position;
+  }
+}
+
 async function canInsert(table, row, userId, access) {
   const admin = await isAdmin(userId);
   if (MESSAGE_TABLES.has(table) && !messagePayloadAllowed(row)) return false;
@@ -630,6 +820,7 @@ async function canInsert(table, row, userId, access) {
   if (table === 'blocked_users') return row.blocker_id === userId && row.blocked_id !== userId;
   if (table === 'friend_requests') {
     if (row.sender_id !== userId || row.receiver_id === userId || row.status !== 'pending') return false;
+    if (row.source != null && !FRIEND_REQUEST_SOURCES.has(row.source)) return false;
     const [recipient] = await pool.execute('SELECT allow_friend_requests FROM profiles WHERE id = ? LIMIT 1', [row.receiver_id]);
     if (!recipient[0]?.allow_friend_requests) return false;
     const [blocked] = await pool.execute('SELECT 1 FROM blocked_users WHERE (blocker_id = ? AND blocked_id = ?) OR (blocker_id = ? AND blocked_id = ?) LIMIT 1', [userId, row.receiver_id, row.receiver_id, userId]);
@@ -692,6 +883,11 @@ async function canInsert(table, row, userId, access) {
     return member.length > 0;
   }
   if (table === 'conversations') return row.created_by === userId;
+  if (table === 'profile_links') {
+    if (row.user_id !== userId || !isValidProfileLink(row)) return false;
+    const [countRows] = await pool.execute('SELECT COUNT(*) AS total FROM profile_links WHERE user_id = ?', [userId]);
+    return Number(countRows[0]?.total || 0) < MAX_PROFILE_LINKS;
+  }
   return access.sql !== '1 = 0' && admin;
 }
 

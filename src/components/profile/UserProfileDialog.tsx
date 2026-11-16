@@ -13,7 +13,15 @@ import { CustomStatusBubble } from "@/components/chat/CustomStatusBubble";
 import { stripBioHeadings } from "@/lib/bio";
 import { useAuth } from "@/hooks/useAuth";
 import { toast } from "sonner";
-import { Loader2, MessageSquare, UserPlus, UserCheck, UserX, Clock, Check, Ban, ShieldOff } from "lucide-react";
+import { Loader2, MessageSquare, UserPlus, UserCheck, UserX, Clock, Check, Ban, ShieldOff, Link2, Music } from "lucide-react";
+import {
+  parseLanguages,
+  parseProfileLayout,
+  parseProfileSong,
+  parseStringArray,
+  type ProfileLayoutSection,
+} from "@/lib/profileFields";
+import type { Json } from "@/integrations/supabase/types";
 
 interface UserProfileDialogProps {
   userId: string | null;
@@ -35,6 +43,19 @@ interface ProfileData {
   custom_status_text: string | null;
   custom_status_emoji: string | null;
   custom_status_expires_at: string | null;
+  status_mode: string | null;
+  interests: Json | null;
+  languages_spoken: Json | null;
+  profile_song: Json | null;
+  profile_layout: Json | null;
+  banner_media_kind: string | null;
+}
+
+interface ProfileLinkItem {
+  id: string;
+  label: string;
+  url: string;
+  position: number;
 }
 
 type ParsedGradient = { enabled: boolean; from: string; to: string } | null;
@@ -130,6 +151,7 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
   const { user } = useAuth();
   const navigate = useNavigate();
   const [profile, setProfile] = useState<ProfileData | null>(null);
+  const [links, setLinks] = useState<ProfileLinkItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [rel, setRel] = useState<RelState>("loading");
   const [requestId, setRequestId] = useState<string | null>(null);
@@ -170,7 +192,7 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
     supabase
       .from("profiles")
       .select(
-        "id, username, display_name, avatar_url, banner_url, banner_gradient, created_at, bio, pronouns, status, allow_friend_requests, custom_status_text, custom_status_emoji, custom_status_expires_at",
+        "id, username, display_name, avatar_url, banner_url, banner_gradient, created_at, bio, pronouns, status, allow_friend_requests, custom_status_text, custom_status_emoji, custom_status_expires_at, status_mode, interests, languages_spoken, profile_song, profile_layout, banner_media_kind",
       )
       .eq("id", userId)
       .maybeSingle()
@@ -179,6 +201,25 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
           setProfile(data as ProfileData | null);
           setLoading(false);
         }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+
+  useEffect(() => {
+    if (!userId) {
+      setLinks([]);
+      return;
+    }
+    let cancelled = false;
+    supabase
+      .from("profile_links")
+      .select("id, label, url, position")
+      .eq("user_id", userId)
+      .order("position", { ascending: true })
+      .then(({ data }) => {
+        if (!cancelled) setLinks((data as ProfileLinkItem[]) || []);
       });
     return () => {
       cancelled = true;
@@ -247,6 +288,74 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
         day: "numeric",
       })
     : null;
+
+  // ---- Profile customization (1.2.8) ----
+  const interests = parseStringArray(profile?.interests ?? null);
+  const languages = parseLanguages(profile?.languages_spoken ?? null);
+  const song = parseProfileSong(profile?.profile_song ?? null);
+  const layoutOrder = parseProfileLayout(profile?.profile_layout ?? null);
+  const statusModeLabel =
+    profile?.status_mode === "idle" ? "Idle"
+    : profile?.status_mode === "do_not_disturb" ? "Do not disturb"
+    : null;
+
+  const renderProfileSection = (section: ProfileLayoutSection) => {
+    const baseStyle = textColor ? { color: textColor } : undefined;
+    switch (section) {
+      case "bio":
+        return profile?.bio ? (
+          <div key="bio" className="mt-4 w-full text-left text-sm break-words" style={baseStyle}>
+            <MessageMarkdown content={stripBioHeadings(profile.bio)} />
+          </div>
+        ) : null;
+      case "links":
+        return links.length ? (
+          <div key="links" className="mt-4 w-full space-y-1.5">
+            {links.map((link) => (
+              <a
+                key={link.id}
+                href={link.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-2 text-sm text-primary hover:underline break-all"
+                style={mutedTextColor ? { color: mutedTextColor } : undefined}
+              >
+                <Link2 className="h-3.5 w-3.5 flex-shrink-0" />
+                <span className="font-medium">{link.label}</span>
+                <span className="truncate text-xs opacity-70">{link.url.replace(/^https?:\/\//, "")}</span>
+              </a>
+            ))}
+          </div>
+        ) : null;
+      case "interests":
+        return interests.length ? (
+          <div key="interests" className="mt-4 flex flex-wrap gap-1.5">
+            {interests.map((tag) => (
+              <span key={tag} className="rounded-full bg-muted px-2.5 py-0.5 text-xs">{tag}</span>
+            ))}
+          </div>
+        ) : null;
+      case "languages":
+        return languages.length ? (
+          <div key="languages" className="mt-4 w-full text-sm" style={mutedTextColor ? { color: mutedTextColor } : undefined}>
+            <p className="text-xs uppercase tracking-wide opacity-70 mb-1">Languages</p>
+            <p>{languages.map((entry) => entry.label).join(", ")}</p>
+          </div>
+        ) : null;
+      case "song":
+        return song ? (
+          <div key="song" className="mt-4 w-full rounded-lg border border-border/60 p-3">
+            <p className="flex items-center gap-1.5 text-xs uppercase tracking-wide opacity-70 mb-1">
+              <Music className="h-3 w-3" /> Profile song
+            </p>
+            <p className="text-sm font-medium" style={baseStyle}>{song.title}{song.artist ? ` — ${song.artist}` : ""}</p>
+            <audio controls preload="none" src={song.url} className="mt-2 w-full" />
+          </div>
+        ) : null;
+      default:
+        return null;
+    }
+  };
 
   // ---- Actions ----
 
@@ -553,9 +662,11 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
 
         {/* Banner */}
         <div className="h-[7.5rem] sm:h-36 w-full overflow-hidden bg-muted">
-          {profile?.banner_url && (
+          {profile?.banner_url && profile.banner_media_kind === "video" ? (
+            <video src={profile.banner_url} autoPlay muted loop playsInline className="h-full w-full object-cover" />
+          ) : profile?.banner_url ? (
             <img src={profile.banner_url} alt="" className="h-full w-full object-cover" />
-          )}
+          ) : null}
         </div>
 
         <div className="px-4 sm:px-5 pb-5 -mt-10 flex flex-col items-start text-left">
@@ -604,6 +715,14 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
                 {profile.pronouns}
               </p>
             )}
+            {statusModeLabel && (
+              <p
+                className="text-xs text-muted-foreground"
+                style={mutedTextColor ? { color: mutedTextColor } : undefined}
+              >
+                {statusModeLabel}
+              </p>
+            )}
           </div>
 
           {/* Action buttons */}
@@ -639,14 +758,8 @@ export function UserProfileDialog({ userId, onOpenChange }: UserProfileDialogPro
             </div>
           )}
 
-          {profile?.bio && (
-            <div
-              className="mt-4 w-full text-left text-sm break-words"
-              style={textColor ? { color: textColor } : undefined}
-            >
-              <MessageMarkdown content={stripBioHeadings(profile.bio)} />
-            </div>
-          )}
+          {/* Sections render in the owner's chosen order (profile_layout). */}
+          {layoutOrder.map((section) => renderProfileSection(section))}
 
           {joined && (
             <p
