@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
 import { WebSocket, WebSocketServer } from 'ws';
 import { pool } from './db.mjs';
 import { publishCallSignal, publishMariaDbChanges } from './realtime.mjs';
@@ -7,8 +10,8 @@ import { resolveSessionUser } from './auth.mjs';
 import { verifyCallTicket } from './call-tickets.mjs';
 import { sendCallInvitePush } from './notifications.mjs';
 
-// Voice calls carry raw PCM16 audio (16 kHz mono, 20 ms frames = 320 samples =
-// 640 bytes) over a WebSocket. The server keeps one pending frame per speaker
+// Voice calls carry encoded audio (Opus via WebCodecs when available, raw
+// PCM16 16 kHz mono 20 ms frames = 640 bytes otherwise) over a WebSocket. The server keeps one pending frame per speaker
 // and, on a 20 ms tick, mixes all pending frames and sends each participant a
 // single stream with their own contribution subtracted — so every client only
 // ever schedules one playback stream regardless of group size.
@@ -39,12 +42,28 @@ const MAX_AUDIO_PAYLOAD = 16 * 1024;
 // bandwidth and real loss concealment.
 let OPUS_OK = false;
 let OpusCtor = null;
-try {
-  const mod = await import('opusscript');
-  OpusCtor = mod.default || mod;
-  new OpusCtor(48000, 1, OpusCtor.Application?.VOIP ?? 2048).delete();
-  OPUS_OK = true;
-} catch { /* Opus unavailable — PCM path still works everywhere. */ }
+let opusInit = null;
+// Lazy + guarded: opusscript's wasm must exist on disk before we import it —
+// serverless bundles (Vercel) don't trace the .wasm, and a missing file aborts
+// the process asynchronously (uncatchable). Skipping the import entirely keeps
+// the API alive; PCM fallback covers audio when Opus is unavailable.
+function ensureOpus() {
+  if (!opusInit) {
+    opusInit = (async () => {
+      try {
+        const req = createRequire(import.meta.url);
+        const pkgDir = path.dirname(req.resolve('opusscript'));
+        if (!fs.existsSync(path.join(pkgDir, 'build', 'opusscript_native_wasm.wasm'))) return;
+        const mod = await import('opusscript');
+        const Ctor = mod.default || mod;
+        new Ctor(48000, 1, Ctor.Application?.VOIP ?? 2048).delete();
+        OpusCtor = Ctor;
+        OPUS_OK = true;
+      } catch { /* Opus unavailable — PCM path still works everywhere. */ }
+    })();
+  }
+  return opusInit;
+}
 
 const OPUS_TAG = 0x01;
 const OPUS_RATE = 48000;
@@ -448,6 +467,7 @@ wss.on('connection', (socket) => {
         sendJson(socket, { type: 'error', message: 'You are not allowed to join this call.' });
         return;
       }
+      await ensureOpus();
       socket.wantsOpus = OPUS_OK && msg.codec === 'opus';
       await handleJoin(socket, call, user);
       return;
