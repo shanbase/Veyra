@@ -41,12 +41,47 @@ type SessionEvents = {
   onError?: (message: string) => void;
 };
 
+// When VITE_CALL_SERVER_URL points at the dedicated call server (e.g. the
+// Altare veyra-calls app), REST calls go there cross-origin with a 60 s HMAC
+// ticket minted by the main API. Without it, calls stay on the same-origin
+// embedded endpoints (session cookie / native Bearer token).
+const CALL_API_BASE = String(import.meta.env.VITE_CALL_SERVER_URL || "").replace(/\/+$/, "");
+
+let ticketCache: { token: string; expiresAt: number } | null = null;
+
+async function getCallTicket() {
+  if (ticketCache && ticketCache.expiresAt > Date.now() + 5000) return ticketCache.token;
+  const response = await apiFetch("/api/calls/ticket", { method: "POST" });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok || !body.ticket) {
+    throw new Error(body.error || "Voice calls are not available on this server.");
+  }
+  ticketCache = { token: body.ticket, expiresAt: Date.now() + 45_000 };
+  return body.ticket as string;
+}
+
 async function callApi(path: string, init: RequestInit = {}) {
-  const response = await apiFetch(`/api/calls${path}`, {
+  if (!CALL_API_BASE) {
+    const response = await apiFetch(`/api/calls${path}`, {
+      ...init,
+      headers: { "Content-Type": "application/json", ...(init.headers || {}) },
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `Call request failed (${response.status}).`);
+    return body;
+  }
+  const ticket = await getCallTicket();
+  const response = await fetch(`${CALL_API_BASE}/api/calls${path}`, {
     ...init,
-    headers: { "Content-Type": "application/json", ...(init.headers || {}) },
+    credentials: "omit",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${ticket}`,
+      ...(init.headers || {}),
+    },
   });
   const body = await response.json().catch(() => ({}));
+  if (response.status === 401) ticketCache = null; // ticket expired mid-flight — refetch next time
   if (!response.ok) throw new Error(body.error || `Call request failed (${response.status}).`);
   return body;
 }
@@ -75,7 +110,16 @@ export function callState(conversationId: string) {
   }>;
 }
 
-function wsUrl() {
+async function wsUrl() {
+  if (CALL_API_BASE) {
+    // Remote call server: wss(s)://<call-host>/api/calls/ws?ticket=<ticket>
+    const ticket = await getCallTicket();
+    const url = new URL(CALL_API_BASE);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.pathname = "/api/calls/ws";
+    url.search = `ticket=${encodeURIComponent(ticket)}`;
+    return url.toString();
+  }
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   const base = `${proto}//${window.location.host}/api/calls/ws`;
   // Native apps authenticate API calls with a Bearer token, not cookies —

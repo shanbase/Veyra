@@ -1,0 +1,15 @@
+# Standalone voice-call server image for the Altare "veyra-calls" Docker app.
+# Built by .github/workflows/call-server-image.yml and pushed to GHCR —
+# Altare Docker Apps only run prebuilt images, they cannot build Dockerfiles.
+FROM node:20-alpine
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
+COPY server ./server
+
+EXPOSE 3001
+CMD ["node", "server/call-server.mjs"]

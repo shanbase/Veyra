@@ -3,6 +3,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import { pool } from './db.mjs';
 import { publishCallSignal } from './realtime.mjs';
 import { resolveSessionUser } from './auth.mjs';
+import { verifyCallTicket } from './call-tickets.mjs';
 
 // Voice calls carry raw PCM16 audio (16 kHz mono, 20 ms frames = 320 samples =
 // 640 bytes) over a WebSocket. The server keeps one pending frame per speaker
@@ -273,7 +274,7 @@ wss.on('connection', (socket) => {
         sendJson(socket, { type: 'error', message: 'Call is no longer active.' });
         return;
       }
-      const user = await resolveSessionUser(socket.sessionToken).catch(() => null);
+      const user = socket.user || null;
       if (!user || !(await isMember(call.conversationId, user.id))) {
         sendJson(socket, { type: 'error', message: 'You are not allowed to join this call.' });
         return;
@@ -318,9 +319,13 @@ wss.on('connection', (socket) => {
   socket.on('pong', () => { socket.isAlive = true; });
 });
 
-// ---- REST endpoints (registered behind authenticateRequest in app.mjs) ----
+// ---- REST endpoints ----
+// `authenticate` is injected so the same routes serve two deployments:
+// the main API passes authenticateRequest (session cookie/Bearer), while the
+// standalone call server passes callTicketAuth (short-lived HMAC tickets).
 
-export function registerCallRoutes(app) {
+export function registerCallRoutes(app, authenticate) {
+  app.use('/api/calls', authenticate);
   app.post('/api/calls/start', async (req, res) => {
     const conversationId = String(req.body?.conversation_id || '');
     if (!conversationId) return res.status(400).json({ error: 'conversation_id is required.' });
@@ -438,23 +443,50 @@ export function registerCallRoutes(app) {
 
 // ---- WebSocket upgrade (wired in server/index.mjs) ----
 
-export function handleCallUpgrade(req, socket, head) {
+// Auth for the standalone call server: callers present a short-lived HMAC
+// ticket minted by the main API (POST /api/calls/ticket). The ticket only
+// proves userId — the profile row supplies the display fields calls need.
+export function callTicketAuth(req, res, next) {
+  const header = String(req.headers.authorization || '');
+  const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
+  const userId = verifyCallTicket(token);
+  if (!userId) return res.status(401).json({ error: 'Invalid or expired call ticket.' });
+  pool.execute('SELECT id, username, display_name FROM profiles WHERE id = ? LIMIT 1', [userId])
+    .then(([rows]) => {
+      if (!rows.length) return res.status(401).json({ error: 'Unknown user.' });
+      req.user = rows[0];
+      next();
+    })
+    .catch(next);
+}
+
+async function resolveUpgradeUser(req) {
   const url = new URL(req.url || '/', 'http://localhost');
+  const ticket = url.searchParams.get('ticket');
+  if (ticket) {
+    const userId = verifyCallTicket(ticket);
+    if (!userId) return null;
+    const [rows] = await pool.execute(
+      'SELECT id, username, display_name FROM profiles WHERE id = ? LIMIT 1',
+      [userId],
+    );
+    return rows[0] || null;
+  }
   const token = url.searchParams.get('token')
     || String(req.headers.cookie || '').split(';').map((c) => c.trim()).find((c) => c.startsWith('veyra_session='))?.slice('veyra_session='.length);
-  if (!token) {
-    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-    socket.destroy();
-    return;
-  }
-  resolveSessionUser(decodeURIComponent(token)).then((user) => {
+  if (!token) return null;
+  return resolveSessionUser(decodeURIComponent(token)).catch(() => null);
+}
+
+export function handleCallUpgrade(req, socket, head) {
+  resolveUpgradeUser(req).then((user) => {
     if (!user) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      ws.sessionToken = token;
+      ws.user = { id: user.id, username: user.username, display_name: user.display_name };
       ws.binaryType = 'nodebuffer';
       wss.emit('connection', ws, req);
     });
