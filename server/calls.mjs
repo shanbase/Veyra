@@ -201,19 +201,29 @@ function mixTick() {
 
 function mixCall(call, now) {
     if (call.state === 'ended' || call.sockets.size === 0) return;
-    // Consume each speaker's pending frame exactly once per tick.
-    const speakers = [];
-    for (const [userId, entry] of call.audio) {
-      if (now - entry.at > STALE_FRAME_MS || entry.muted) {
-        call.audio.delete(userId);
-        continue;
+    // Per-speaker jitter buffer: each tick picks the queued frame whose
+    // arrival is closest to a ~30 ms playout target, so bursty network
+    // delivery smooths out instead of chopping whole frames.
+    const PLAYOUT_AGE_MS = 30;
+    const chosen = new Map();
+    for (const [userId, queue] of call.audio) {
+      while (queue.length && now - queue[0].at > STALE_FRAME_MS) queue.shift();
+      if (!queue.length) { call.audio.delete(userId); continue; }
+      const target = now - PLAYOUT_AGE_MS;
+      let best = 0;
+      let bestDelta = Infinity;
+      for (let i = 0; i < queue.length; i++) {
+        const d = Math.abs(queue[i].at - target);
+        if (d < bestDelta) { bestDelta = d; best = i; }
       }
-      speakers.push([userId, entry.frame]);
+      chosen.set(userId, queue[best]);
+      queue.splice(0, best + 1);
+      if (!queue.length) call.audio.delete(userId);
     }
-    if (!speakers.length) return;
+    if (!chosen.size) return;
 
     const total = new Int32Array(FRAME_SAMPLES);
-    for (const [, frame] of speakers) {
+    for (const { frame } of chosen.values()) {
       for (let i = 0; i < FRAME_SAMPLES; i++) total[i] += frame[i];
     }
 
@@ -222,7 +232,7 @@ function mixCall(call, now) {
       // Fresh buffer per recipient — reusing one Buffer across socket.send()
       // calls lets later writes corrupt frames still queued for earlier
       // recipients, which is what made audio arrive silent/garbled.
-      const own = call.audio.get(userId);
+      const own = chosen.get(userId);
       const view = new Int16Array(FRAME_SAMPLES);
       for (let i = 0; i < FRAME_SAMPLES; i++) {
         const sample = total[i] - (own ? own.frame[i] : 0);
@@ -231,7 +241,6 @@ function mixCall(call, now) {
       if (socket.bufferedAmount > 64 * 1024) continue; // slow consumer — drop
       try { socket.send(Buffer.from(view.buffer, view.byteOffset, FRAME_BYTES)); } catch { /* socket closing */ }
     }
-    call.audio.clear();
 }
 
 function parseAudioFrame(data) {
@@ -340,7 +349,12 @@ wss.on('connection', (socket) => {
       if (!call || call.state !== 'active' || socket.muted) return;
       const frame = parseAudioFrame(data);
       if (!frame) return;
-      call.audio.set(socket.userId, { frame, at: Date.now(), muted: false });
+      // Small per-speaker jitter queue (max ~240 ms) — latest-wins made
+      // bursty arrivals drop whole frames and sound robotic.
+      let queue = call.audio.get(socket.userId);
+      if (!queue) { queue = []; call.audio.set(socket.userId, queue); }
+      queue.push({ frame, at: Date.now() });
+      if (queue.length > 8) queue.shift();
       return;
     }
     let msg;

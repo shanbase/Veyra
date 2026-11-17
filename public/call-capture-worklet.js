@@ -7,6 +7,10 @@
 // This is deliberately simple DSP — no ML models, zero cost. The browser's
 // own RNNoise pipeline (echoCancellation/noiseSuppression constraints) does
 // the heavy lifting; this cleans up what leaks through.
+//
+// The input side is a Float32Array ring buffer — the previous JS-array +
+// splice() version did O(n) work per 128-sample quantum (~375x/sec) and was
+// a measurable source of capture glitches on slower devices.
 
 const TARGET_RATE = 16000;
 const FRAME_SAMPLES = 320;
@@ -15,10 +19,15 @@ class CallCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.step = sampleRate / TARGET_RATE;
-    this.pending = [];
-    this.outPos = 0;
     this.out = new Float32Array(FRAME_SAMPLES);
     this.outLen = 0;
+
+    // Ring buffer holding up to ~2 s of input at the device rate.
+    this.cap = Math.ceil(sampleRate * 2);
+    this.buf = new Float32Array(this.cap);
+    this.head = 0;   // index of oldest sample
+    this.count = 0;  // samples currently buffered
+    this.outPos = 0; // fractional read position within buffered input
 
     // --- noise suppression state (all at 16 kHz output rate) ---
     // One-pole high-pass ~120 Hz: kills wind rumble, desk thumps, DC offset.
@@ -36,6 +45,10 @@ class CallCaptureProcessor extends AudioWorkletProcessor {
     this.gateOpen = true;
   }
 
+  at(i) {
+    return this.buf[(this.head + i) % this.cap];
+  }
+
   emit() {
     // Measure this frame's level before filtering.
     let sumSq = 0;
@@ -46,7 +59,7 @@ class CallCaptureProcessor extends AudioWorkletProcessor {
     else this.noiseFloor += (rms - this.noiseFloor) * 0.002;
 
     // Hysteresis: once open, only close when clearly below the floor; once
-    // closed, only open clearly above it. The gate floor is shallow (0.35)
+    // closed, only open clearly above it. The gate floor is shallow (0.45)
     // so quiet voices stay audible instead of being crushed to a whisper.
     const openThresh = Math.max(this.noiseFloor * 2.5, 0.004);
     const closeThresh = openThresh * 0.5;
@@ -77,26 +90,34 @@ class CallCaptureProcessor extends AudioWorkletProcessor {
 
   process(inputs) {
     const channel = inputs[0] && inputs[0][0];
-    if (channel && channel.length) {
-      for (let i = 0; i < channel.length; i++) this.pending.push(channel[i]);
+    if (!channel || !channel.length) return true;
 
-      while (this.outPos + this.step <= this.pending.length) {
-        const i0 = Math.floor(this.outPos);
-        const frac = this.outPos - i0;
-        const a = this.pending[i0];
-        const b = this.pending[i0 + 1] || a;
-        this.out[this.outLen++] = a + (b - a) * frac;
-        this.outPos += this.step;
-        if (this.outLen === FRAME_SAMPLES) this.emit();
+    // Push this quantum into the ring, dropping the oldest samples if full
+    // (never happens in practice — the consumer keeps up).
+    for (let i = 0; i < channel.length; i++) {
+      if (this.count === this.cap) {
+        this.head = (this.head + 1) % this.cap;
+        this.count--;
       }
+      this.buf[(this.head + this.count) % this.cap] = channel[i];
+      this.count++;
+    }
 
-      const consumed = Math.floor(this.outPos);
-      if (consumed > 0) {
-        this.pending.splice(0, consumed);
-        this.outPos -= consumed;
-      }
-      // Safety valve: never let the backlog grow unboundedly.
-      if (this.pending.length > sampleRate) this.pending.splice(0, this.pending.length - sampleRate);
+    while (this.outPos + this.step <= this.count) {
+      const i0 = Math.floor(this.outPos);
+      const frac = this.outPos - i0;
+      const a = this.at(i0);
+      const b = i0 + 1 < this.count ? this.at(i0 + 1) : a;
+      this.out[this.outLen++] = a + (b - a) * frac;
+      this.outPos += this.step;
+      if (this.outLen === FRAME_SAMPLES) this.emit();
+    }
+
+    const consumed = Math.floor(this.outPos);
+    if (consumed > 0) {
+      this.head = (this.head + consumed) % this.cap;
+      this.count -= consumed;
+      this.outPos -= consumed;
     }
     return true;
   }
