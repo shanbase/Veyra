@@ -66,6 +66,7 @@ const UPSERT_CONFLICT = {
   conversation_members: 'conversation_id, user_id',
   conversations: 'id',
   friend_requests: 'sender_id, receiver_id',
+  gif_favorites: 'user_id, gif_id',
   global_messages: 'id',
   message_reactions: 'message_id, user_id, emoji',
   messages: 'id',

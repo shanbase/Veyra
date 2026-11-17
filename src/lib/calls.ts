@@ -181,6 +181,12 @@ export class CallSession {
       ws.addEventListener("close", onFail, { once: true });
     });
 
+    // AudioContext is created up-front for PLAYBACK even when the mic fails —
+    // mic-less users must still hear the call. It starts 'suspended' under
+    // autoplay policy; playFrame() keeps retrying resume() until it runs.
+    this.audioCtx = new AudioContext();
+    void this.audioCtx.resume().catch(() => {});
+
     // Mic is optional: users without one (or who deny permission) still join
     // and hear the call — the server simply receives no frames from them.
     await this.startMic().catch(() => {
@@ -198,20 +204,20 @@ export class CallSession {
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       video: false,
     });
-    this.audioCtx = new AudioContext();
-    const source = this.audioCtx.createMediaStreamSource(this.stream);
+    const source = this.audioCtx!.createMediaStreamSource(this.stream);
 
+    let workletReady = false;
     if (this.audioCtx.audioWorklet) {
       try {
         await this.audioCtx.audioWorklet.addModule("/call-capture-worklet.js");
-      } catch (error) {
-        for (const track of this.stream?.getTracks() || []) track.stop();
-        this.stream = null;
-        await this.audioCtx.close().catch(() => {});
-        this.audioCtx = null;
-        throw error;
+        workletReady = true;
+      } catch {
+        // Worklet failed to load — fall through to the ScriptProcessor path
+        // instead of giving up on the mic entirely.
       }
-      this.worklet = new AudioWorkletNode(this.audioCtx, "call-capture");
+    }
+    if (workletReady) {
+      this.worklet = new AudioWorkletNode(this.audioCtx!, "call-capture");
       this.worklet.port.onmessage = (event) => {
         if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.muted) {
           this.ws.send(event.data as ArrayBuffer);
@@ -294,7 +300,14 @@ export class CallSession {
   }
 
   private playFrame(buffer: ArrayBuffer) {
-    if (!this.audioCtx || buffer.byteLength < CALL_FRAME_SAMPLES * 2) return;
+    if (!this.audioCtx) {
+      // Playback context was never created (shouldn't happen) — skip.
+      return;
+    }
+    // Autoplay policy keeps the context 'suspended' until a user gesture;
+    // keep retrying on every frame — once it unblocks, audio starts flowing.
+    if (this.audioCtx.state === "suspended") void this.audioCtx.resume().catch(() => {});
+    if (buffer.byteLength < CALL_FRAME_SAMPLES * 2) return;
     const pcm = new Int16Array(buffer);
     const audioBuffer = this.audioCtx.createBuffer(1, CALL_FRAME_SAMPLES, CALL_SAMPLE_RATE);
     const channel = audioBuffer.getChannelData(0);

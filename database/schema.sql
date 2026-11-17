@@ -415,3 +415,16 @@ CREATE TABLE IF NOT EXISTS profile_friend_codes (
   UNIQUE KEY uq_profile_friend_codes_code (code),
   CONSTRAINT fk_profile_friend_codes_user FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+-- GIF picker favorites, one row per (user, gif). payload is the serialized
+-- GifItem JSON, AES-256-GCM encrypted at rest via server/encryption.mjs when
+-- MESSAGE_ENCRYPTION_KEY is configured (same model as message content).
+CREATE TABLE IF NOT EXISTS gif_favorites (
+  user_id CHAR(36) NOT NULL,
+  gif_id VARCHAR(64) NOT NULL,
+  payload TEXT NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (user_id, gif_id),
+  CONSTRAINT fk_gif_favorites_user FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

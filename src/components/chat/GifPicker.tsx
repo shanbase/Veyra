@@ -4,6 +4,7 @@ import { Input } from "@/components/ui/input";
 import { fetchTrendingGifs, searchGifs, type GifItem } from "@/lib/giphy";
 import {
   getFavoriteGifs,
+  hydrateGifFavorites,
   subscribeGifFavorites,
   toggleFavoriteGif,
 } from "@/lib/gifFavorites";
@@ -39,6 +40,10 @@ export function GifPicker({ onSelect, className }: GifPickerProps) {
     setFavorites(items);
     setFavoriteIds(new Set(items.map((gif) => gif.id)));
   }), []);
+
+  // Merge server-side favorites (encrypted gif_favorites rows) into the
+  // localStorage cache once per session.
+  useEffect(() => { void hydrateGifFavorites(); }, []);
 
   const searching = query.trim().length > 0;
 

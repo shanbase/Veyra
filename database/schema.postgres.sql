@@ -440,3 +440,15 @@ CREATE TABLE IF NOT EXISTS profile_friend_codes (
   CONSTRAINT uq_profile_friend_codes_code UNIQUE (code),
   CONSTRAINT fk_profile_friend_codes_user FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
 );
+
+
+-- GIF picker favorites, one row per (user, gif). payload is the serialized
+-- GifItem JSON, AES-256-GCM encrypted at rest via server/encryption.mjs.
+CREATE TABLE IF NOT EXISTS gif_favorites (
+  user_id VARCHAR(36) NOT NULL,
+  gif_id VARCHAR(64) NOT NULL,
+  payload TEXT NOT NULL,
+  created_at TIMESTAMP(3) NOT NULL DEFAULT NOW(),
+  CONSTRAINT pk_gif_favorites PRIMARY KEY (user_id, gif_id),
+  CONSTRAINT fk_gif_favorites_user FOREIGN KEY (user_id) REFERENCES profiles(id) ON DELETE CASCADE
+);

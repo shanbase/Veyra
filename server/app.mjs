@@ -9,7 +9,7 @@ import { authenticateRequest, registerAuthRoutes } from './auth.mjs';
 import { changesFromRpc, changeFromDataRequest, mariaDbRealtimeTopic, mariaDbConversationTopic, publishMariaDbChanges } from './realtime.mjs';
 import { getSupabaseAdmin } from './supabase-admin.mjs';
 import { invalidateReadCache, consumeRateLimit, redisGetJson, redisSetJson, ezmsgStats } from './redis.mjs';
-import { assertEncryptionConfig, encryptionEnabled } from './encryption.mjs';
+import { assertEncryptionConfig, encryptionEnabled, encryptField, decryptField } from './encryption.mjs';
 import { u3StorageEnabled, u3Config, u3ObjectUrl, u3PresignUpload, u3PresignDownload } from './storage.mjs';
 import { assertQueuesConfig } from './queues.mjs';
 import { registerCallRoutes } from './calls.mjs';
@@ -472,6 +472,69 @@ export function createApp() {
     } catch (error) {
       console.error('Chat media read signing failed:', error);
       res.status(503).json({ error: 'Chat media storage is unavailable.' });
+    }
+  });
+  // GIF picker favorites — synced per user so they follow the account across
+  // devices. `payload` is AES-256-GCM encrypted at rest like message content;
+  // decryptField tolerates plaintext rows and missing-key deployments.
+  app.get('/api/gif-favorites', async (req, res) => {
+    try {
+      const [rows] = await pool.execute(
+        'SELECT gif_id, payload FROM gif_favorites WHERE user_id = ? ORDER BY created_at DESC LIMIT 200',
+        [req.user.id],
+      );
+      const favorites = [];
+      for (const row of rows) {
+        try {
+          favorites.push(JSON.parse(decryptField(row.payload)));
+        } catch { /* skip a corrupt row rather than failing the whole list */ }
+      }
+      res.json({ favorites });
+    } catch (error) {
+      console.error('GIF favorites read failed:', error);
+      res.status(503).json({ error: 'Could not load GIF favorites.' });
+    }
+  });
+  app.post('/api/gif-favorites', async (req, res) => {
+    const gif = req.body?.gif;
+    const id = typeof gif?.id === 'string' ? gif.id.slice(0, 64) : '';
+    const previewUrl = typeof gif?.previewUrl === 'string' ? gif.previewUrl.slice(0, 2048) : '';
+    const sendUrl = typeof gif?.sendUrl === 'string' ? gif.sendUrl.slice(0, 2048) : '';
+    if (!id || !sendUrl || !/^https:\/\//.test(sendUrl)) {
+      return res.status(400).json({ error: 'Invalid GIF.' });
+    }
+    const limited = await consumeRequestRateLimit(`gif-favorites:${req.user.id}`, 120, 60_000);
+    if (limited && !limited.allowed) {
+      return res.status(429).json({ error: 'Too many favorite updates. Please slow down.' });
+    }
+    const clean = {
+      id,
+      title: String(gif?.title || 'GIF').slice(0, 200),
+      previewUrl: previewUrl || sendUrl,
+      sendUrl,
+      width: Number.isFinite(gif?.width) ? Math.max(0, Math.floor(gif.width)) : 0,
+      height: Number.isFinite(gif?.height) ? Math.max(0, Math.floor(gif.height)) : 0,
+    };
+    try {
+      await pool.execute(
+        'INSERT INTO gif_favorites (user_id, gif_id, payload) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE payload = VALUES(payload)',
+        [req.user.id, id, encryptField(JSON.stringify(clean))],
+      );
+      res.json({ ok: true });
+    } catch (error) {
+      console.error('GIF favorite save failed:', error);
+      res.status(503).json({ error: 'Could not save GIF favorite.' });
+    }
+  });
+  app.delete('/api/gif-favorites/:gifId', async (req, res) => {
+    const gifId = String(req.params.gifId || '').slice(0, 64);
+    if (!gifId) return res.status(400).json({ error: 'Invalid GIF id.' });
+    try {
+      await pool.execute('DELETE FROM gif_favorites WHERE user_id = ? AND gif_id = ?', [req.user.id, gifId]);
+      res.json({ ok: true });
+    } catch (error) {
+      console.error('GIF favorite delete failed:', error);
+      res.status(503).json({ error: 'Could not remove GIF favorite.' });
     }
   });
   // Mints a 60 s HMAC ticket for the standalone call server. Registered before

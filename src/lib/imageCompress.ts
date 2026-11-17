@@ -6,6 +6,13 @@ const MAX_DIMENSION = 1920; // px on the longest edge
 const TARGET_QUALITY = 0.82;
 // If the encoded output isn't meaningfully smaller than the original, keep the original.
 const MIN_SAVINGS_RATIO = 0.9;
+// Below this size the decode+encode cost exceeds the upload time it saves —
+// send the file as-is. Keeps small images feeling instant.
+const SKIP_COMPRESS_UNDER_BYTES = 400 * 1024;
+// AVIF encoding is CPU-heavy (canvas.toBlob can take seconds on large images).
+// Only attempt it when the file is big enough that the extra savings pay for
+// the wait; everything else goes straight to WebP.
+const AVIF_MIN_BYTES = 1.5 * 1024 * 1024;
 
 const SKIP_MIME = new Set([
   "image/gif", // animated frames would be lost
@@ -75,6 +82,7 @@ function canvasToBlob(
 export async function compressImageForUpload(file: File): Promise<File> {
   if (!file.type.startsWith("image/")) return file;
   if (SKIP_MIME.has(file.type)) return file;
+  if (file.size < SKIP_COMPRESS_UNDER_BYTES) return file;
 
   try {
     const bmp = await loadBitmap(file);
@@ -90,9 +98,10 @@ export async function compressImageForUpload(file: File): Promise<File> {
       if (!ctx) return file;
       bmp.draw(ctx, w, h);
 
-      // Try AVIF first when the browser can actually encode it, then WebP.
+      // Try AVIF first when the browser can actually encode it AND the file is
+      // large enough to justify the slow encode; then WebP.
       const candidates: Array<{ type: string; ext: string }> = [];
-      if (await supportsAvifEncode()) {
+      if (file.size >= AVIF_MIN_BYTES && (await supportsAvifEncode())) {
         candidates.push({ type: "image/avif", ext: "avif" });
       }
       candidates.push({ type: "image/webp", ext: "webp" });
