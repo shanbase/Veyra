@@ -12,9 +12,20 @@ Veyra supports self-hosted audio calls in 1:1 and group conversations. There is 
 
 Calls need a **long-running Node server** — the same process that serves the API on Altare (`server/index.mjs` / `server/start.mjs`). WebSockets share the app's HTTPS port, which Altare supports.
 
-**Vercel cannot host calls**: serverless functions have no persistent process and cannot accept WebSocket upgrades. On the Vercel deployment the call button fails with a toast and everything else keeps working.
+### Dedicated call server (recommended for Vercel frontends)
 
-No extra environment variables are required. The WS authenticates with the same session cookie as the web app, or `?token=` for native clients (Electron/Android send their Bearer session token).
+`server/call-server.mjs` runs ONLY the call API + audio socket, packaged as `ghcr.io/<owner>/veyra-call-server` by `.github/workflows/call-server-image.yml` and deployed as the Altare Docker app **veyra-calls** (Secondary team, `https://veyra-calls.go.altare.global`, 200% CPU / 3 GB / 5 GB, auto-updates on new `:latest` images).
+
+Cross-origin auth uses **60-second HMAC tickets**: the main API exposes `POST /api/calls/ticket` (normal session auth) and the call server verifies `CALL_TICKET_SECRET` — no cookies cross sites. To point a frontend at it, set:
+
+- `VITE_CALL_SERVER_URL=https://veyra-calls.go.altare.global` (build-time)
+- `CALL_TICKET_SECRET=<same value on both the API and call server>` (runtime)
+
+The call server env needs: `CALL_TICKET_SECRET`, `USE_MARIADB=false` + `POSTGRES_*`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (signalling), `NODE_ENV=production`.
+
+**Vercel cannot host calls itself**: serverless functions have no persistent process and cannot accept WebSocket upgrades. Without `VITE_CALL_SERVER_URL`, the Vercel deployment's call button fails with a toast and everything else keeps working. With it, Vercel frontends use the Altare call server.
+
+The Altare-hosted app (`veyra.go.altare.global`) works either way: embedded calls via session cookie by default, or the dedicated server when `VITE_CALL_SERVER_URL` is set at build time (then `CALL_TICKET_SECRET` must also be in its runtime env).
 
 ## Limits (v1)
 
