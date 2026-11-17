@@ -62,3 +62,10 @@ shape is a write fan-out inside the `pool` abstraction in `server/db.mjs`:
 
 Until then, treat the secondary database as a migration target and backup
 store, not a replica.
+
+## Live read replica (PostgreSQL, optional)
+
+
+When `POSTGRES_READ_URL` points at a streaming replica of the primary, `server/db.mjs` creates a second pool (`poolRead`) and `server/data.mjs` + `server/rpc.mjs` route user-facing SELECTs and read-only RPCs (DM/group lists, admin stats) to it. Writes, auth, membership checks, and receipt updates always use the primary pool. Replica lag is typically sub-second; clients still receive new rows instantly via Supabase Realtime broadcast, so brief replica lag does not lose messages.
+
+The replica itself is provisioned with `shanbase/postgresql` in replica mode (`PG_REPLICA_HOST` etc.) — see that repo for `pg_basebackup` bootstrap.

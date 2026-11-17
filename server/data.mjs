@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { pool, isPostgres } from './db.mjs';
+import { pool, poolRead, isPostgres } from './db.mjs';
 import { ensureDirectMessage } from './rpc.mjs';
 import { notifyNewMessage } from './notifications.mjs';
 import { cachedRead, invalidateReadCache, redisGetJson, redisSetJson, cachedUserRoles, invalidateUserRole, ezmsgPush, ezmsgPop, ezmsgAck, ezmsgPending, ezmsgRecover, ezmsgMarkFailed, ezmsgScheduleRetry, ezmsgMoveDueRetries, isTransientQueueError } from './redis.mjs';
@@ -324,17 +324,20 @@ async function queryDataUncached(userId, payload) {
   const whereArgs = [...filterArgs, ...access.args];
 
   if (operation === 'select') {
+    // User-facing reads may hit the read replica (poolRead === pool unless
+    // POSTGRES_READ_URL is configured). Writes and consistency-sensitive
+    // queries below always use the primary.
     const countRequested = payload.count === 'exact';
     let count = null;
     if (countRequested) {
-      const [countRows] = await pool.execute(`SELECT COUNT(*) AS total FROM \`${table}\` t WHERE ${whereSql}`, whereArgs);
+      const [countRows] = await poolRead.execute(`SELECT COUNT(*) AS total FROM \`${table}\` t WHERE ${whereSql}`, whereArgs);
       count = Number(countRows[0]?.total || 0);
     }
     if (payload.head) return { data: null, count };
     const order = (payload.order || []).map(({ column, ascending }) => `${identifier(column, columns)} ${ascending === false ? 'DESC' : 'ASC'}`).join(', ');
     const limit = Math.min(Math.max(Number(payload.limit ?? 100), 0), 500);
     const offset = Math.max(Number(payload.offset || 0), 0);
-    const [rows] = await pool.execute(
+    const [rows] = await poolRead.execute(
       `SELECT ${requested} FROM \`${table}\` t WHERE ${whereSql}${order ? ` ORDER BY ${order}` : ''} LIMIT ${limit} OFFSET ${offset}`,
       whereArgs,
     );

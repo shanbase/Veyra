@@ -265,8 +265,8 @@ async function runPg(client, sql, params) {
   }
 }
 
-function createPgPool() {
-  const pgPool = new pg.Pool(pgConfig());
+function createPgPool(config = pgConfig()) {
+  const pgPool = new pg.Pool(config);
   pgPool.on('error', (error) => console.error('PostgreSQL pool error:', error.message));
 
   // Pin each physical connection's timezone to UTC. The startup `options`
@@ -333,3 +333,28 @@ export const pool = isPostgres
       timezone: 'Z',
       decimalNumbers: true,
     });
+
+// Read replica: when POSTGRES_READ_URL is set (Postgres dialect only), user-
+// facing SELECTs go to the replica while writes/auth/consistency-sensitive
+// reads stay on the primary pool. Unset → poolRead is just `pool`.
+export const poolRead = (() => {
+  if (!isPostgres) return pool;
+  const url = String(process.env.POSTGRES_READ_URL || '').trim();
+  if (!url) return pool;
+  try {
+    const replica = createPgPool({
+      connectionString: url,
+      ssl: false,
+      max: Number(process.env.POSTGRES_READ_POOL_SIZE || 2),
+      idleTimeoutMillis: 5000,
+      connectionTimeoutMillis: 30000,
+      allowExitOnIdle: false,
+      options: '-c timezone=UTC',
+    });
+    replica.query('SELECT 1').catch((error) =>
+      console.error('Postgres read replica unreachable:', error?.message || error));
+    return replica;
+  } catch {
+    return pool;
+  }
+})();
