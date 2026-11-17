@@ -20,8 +20,8 @@ const configuredPoolSize = Number(
     ? process.env.POSTGRES_POOL_SIZE || process.env.MARIADB_POOL_SIZE || 1
     : process.env.MARIADB_POOL_SIZE || process.env.POSTGRES_POOL_SIZE || 1,
 );
-// Vercel creates multiple warm function instances. Keep each instance's
-// connection footprint deliberately small for Layerbase's 20-client Free cap.
+// Serverless hosts create multiple warm instances. Keep each instance's
+// connection footprint deliberately small for managed-database connection caps.
 const connectionLimit = Number.isFinite(configuredPoolSize)
   ? Math.min(Math.max(Math.floor(configuredPoolSize), 1), 2)
   : 1;

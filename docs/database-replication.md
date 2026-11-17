@@ -25,8 +25,8 @@ which is justified by the current scale targets.
 
 ### PostgreSQL
 
-- Enable WAL archiving or use a managed provider with point-in-time recovery
-  (Neon, Supabase, Layerbase, RDS). Target RPO ≤ 5 minutes, RTO ≤ 1 hour.
+- Enable WAL archiving or use a managed/self-hosted provider with
+  point-in-time recovery. Target RPO ≤ 5 minutes, RTO ≤ 1 hour.
 - `pg_dump` remains the portable fallback for planned snapshots.
 
 ### MariaDB

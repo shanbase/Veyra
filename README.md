@@ -15,6 +15,8 @@ Desktop and Android installers are built and released through GitHub Actions. Se
 - **Message content encryption:** sensitive message text (`messages`, `global_messages`, `announcement_messages` content and poll questions) is encrypted with AES-256-GCM on the server before reaching MariaDB. This is encryption at rest, not end-to-end encryption — the API decrypts for authorized reads and moderation. See [docs/message-encryption.md](docs/message-encryption.md).
 - **Optional Altare Queues:** background jobs such as notification delivery can be published to an external queue, fully disabled by default with inline fallback. See [docs/queues.md](docs/queues.md).
 
+For the full inventory of hosted services (Altare databases, Redis, U3 storage, Supabase Realtime, Sequenzy, Google OAuth, ntfy, FCM, hCaptcha, GIPHY), see [docs/services.md](docs/services.md).
+
 MariaDB, Google OAuth, and Sequenzy credentials stay on the server. The browser uses Supabase for Storage, presence, and receiving scoped change notices.
 
 ## Features
@@ -52,7 +54,7 @@ GRANT ALL PRIVILEGES ON veyra.* TO 'veyra_app'@'127.0.0.1';
 FLUSH PRIVILEGES;
 ```
 
-Copy `.env.example` to `.env.local` and set `MARIADB_*` values. `.env.local` is ignored by Git. For Vercel, use Layerbase's pooled connection details, set `MARIADB_SSL=true`, and keep the pool size at `1` (the server caps it at `2`). Layerbase's free MariaDB sleeps after inactivity, so its first connection can take longer while the database wakes.
+Copy `.env.example` to `.env.local` and set the database values. `.env.local` is ignored by Git. On serverless hosts (Vercel functions), use the provider's pooled connection endpoint, set `MARIADB_SSL=true` if the endpoint requires TLS, and keep the pool size at `1` (the server caps it at `2`). For the full service inventory — databases, Redis, storage, email, OAuth, push — see [docs/services.md](docs/services.md).
 
 To run on PostgreSQL instead, set `USE_MARIADB=false` and configure `POSTGRES_*` values (plain TCP, no TLS). `npm run db:migrate` then applies `database/schema.postgres.sql`. See [docs/postgres.md](docs/postgres.md) for details and caveats. For the primary/backup database strategy (independent environments + planned cutover, managed backups for DR), see [docs/database-replication.md](docs/database-replication.md).
 
@@ -98,7 +100,7 @@ Chat media uploads use per-bucket limits enforced by `/api/storage/chat-upload` 
 
 Create a Web application OAuth client and configure its consent screen in [Google Cloud Console](https://console.cloud.google.com/apis/credentials), following [Google's web server OAuth flow](https://developers.google.com/identity/protocols/oauth2/web-server). Add the public `APP_URL` origin to Authorized JavaScript origins and `APP_URL/api/auth/google/callback` to Authorized redirect URIs. For this Vercel deployment, use `https://veyra-pink-mu.vercel.app/api/auth/google/callback`. Put the client ID and secret in the API runtime environment. Google identities are stored by Google's stable `sub` identifier in MariaDB. Run `npm run db:migrate` before enabling Google sign-in. Supabase Auth is not involved.
 
-The project uses one Vercel Function for all `/api/*` requests, so it stays within the Hobby plan function limit; no proxy target or VPS is required. Add `MARIADB_HOST`, `MARIADB_PORT`, `MARIADB_DATABASE`, `MARIADB_USER`, and `MARIADB_PASSWORD` as Vercel environment variables. MariaDB must accept connections from Vercel Functions. A database bound only to `127.0.0.1` or a private network cannot be reached by Vercel. Add `APP_URL`, Google, Sequenzy, and other server-only settings there as well.
+The project uses one function for all `/api/*` requests on serverless hosts, and the same Express app runs directly under `npm start` on a Node server or Altare App Hosting. Add the `MARIADB_*`/`POSTGRES_*` (per `USE_MARIADB`), `APP_URL`, Google, Sequenzy, and other server-only settings to the hosting environment. `MARIADB_POOL_SIZE`/`POSTGRES_POOL_SIZE` are capped at two per instance and idle connections are released quickly to stay within small managed-database connection limits.
 
 ### Native app sign-in and account sync
 
@@ -147,7 +149,7 @@ npm run db:migrate
 npm start
 ```
 
-The Node server can host the compiled frontend and API on `PORT` (default `3001`). On Vercel, a single function runs the same Express API for all API paths; set the pooled Layerbase MariaDB connection and server secrets in Vercel's environment settings. `MARIADB_POOL_SIZE` is capped at two per function instance and idle connections are released quickly to reduce pressure on Layerbase's 20-connection Free limit.
+The Node server can host the compiled frontend and API on `PORT` (default `3001`). On Vercel, a single function runs the same Express API for all API paths; on Altare App Hosting the repo deploys automatically and `altr env set` manages runtime variables. Set the pooled database connection and server secrets in the host's environment settings. `MARIADB_POOL_SIZE`/`POSTGRES_POOL_SIZE` is capped at two per instance and idle connections are released quickly to reduce pressure on small managed-database connection limits.
 
 ## Attachment cleanup and notifications
 
@@ -182,6 +184,7 @@ Users without a `notification_preferences` row get schema defaults: DMs and anno
 | `npm run db:encrypt:messages` | Encrypt existing plaintext message rows (`-- --dry-run` to preview) |
 | `npm run db:grant-role` | Grant/revoke a user role: `npm run db:grant-role -- <username-or-email> <user\|admin\|super_admin\|none>` |
 | `npm run db:import:legacy` | Import Supabase Postgres app tables into the configured database |
+| `npm run SS:migrate:ALTR` | Copy Supabase Storage objects into Altare U3 buckets (`-- --dry-run`, `-- --rewrite-urls`) |
 | `npm run lint` | Run ESLint |
 | `npm test` | Run server unit tests |
 
