@@ -3,6 +3,12 @@ import { supabase } from "@/integrations/supabase/client";
 import { apiFetch } from '@/lib/nativeSession';
 
 const CHAT_BUCKETS = ["chat-images", "chat-videos", "chat-voice"];
+// U3 (Altare) bucket names -> logical bucket names used by /api/storage/*.
+const U3_BUCKET_TO_LOGICAL: Record<string, string> = {
+  "veyra-chat-images": "chat-images",
+  "veyra-chat-videos": "chat-videos",
+  "veyra-chat-voice": "chat-voice",
+};
 const DEFAULT_EXPIRES_IN_SECONDS = 60 * 60 * 6; // 6 hours
 const signedUrlCache = new Map<string, { url: string; expiresAt: number }>();
 const signingRequests = new Map<string, Promise<string>>();
@@ -78,11 +84,27 @@ function parseStorageUrl(url: string): { bucket: string; path: string } | null {
   }
 }
 
+// Altare U3 object URLs look like https://<bucket>.u3.altare.global/<key>.
+// Chat buckets are private there too — these URLs are canonical identifiers
+// that /api/storage/chat-read swaps for presigned GETs, same as Supabase.
+function parseU3StorageUrl(url: string): { bucket: string; path: string } | null {
+  try {
+    const u = new URL(url);
+    if (!u.hostname.endsWith(".u3.altare.global")) return null;
+    const bucket = U3_BUCKET_TO_LOGICAL[u.hostname.split(".")[0]];
+    if (!bucket) return null;
+    const path = decodeURIComponent(u.pathname.replace(/^\/+/, ""));
+    return path ? { bucket, path } : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function signChatUrl(
   url: string,
   expiresIn: number = DEFAULT_EXPIRES_IN_SECONDS
 ): Promise<string> {
-  const parsed = parseStorageUrl(url);
+  const parsed = parseStorageUrl(url) || parseU3StorageUrl(url);
   if (!parsed) return url;
   const cached = signedUrlCache.get(url);
   if (cached && cached.expiresAt > Date.now()) return cached.url;
@@ -149,7 +171,7 @@ export function collectMediaUrls(serialized: string | null | undefined): string[
 // signMessageMedia resolve instantly from the cache for these URLs.
 export async function prefetchChatUrls(urls: string[]) {
   const pending = [...new Set(urls)]
-    .map((url) => ({ url, parsed: parseStorageUrl(url) }))
+    .map((url) => ({ url, parsed: parseStorageUrl(url) || parseU3StorageUrl(url) }))
     .filter((entry): entry is { url: string; parsed: { bucket: string; path: string } } => Boolean(entry.parsed))
     .filter(({ url }) => {
       const cached = signedUrlCache.get(url);

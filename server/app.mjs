@@ -10,6 +10,7 @@ import { changesFromRpc, changeFromDataRequest, mariaDbRealtimeTopic, mariaDbCon
 import { getSupabaseAdmin } from './supabase-admin.mjs';
 import { invalidateReadCache, consumeRateLimit, redisGetJson, redisSetJson, ezmsgStats } from './redis.mjs';
 import { assertEncryptionConfig, encryptionEnabled } from './encryption.mjs';
+import { u3StorageEnabled, u3Config, u3ObjectUrl, u3PresignUpload, u3PresignDownload } from './storage.mjs';
 import { assertQueuesConfig } from './queues.mjs';
 
 const MAX_PROFILE_IMAGE_BYTES = 25 * 1024 * 1024;
@@ -321,6 +322,19 @@ export function createApp() {
     if (limited && !limited.allowed) {
       return res.status(429).json({ error: 'Too many uploads. Please slow down and try again.' });
     }
+    if (u3StorageEnabled()) {
+      const cfg = u3Config(bucket);
+      if (!cfg) return res.status(503).json({ error: 'Profile image storage is not configured.' });
+      try {
+        const path = `${req.user.id}/${bucket === 'avatars' ? 'avatar' : 'banner'}`;
+        const uploadUrl = await u3PresignUpload(bucket, path);
+        res.json({ mode: 'u3', path, uploadUrl, publicUrl: u3ObjectUrl(bucket, path), contentType });
+      } catch (error) {
+        console.error('Profile image upload link failed:', error);
+        res.status(503).json({ error: 'Profile image storage is not configured.' });
+      }
+      return;
+    }
     try {
       const path = `${req.user.id}/${bucket === 'avatars' ? 'avatar' : 'banner'}`;
       const { data, error } = await getSupabaseAdmin().storage.from(bucket).createSignedUploadUrl(path, { upsert: true });
@@ -359,6 +373,17 @@ export function createApp() {
     if (!Number.isFinite(size) || size <= 0 || size > maxBytes) {
       return res.status(413).json({ error: `Maximum file size is ${chatUploadLimitLabel(maxBytes)}.` });
     }
+    if (u3StorageEnabled()) {
+      if (!u3Config(bucket)) return res.status(503).json({ error: 'Chat media storage is not configured.' });
+      try {
+        const uploadUrl = await u3PresignUpload(bucket, path);
+        res.json({ mode: 'u3', path, uploadUrl, publicUrl: u3ObjectUrl(bucket, path), contentType });
+      } catch (error) {
+        console.error('Chat media upload link failed:', error);
+        res.status(503).json({ error: 'Chat media storage is not configured.' });
+      }
+      return;
+    }
     try {
       const { data, error } = await getSupabaseAdmin().storage.from(bucket).createSignedUploadUrl(path);
       if (error || !data?.token) throw error || new Error('Could not create upload link.');
@@ -393,6 +418,31 @@ export function createApp() {
           [scope, req.user.id],
         );
         if (!members.length) return res.status(403).json({ error: 'You cannot access this conversation media.' });
+      }
+      if (u3StorageEnabled()) {
+        // U3 mode: chat buckets stay private — membership was verified above,
+        // now mint short-lived presigned GETs. Cache them like the Supabase
+        // signed URLs (50 min of a 60 min lifetime).
+        const u3SignCacheKey = ({ bucket, path }) =>
+          `veyra:v1:sign:u3:${bucket}:${createHash('sha256').update(path).digest('hex').slice(0, 32)}`;
+        const signed = await Promise.all(validated.map(async ({ bucket, path }) => {
+          const key = u3SignCacheKey({ bucket, path });
+          const cached = await redisGetJson(key);
+          if (cached) return { key: `${bucket}/${path}`, url: cached };
+          const url = await u3PresignDownload(bucket, path).catch(() => null);
+          if (url) await redisSetJson(key, url, 3000);
+          return { key: `${bucket}/${path}`, url };
+        }));
+        if (batch) {
+          const urls = {};
+          for (const entry of signed) if (entry.url) urls[entry.key] = entry.url;
+          res.set('Cache-Control', 'private, max-age=300').json({ urls, expiresIn: 3600 });
+          return;
+        }
+        const url = signed[0]?.url;
+        if (!url) return res.status(404).json({ error: 'Media is missing or unavailable.' });
+        res.set('Cache-Control', 'private, max-age=300').json({ url, expiresIn: 3600 });
+        return;
       }
       // Signed URLs are bearer credentials but identical for every authorized
       // viewer of the same object — cache them in Redis for 50 minutes (the

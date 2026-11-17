@@ -9,7 +9,7 @@ Desktop and Android installers are built and released through GitHub Actions. Se
 - **MariaDB** stores the 19 messaging and product data tables plus the authentication tables for users, sessions, email tokens, and Google identities.
 - **MariaDB and the Node API** manage accounts, password hashes, sessions, email verification, and password recovery.
 - **Sequenzy** sends account verification and password reset emails through its transactional API.
-- **Supabase Storage** stores avatars, banners, chat images, videos, and voice messages.
+- **Supabase Storage or Altare U3** stores avatars, banners, chat images, videos, and voice messages. `USE_SUPABASESTORAGE=false` switches object storage to U3 buckets (chat buckets stay private behind membership-checked presigned URLs); Supabase remains required for Realtime and presence either way. See [docs/storage.md](docs/storage.md).
 - **Node.js** API and MariaDB power accounts and application data. The API can run on a server or as a Vercel Function.
 - **Supabase Realtime** carries presence and lightweight, member-scoped MariaDB change notices. Redis provides short-lived authenticated read caching, request coalescing, shared rate limiting, and a bounded retry queue for change notices; MariaDB remains the permanent source of truth.
 - **Message content encryption:** sensitive message text (`messages`, `global_messages`, `announcement_messages` content and poll questions) is encrypted with AES-256-GCM on the server before reaching MariaDB. This is encryption at rest, not end-to-end encryption — the API decrypts for authorized reads and moderation. See [docs/message-encryption.md](docs/message-encryption.md).

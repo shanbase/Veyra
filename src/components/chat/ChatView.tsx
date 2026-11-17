@@ -83,8 +83,20 @@ import { ReportMessageDialog } from "./ReportMessageDialog";
 const EXPIRED_ATTACHMENT_IMG = "/expired-attachment.png";
 async function uploadChatMedia(bucket: "chat-images" | "chat-videos" | "chat-voice", path: string, file: Blob) {
   const response = await apiFetch("/api/storage/chat-upload", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ bucket, path, contentType: file.type || "application/octet-stream", size: file.size }) });
-  const signed = await response.json() as { path?: string; token?: string; publicUrl?: string; error?: string };
-  if (!response.ok || !signed.path || !signed.token || !signed.publicUrl) throw new Error(signed.error || "Could not prepare the media upload.");
+  const signed = await response.json() as { mode?: string; path?: string; token?: string; uploadUrl?: string; publicUrl?: string; error?: string };
+  if (!response.ok || !signed.publicUrl) throw new Error(signed.error || "Could not prepare the media upload.");
+  if (signed.mode === "u3") {
+    // Altare U3: plain presigned PUT to S3 — no SDK needed.
+    if (!signed.uploadUrl) throw new Error("Could not prepare the media upload.");
+    const put = await fetch(signed.uploadUrl, {
+      method: "PUT",
+      body: file,
+      headers: { "Content-Type": file.type || "application/octet-stream" },
+    });
+    if (!put.ok) throw new Error(`Upload failed (${put.status}).`);
+    return signed.publicUrl;
+  }
+  if (!signed.path || !signed.token) throw new Error("Could not prepare the media upload.");
   const { error } = await supabase.storage.from(bucket).uploadToSignedUrl(signed.path, signed.token, file, { contentType: file.type || "application/octet-stream", cacheControl: "31536000, immutable" });
   if (error) throw error;
   return signed.publicUrl;

@@ -214,15 +214,25 @@ export default function Settings() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bucket, contentType, size: data.size }),
     });
-    const signedUpload = await signResponse.json() as { path?: string; token?: string; publicUrl?: string; error?: string };
-    if (!signResponse.ok || !signedUpload.path || !signedUpload.token || !signedUpload.publicUrl) {
+    const signedUpload = await signResponse.json() as { mode?: string; path?: string; token?: string; uploadUrl?: string; publicUrl?: string; error?: string };
+    if (!signResponse.ok || !signedUpload.publicUrl || (signedUpload.mode !== 'u3' && (!signedUpload.path || !signedUpload.token))) {
       throw new Error(signedUpload.error || 'Could not prepare the profile image upload.');
     }
 
-    const { error: uploadError } = await supabase.storage
-      .from(bucket)
-      .uploadToSignedUrl(signedUpload.path, signedUpload.token, data, { contentType, cacheControl: '3600' });
-    if (uploadError) throw uploadError;
+    if (signedUpload.mode === 'u3') {
+      if (!signedUpload.uploadUrl) throw new Error('Could not prepare the profile image upload.');
+      const put = await fetch(signedUpload.uploadUrl, {
+        method: 'PUT',
+        body: data,
+        headers: { 'Content-Type': contentType },
+      });
+      if (!put.ok) throw new Error(`Upload failed (${put.status}).`);
+    } else {
+      const { error: uploadError } = await supabase.storage
+        .from(bucket)
+        .uploadToSignedUrl(signedUpload.path!, signedUpload.token!, data, { contentType, cacheControl: '3600' });
+      if (uploadError) throw uploadError;
+    }
 
     const newUrl = signedUpload.publicUrl + `?t=${Date.now()}`;
 
