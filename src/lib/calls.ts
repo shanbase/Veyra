@@ -137,7 +137,9 @@ export class CallSession {
   private worklet: AudioWorkletNode | null = null;
   private stream: MediaStream | null = null;
   private nextPlayTime = 0;
-  private muted = false;
+  private muted = false;      // effective mute sent to the server/others
+  private userMuted = false;  // the user's own mute toggle
+  private deafened = false;   // deafen = self-mute + local playback mute
   private closed = false;
   private micDenied = false;
   readonly callId: string;
@@ -150,6 +152,8 @@ export class CallSession {
   }
 
   get isMuted() { return this.muted; }
+  get isUserMuted() { return this.userMuted; }
+  get isDeafened() { return this.deafened; }
   get isOpen() { return !this.closed && this.ws?.readyState === WebSocket.OPEN; }
   get hasMic() { return !this.micDenied; }
 
@@ -201,7 +205,18 @@ export class CallSession {
   private async startMic() {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone API unavailable.");
     this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+        // Chrome/Edge expose stronger RNNoise-based processing through the
+        // non-standard goog* constraints — ignored harmlessly elsewhere.
+        googEchoCancellation: true,
+        googNoiseSuppression: true,
+        googAutoGainControl: true,
+        googHighpassFilter: true,
+        googTypingNoiseDetection: true,
+      } as MediaTrackConstraints,
       video: false,
     });
     const source = this.audioCtx!.createMediaStreamSource(this.stream);
@@ -300,6 +315,9 @@ export class CallSession {
   }
 
   private playFrame(buffer: ArrayBuffer) {
+    // Deafen mutes all remote audio for THIS listener only — frames are
+    // dropped client-side; other participants are unaffected.
+    if (this.deafened) return;
     if (!this.audioCtx) {
       // Playback context was never created (shouldn't happen) — skip.
       return;
@@ -323,10 +341,21 @@ export class CallSession {
   }
 
   setMuted(muted: boolean) {
-    this.muted = muted;
-    for (const track of this.stream?.getAudioTracks() || []) track.enabled = !muted;
+    this.userMuted = muted;
+    this.applyEffectiveMute();
+  }
+
+  setDeafened(deafened: boolean) {
+    this.deafened = deafened;
+    this.applyEffectiveMute();
+  }
+
+  private applyEffectiveMute() {
+    const effective = this.userMuted || this.deafened;
+    this.muted = effective;
+    for (const track of this.stream?.getAudioTracks() || []) track.enabled = !effective;
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "mute", muted }));
+      this.ws.send(JSON.stringify({ type: "mute", muted: effective }));
     }
   }
 
