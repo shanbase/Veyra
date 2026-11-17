@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { pool } from './db.mjs';
 import { createApp } from './app.mjs';
 import { closeRedis } from './redis.mjs';
+import { isCallUpgradePath, handleCallUpgrade } from './calls.mjs';
 
 const isProduction = process.env.NODE_ENV === 'production';
 // Altare/other PaaS inject PORT automatically; 3001 is the local default.
@@ -49,6 +50,16 @@ if (isProduction) {
 // version on the port until this process exits, then restart it — retrying
 // in-process just stalls the deploy.
 const server = app.listen(port, '0.0.0.0');
+
+// Voice calls: the audio/signalling socket upgrades on /api/calls/ws. Any
+// other upgrade path is rejected — nothing else on this server uses WS.
+server.on('upgrade', (req, socket, head) => {
+  if (isCallUpgradePath(req)) {
+    handleCallUpgrade(req, socket, head);
+    return;
+  }
+  socket.destroy();
+});
 
 server.once('listening', () => {
   console.log(`Veyra API listening on 0.0.0.0:${port}.`);

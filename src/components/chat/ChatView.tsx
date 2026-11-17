@@ -43,7 +43,7 @@ import { VoiceRecordingIndicator } from "@/components/chat/VoiceRecordingIndicat
 import {
   Send, Check, CheckCheck, Clock, MoreHorizontal, Pencil, X,
   Trash2, Smile, ArrowLeft, ImagePlus, ArrowDown, Reply,
-  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff, Forward, Hash, Flag
+  ChevronLeft, ChevronRight, Play, Mic, Pin, Copy, Bell, BellOff, Forward, Hash, Flag, Phone
 } from "lucide-react";
 import { Sheet, SheetContent, SheetTrigger } from "@/components/ui/sheet";
 import { signMessageMedia, encodeFile, decodeFile, encodeMusic, decodeMusic } from "@/lib/mediaUrl";
@@ -77,6 +77,7 @@ import { reconcileLiveMessage as reconcileLiveMessageState } from "./reconcileMe
 import { MessageActionMenu, type MessageActionMenuState } from "./MessageActionMenu";
 import { ForwardMessageDialog } from "./ForwardMessageDialog";
 import { ReportMessageDialog } from "./ReportMessageDialog";
+import { useCall } from "@/components/calls/CallProvider";
 
 
 
@@ -345,6 +346,7 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
   }, [user?.id]);
 
   const { typingUsers, setTyping } = usePresence(conversationIdProp ?? null);
+  const callContext = useCall();
   const [messages, setMessages] = useState<Message[]>([]);
   const [pinnedMessages, setPinnedMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState("");
@@ -2135,6 +2137,35 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
             {muted ? <BellOff className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
           </Button>
         )}
+        {isDM && conversationIdProp && callContext && (() => {
+          const myCall = callContext.activeCall?.conversationId === conversationIdProp;
+          const live = callContext.liveCallFor(conversationIdProp);
+          const inCallElsewhere = !!callContext.activeCall && !myCall;
+          const callTitle = isGroupConv
+            ? (groupInfo.name?.trim() || "Group chat")
+            : (otherUser?.display_name || otherUser?.username || "Voice call");
+          return (
+            <Button
+              variant="ghost"
+              size="icon"
+              disabled={myCall || inCallElsewhere}
+              title={myCall ? "In call" : live ? `Join call — ${live.title}` : "Start voice call"}
+              onClick={() => {
+                if (myCall) return;
+                const action = live && !inCallElsewhere ? callContext.joinCall(conversationIdProp) : callContext.startCall(conversationIdProp, callTitle);
+                void action.catch((error) => {
+                  toast({
+                    title: "Couldn't start the call",
+                    description: error instanceof Error ? error.message : "Voice calls need the self-hosted server (not available on Vercel).",
+                    variant: "destructive",
+                  });
+                });
+              }}
+            >
+              <Phone className={`h-4 w-4 ${live && !myCall ? "text-green-600" : ""}`} />
+            </Button>
+          );
+        })()}
         {(() => {
           const mentionMsgs = messages.filter(
             (m) =>

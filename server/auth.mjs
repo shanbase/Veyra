@@ -222,6 +222,22 @@ async function invalidateSessionHashes(...tokenHashes) {
   if (hashes.length) await redisDel(...hashes.map(sessCacheKey));
 }
 
+// Token → user lookup for non-Express entry points (the calls WebSocket
+// upgrade can't run through authenticateRequest middleware). Same session
+// rules as authenticateRequest, without the Redis read cache — WS connects
+// are rare enough that a direct query is fine.
+export async function resolveSessionUser(token) {
+  if (!token) return null;
+  const [rows] = await pool.execute(
+    `SELECT u.id, u.email, u.email_verified_at, p.username, p.display_name, p.avatar_url, s.expires_at
+     FROM auth_sessions s JOIN auth_users u ON u.id = s.user_id
+     JOIN profiles p ON p.id = u.id
+     WHERE s.token_hash = ? AND s.expires_at > UTC_TIMESTAMP(3) AND u.email_verified_at IS NOT NULL LIMIT 1`,
+    [hashToken(token)],
+  );
+  return rows[0] || null;
+}
+
 export async function authenticateRequest(req, res, next) {
   const authorization = String(req.headers.authorization || '');
   const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : cookieValue(req, COOKIE);

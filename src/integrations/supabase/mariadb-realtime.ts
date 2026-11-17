@@ -1,5 +1,6 @@
 import { authClient } from './client-core';
 import { apiFetch } from '@/lib/nativeSession';
+import type { CallSignal } from '@/lib/calls';
 
 const PUBLIC_TOPIC = 'veyra-public-mariadb';
 const PUBLIC_TABLES = new Set(['global_messages', 'announcement_messages']);
@@ -32,6 +33,9 @@ export type MariaDbChangeCallback = Subscriber['callback'];
 type RealtimeChannel = ReturnType<typeof authClient.channel>;
 
 const subscribers = new Set<Subscriber>();
+// Voice-call signalling rides the same broadcast transport on a dedicated
+// 'call-signal' event, delivered to each member's user topic.
+const callSignalSubscribers = new Set<(signal: CallSignal) => void>();
 const reconnectListeners = new Set<() => void>();
 let userId: string | null = null;
 let userTopic: string | null = null;
@@ -104,6 +108,18 @@ function openChannel(topic: string, publicOnly: boolean) {
   let degraded = false;
   channel
     .on('broadcast', { event: 'db-change' }, (message: unknown) => dispatch(message, publicOnly))
+    .on('broadcast', { event: 'call-signal' }, (message: unknown) => {
+      const envelope = message as { payload?: unknown };
+      const signal = (envelope?.payload ?? message) as CallSignal;
+      if (!signal || typeof signal.type !== 'string') return;
+      for (const listener of callSignalSubscribers) {
+        try {
+          listener(signal);
+        } catch (error) {
+          console.warn('Call signal listener failed:', error instanceof Error ? error.message : error);
+        }
+      }
+    })
     .subscribe((status) => {
       if (status === 'SUBSCRIBED') {
         if (degraded) notifyRealtimeReconnect();
@@ -169,12 +185,12 @@ async function ensureUserTopic() {
       const result = await response.json() as { topic?: string };
       if (!response.ok || !result.topic || userId !== requestedUser || identityRevision !== revision) return;
       userTopic = result.topic;
-      if (subscribers.size) userChannel = openChannel(userTopic, false);
+      if (subscribers.size || callSignalSubscribers.size) userChannel = openChannel(userTopic, false);
     } catch (error) {
       console.warn('Could not initialize MariaDB live updates:', error instanceof Error ? error.message : 'network error');
     } finally {
       userTopicRequest = null;
-      if (userId && subscribers.size && (userId !== requestedUser || identityRevision !== revision)) {
+      if (userId && (subscribers.size || callSignalSubscribers.size) && (userId !== requestedUser || identityRevision !== revision)) {
         void ensureUserTopic();
       }
     }
@@ -196,7 +212,36 @@ export function setMariaDbRealtimeUserId(nextUserId: string | null) {
     userChannel = null;
     void authClient.removeChannel(previous);
   }
-  if (userId && subscribers.size) void ensureUserTopic();
+  if (userId && (subscribers.size || callSignalSubscribers.size)) void ensureUserTopic();
+}
+
+function scheduleChannelRelease() {
+  if (releaseTimer) return;
+  releaseTimer = setTimeout(() => {
+    releaseTimer = undefined;
+    if (subscribers.size || callSignalSubscribers.size) return;
+    const channels = [userChannel, publicChannel, ...convChannels.values()].filter(Boolean) as RealtimeChannel[];
+    userChannel = null;
+    publicChannel = null;
+    userTopic = null;
+    convChannels.clear();
+    convTopicRequests.clear();
+    channels.forEach((channel) => void authClient.removeChannel(channel));
+  }, 20_000);
+}
+
+// Call signals are app-wide (user topic), independent of any open chat.
+export function subscribeCallSignals(listener: (signal: CallSignal) => void) {
+  if (releaseTimer) { clearTimeout(releaseTimer); releaseTimer = undefined; }
+  callSignalSubscribers.add(listener);
+  if (userId) {
+    if (userTopic && !userChannel) userChannel = openChannel(userTopic, false);
+    else void ensureUserTopic();
+  }
+  return () => {
+    callSignalSubscribers.delete(listener);
+    if (!subscribers.size && !callSignalSubscribers.size) scheduleChannelRelease();
+  };
 }
 
 export function subscribeMariaDbChanges(filter: ChangeFilter, callback: Subscriber['callback']) {
@@ -214,19 +259,8 @@ export function subscribeMariaDbChanges(filter: ChangeFilter, callback: Subscrib
 
   return () => {
     subscribers.delete(subscriber);
-    if (!subscribers.size) {
-      if (releaseTimer) return;
-      releaseTimer = setTimeout(() => {
-        releaseTimer = undefined;
-        if (subscribers.size) return;
-        const channels = [userChannel, publicChannel, ...convChannels.values()].filter(Boolean) as RealtimeChannel[];
-        userChannel = null;
-        publicChannel = null;
-        userTopic = null;
-        convChannels.clear();
-        convTopicRequests.clear();
-        channels.forEach((channel) => void authClient.removeChannel(channel));
-      }, 20_000);
+    if (!subscribers.size && !callSignalSubscribers.size) {
+      scheduleChannelRelease();
       return;
     }
     // Drop conversation channels no remaining subscriber needs so hopping

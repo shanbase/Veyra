@@ -250,6 +250,19 @@ export async function publishMariaDbChanges(changes, actorId) {
     return;
   }
   if (!messages.length) return;
+  await deliverBroadcasts(messages);
+}
+
+async function deliverBroadcasts(messages) {
+  const url = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL;
+  const key = serviceKey();
+  if (!url || !key) {
+    if (!warnedMissingConfig.value) {
+      console.warn('MariaDB live updates require server-side Supabase service credentials.');
+      warnedMissingConfig.value = true;
+    }
+    return;
+  }
 
   const broadcast = async (batch) => {
     try {
@@ -278,6 +291,21 @@ export async function publishMariaDbChanges(changes, actorId) {
     if (!(await broadcast(batch.messages))) break;
     await acknowledgeRealtimeBatch(batch.id);
   }
+}
+
+// Call signalling (invite/accept/decline/end) rides the same Supabase
+// Realtime broadcast transport as DB changes, but on a dedicated 'call-signal'
+// event sent to each member's user topic so ringing works app-wide, not just
+// inside the open conversation.
+export async function publishCallSignal(payload, userIds) {
+  const ids = [...new Set((userIds || []).filter(Boolean))];
+  if (!ids.length) return;
+  const messages = ids.map((userId) => ({
+    topic: mariaDbRealtimeTopic(userId),
+    event: 'call-signal',
+    payload,
+  }));
+  await deliverBroadcasts(messages);
 }
 
 export function changeFromDataRequest(payload, result) {

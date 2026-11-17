@@ -32,6 +32,7 @@ MariaDB, Google OAuth, and Sequenzy credentials stay on the server. The browser 
 - Presence modes (online / idle / do-not-disturb) that also gate push notifications.
 - Admin tools for member management, analytics, roles, moderation, and logs. Roles (`user`/`admin`/`super_admin`) live in `user_roles` and are enforced server-side; see [docs/admin.md](docs/admin.md) for the permission model and how to grant the first admin.
 - ntfy and Firebase Cloud Messaging push notifications, per-chat muting, and native OS notifications on the Windows desktop app.
+- Self-hosted voice calls in DMs and groups over a WebSocket audio channel — no third-party call service. Requires the long-running Node server (Altare/self-hosted), not Vercel. See [docs/calls.md](docs/calls.md).
 
 ## Setup
 

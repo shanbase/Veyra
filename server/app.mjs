@@ -12,6 +12,7 @@ import { invalidateReadCache, consumeRateLimit, redisGetJson, redisSetJson, ezms
 import { assertEncryptionConfig, encryptionEnabled } from './encryption.mjs';
 import { u3StorageEnabled, u3Config, u3ObjectUrl, u3PresignUpload, u3PresignDownload } from './storage.mjs';
 import { assertQueuesConfig } from './queues.mjs';
+import { registerCallRoutes } from './calls.mjs';
 
 const MAX_PROFILE_IMAGE_BYTES = 25 * 1024 * 1024;
 
@@ -472,6 +473,7 @@ export function createApp() {
       res.status(503).json({ error: 'Chat media storage is unavailable.' });
     }
   });
+  registerCallRoutes(app);
   // Worker endpoint for optional Altare Queues consumers. A queue worker posts
   // jobs of type "notifications.deliver" here to perform the actual ntfy send.
   app.post('/api/queues/deliver', async (req, res) => {
