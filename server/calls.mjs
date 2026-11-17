@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { WebSocket, WebSocketServer } from 'ws';
 import { pool } from './db.mjs';
-import { publishCallSignal } from './realtime.mjs';
+import { publishCallSignal, publishMariaDbChanges } from './realtime.mjs';
+import { encryptRowForTable, decryptRowsForTable } from './encryption.mjs';
 import { resolveSessionUser } from './auth.mjs';
 import { verifyCallTicket } from './call-tickets.mjs';
 import { sendCallInvitePush } from './notifications.mjs';
@@ -100,6 +101,9 @@ async function broadcastToMembers(call, type, extra = {}) {
 function endCall(call, reason) {
   if (call.state === 'ended') return;
   call.state = 'ended';
+  call.endedAt = Date.now();
+  call.endReason = reason || '';
+  void writeCallLog(call).catch((error) => console.warn('Call log write failed:', error?.message || error));
   if (call.ringTimer) clearTimeout(call.ringTimer);
   if (call.emptyTimer) clearTimeout(call.emptyTimer);
   for (const socket of call.sockets.values()) {
@@ -109,6 +113,50 @@ function endCall(call, reason) {
   call.audio.clear();
   // Keep the record briefly so late REST polls see 'ended' rather than 404.
   setTimeout(() => calls.delete(call.id), 60_000).unref?.();
+}
+
+// Posts a Messenger-style call entry into the conversation's message history:
+// a normal `messages` row whose content is a JSON marker the client renders as
+// a call card (duration, outcome, "call again"). Content goes through the same
+// AES-256-GCM encryption as chat messages.
+async function writeCallLog(call) {
+  const connected = Boolean(call.activeAt);
+  const someoneDeclined = call.declined.size > 0;
+  const rangOut = call.endReason === 'ring-timeout';
+  // Skip pure caller-cancels before anyone interacted — no noise in chat.
+  if (!connected && !someoneDeclined && !rangOut) return;
+
+  const durationSec = connected ? Math.max(0, Math.round(((call.endedAt || Date.now()) - call.activeAt) / 1000)) : 0;
+  const content = JSON.stringify({
+    v: 1,
+    kind: 'voice_call',
+    callId: call.id,
+    outcome: connected ? 'completed' : 'missed',
+    durationSec,
+    participants: Math.max(1, call.peakParticipants || 1),
+  });
+
+  const id = randomUUID();
+  const row = {
+    id,
+    conversation_id: call.conversationId,
+    sender_id: call.startedBy,
+    content,
+  };
+  const stored = encryptRowForTable('messages', row);
+  await pool.execute(
+    'INSERT INTO messages (id, conversation_id, sender_id, content) VALUES (?, ?, ?, ?)',
+    [id, call.conversationId, call.startedBy, stored.content],
+  );
+  const [rows] = await pool.execute('SELECT * FROM messages WHERE id = ? LIMIT 1', [id]);
+  const plain = decryptRowsForTable('messages', rows)[0] || null;
+  await publishMariaDbChanges([{
+    table: 'messages',
+    operation: 'insert',
+    eventType: 'INSERT',
+    values: row,
+    data: plain ? [plain] : rows,
+  }], call.startedBy).catch((error) => console.warn('Call log broadcast failed:', error?.message || error));
 }
 
 function scheduleEmptyCleanup(call) {
@@ -230,6 +278,10 @@ async function handleJoin(socket, call, user) {
   call.accepted.add(user.id);
   call.declined.delete(user.id);
   if (becameActive) call.state = 'active';
+  // First real audio connection starts the call clock — covers both the
+  // ringing→active WS path and REST-accept-then-join.
+  if (!call.activeAt) call.activeAt = Date.now();
+  call.peakParticipants = Math.max(call.peakParticipants || 1, call.sockets.size);
   if (call.emptyTimer) { clearTimeout(call.emptyTimer); call.emptyTimer = null; }
   if (call.ringTimer) { clearTimeout(call.ringTimer); call.ringTimer = null; }
   ensureMixTimer();
@@ -370,6 +422,10 @@ export function registerCallRoutes(app, authenticate) {
       audio: new Map(),
       ringTimer: null,
       emptyTimer: null,
+      activeAt: null,
+      endedAt: null,
+      endReason: '',
+      peakParticipants: 1,
     };
     call.ringTimer = setTimeout(() => {
       const c = getCall(call.id);

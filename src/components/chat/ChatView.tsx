@@ -78,6 +78,7 @@ import { MessageActionMenu, type MessageActionMenuState } from "./MessageActionM
 import { ForwardMessageDialog } from "./ForwardMessageDialog";
 import { ReportMessageDialog } from "./ReportMessageDialog";
 import { useCall } from "@/components/calls/CallProvider";
+import { CallLogCard, parseCallLog } from "@/components/chat/CallLogCard";
 
 
 
@@ -511,6 +512,8 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
 
   const renderMessageBody = (msg: { id: string; content: string | null }, suffix?: React.ReactNode) => {
     if (!msg.content) return null;
+    const callLog = parseCallLog(msg.content);
+    if (callLog) return <CallLogCard payload={callLog} conversationId={isDM ? conversationIdProp : null} />;
     const pollMarker = msg.content.match(/^\[\[poll:([0-9a-f-]{36})\]\]\s*$/i);
     if (pollMarker) return <PollCard pollId={pollMarker[1]} />;
     if (pollByMsgId[msg.id]) return <PollCard pollId={pollByMsgId[msg.id]} />;

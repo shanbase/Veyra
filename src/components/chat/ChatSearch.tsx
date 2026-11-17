@@ -12,6 +12,7 @@ import {
 } from "@/components/ui/popover";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { MessageMarkdown } from "@/components/chat/MessageMarkdown";
+import { parseCallLog } from "@/components/chat/CallLogCard";
 import {
   Command,
   CommandInput,
@@ -404,7 +405,10 @@ export function ChatSearch({ messages, onJump, currentUserId }: ChatSearchProps)
                 const kinds = detectAttachmentKinds(m.content, m.image_url);
                 const att = kinds.has("attachment");
                 const name = m.sender?.display_name || m.sender?.username || "Unknown";
-                const preview = m.content
+                const callLog = parseCallLog(m.content);
+                const preview = callLog
+                  ? callLog.outcome === "missed" ? "Missed voice call" : "Voice call"
+                  : m.content
                   ? m.content.replace(ATTACHMENT_REGEX, "[attachment]")
                   : m.image_url
                   ? "[image]"

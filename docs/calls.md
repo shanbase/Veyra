@@ -34,7 +34,7 @@ The Altare-hosted app (`veyra.go.altare.global`) works either way: embedded call
 
 ## Limits (v1)
 
-- Audio only — no video, screen share, or call history.
+- Audio only — no video, screen share. Call history appears as Messenger-style entries in the conversation: `endCall` writes an encrypted `messages` row whose content is a `{"v":1,"kind":"voice_call",...}` marker (outcome, duration, participant count); `CallLogCard` renders it with a "Call again" button. Requires `MESSAGE_ENCRYPTION_KEY` on the call server or the row is stored unencrypted.
 - Max 12 participants per call (`MAX_PARTICIPANTS` in `server/calls.mjs`).
 - PCM16 ≈ 256 kbps per speaker upstream — noticeably heavier than Opus but codec-free and works in every browser/WebView. Opus via WebCodecs is a possible v2 optimization.
 - Call state is in-memory: a server restart drops active calls (clients see "disconnected"). Ringing calls time out after 90 s; empty calls are cleaned up after 30 s. Clients auto-reconnect the audio socket up to 3 times on drops and re-apply mute state on rejoin.
