@@ -16,10 +16,13 @@ Calls need a **long-running Node server** — the same process that serves the A
 
 `server/call-server.mjs` runs ONLY the call API + audio socket, packaged as `ghcr.io/<owner>/veyra-call-server` by `.github/workflows/call-server-image.yml` and deployed as the Altare Docker app **veyra-calls** (Secondary team, `https://veyra-calls.go.altare.global`, 200% CPU / 3 GB / 5 GB, auto-updates on new `:latest` images).
 
-Cross-origin auth uses **60-second HMAC tickets**: the main API exposes `POST /api/calls/ticket` (normal session auth) and the call server verifies `CALL_TICKET_SECRET` — no cookies cross sites. To point a frontend at it, set:
+Cross-origin auth uses **60-second HMAC tickets**: the main API exposes `POST /api/calls/ticket` (normal session auth) and the call server verifies `CALL_TICKET_SECRET` — no cookies cross sites.
 
-- `VITE_CALL_SERVER_URL=https://veyra-calls.go.altare.global` (build-time)
+**Call rooms are in-memory per process, so every client must use the SAME call backend.** `GET /api/calls/config` returns `CALL_SERVER_URL` from the API's env; clients prefer `VITE_CALL_SERVER_URL` (build-time) then fall back to that runtime value, then to same-origin embedded calls. Set on the API serving the frontend:
+
+- `CALL_SERVER_URL=https://veyra-calls.go.altare.global` (runtime)
 - `CALL_TICKET_SECRET=<same value on both the API and call server>` (runtime)
+- `VITE_CALL_SERVER_URL` — optional build-time override; the runtime config makes it unnecessary
 
 The call server env needs: `CALL_TICKET_SECRET`, `USE_MARIADB=false` + `POSTGRES_*`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (signalling), `NODE_ENV=production`.
 
@@ -32,4 +35,4 @@ The Altare-hosted app (`veyra.go.altare.global`) works either way: embedded call
 - Audio only — no video, screen share, or call history.
 - Max 12 participants per call (`MAX_PARTICIPANTS` in `server/calls.mjs`).
 - PCM16 ≈ 256 kbps per speaker upstream — noticeably heavier than Opus but codec-free and works in every browser/WebView. Opus via WebCodecs is a possible v2 optimization.
-- Call state is in-memory: a server restart drops active calls (clients see "disconnected"). Ringing calls time out after 90 s; empty calls are cleaned up after 30 s.
+- Call state is in-memory: a server restart drops active calls (clients see "disconnected"). Ringing calls time out after 90 s; empty calls are cleaned up after 30 s. Clients auto-reconnect the audio socket up to 3 times on drops and re-apply mute state on rejoin.

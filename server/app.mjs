@@ -537,6 +537,13 @@ export function createApp() {
       res.status(503).json({ error: 'Could not remove GIF favorite.' });
     }
   });
+  // Tells clients where the canonical call server lives. Call rooms are
+  // in-memory per process, so EVERY client must converge on ONE server —
+  // without this, a caller on the Altare app and a callee on Vercel would hit
+  // different backends and the accept would 404 with "call not found".
+  app.get('/api/calls/config', (_req, res) => {
+    res.json({ url: String(process.env.CALL_SERVER_URL || '').replace(/\/+$/, '') || null });
+  });
   // Mints a 60 s HMAC ticket for the standalone call server. Registered before
   // registerCallRoutes so it isn't swallowed by the /api/calls auth middleware.
   app.post('/api/calls/ticket', (req, res) => {

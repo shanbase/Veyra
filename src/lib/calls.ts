@@ -42,11 +42,28 @@ type SessionEvents = {
   onMicDenied?: () => void;
 };
 
-// When VITE_CALL_SERVER_URL points at the dedicated call server (e.g. the
-// Altare veyra-calls app), REST calls go there cross-origin with a 60 s HMAC
-// ticket minted by the main API. Without it, calls stay on the same-origin
-// embedded endpoints (session cookie / native Bearer token).
-const CALL_API_BASE = String(import.meta.env.VITE_CALL_SERVER_URL || "").replace(/\/+$/, "");
+// Call rooms are in-memory per server process, so every client MUST use the
+// same backend. Resolution order:
+//   1. VITE_CALL_SERVER_URL (build-time override)
+//   2. GET /api/calls/config → CALL_SERVER_URL env on the API (runtime —
+//      works on Vercel/Altare/native without a rebuild)
+//   3. "" → same-origin embedded endpoints (single-server self-host only)
+const CALL_API_BASE_ENV = String(import.meta.env.VITE_CALL_SERVER_URL || "").replace(/\/+$/, "");
+let serverUrlCache: string | null | undefined;
+
+async function callServerBase(): Promise<string> {
+  if (CALL_API_BASE_ENV) return CALL_API_BASE_ENV;
+  if (serverUrlCache === undefined) {
+    try {
+      const response = await apiFetch("/api/calls/config");
+      const body = await response.json().catch(() => ({}));
+      serverUrlCache = body?.url ? String(body.url).replace(/\/+$/, "") : null;
+    } catch {
+      serverUrlCache = null;
+    }
+  }
+  return serverUrlCache || "";
+}
 
 let ticketCache: { token: string; expiresAt: number } | null = null;
 
@@ -62,7 +79,8 @@ async function getCallTicket() {
 }
 
 async function callApi(path: string, init: RequestInit = {}) {
-  if (!CALL_API_BASE) {
+  const base = await callServerBase();
+  if (!base) {
     const response = await apiFetch(`/api/calls${path}`, {
       ...init,
       headers: { "Content-Type": "application/json", ...(init.headers || {}) },
@@ -72,7 +90,7 @@ async function callApi(path: string, init: RequestInit = {}) {
     return body;
   }
   const ticket = await getCallTicket();
-  const response = await fetch(`${CALL_API_BASE}/api/calls${path}`, {
+  const response = await fetch(`${base}/api/calls${path}`, {
     ...init,
     credentials: "omit",
     headers: {
@@ -112,23 +130,24 @@ export function callState(conversationId: string) {
 }
 
 async function wsUrl() {
-  if (CALL_API_BASE) {
+  const base = await callServerBase();
+  if (base) {
     // Remote call server: wss(s)://<call-host>/api/calls/ws?ticket=<ticket>
     const ticket = await getCallTicket();
-    const url = new URL(CALL_API_BASE);
+    const url = new URL(base);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     url.pathname = "/api/calls/ws";
     url.search = `ticket=${encodeURIComponent(ticket)}`;
     return url.toString();
   }
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const base = `${proto}//${window.location.host}/api/calls/ws`;
+  const sameOrigin = `${proto}//${window.location.host}/api/calls/ws`;
   // Native apps authenticate API calls with a Bearer token, not cookies —
   // pass it as a query param for the WS handshake.
   if (isNativeVeyraApp()) {
-    return getNativeSessionToken().then((token) => (token ? `${base}?token=${encodeURIComponent(token)}` : base));
+    return getNativeSessionToken().then((token) => (token ? `${sameOrigin}?token=${encodeURIComponent(token)}` : sameOrigin));
   }
-  return Promise.resolve(base);
+  return Promise.resolve(sameOrigin);
 }
 
 export class CallSession {
@@ -157,33 +176,77 @@ export class CallSession {
   get isOpen() { return !this.closed && this.ws?.readyState === WebSocket.OPEN; }
   get hasMic() { return !this.micDenied; }
 
-  async start(): Promise<void> {
-    const url = await wsUrl();
-    this.ws = new WebSocket(url);
-    this.ws.binaryType = "arraybuffer";
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
-    this.ws.onmessage = (event) => {
+  private attachSocket(ws: WebSocket) {
+    ws.binaryType = "arraybuffer";
+    ws.onmessage = (event) => {
       if (typeof event.data === "string") {
         this.handleSignal(JSON.parse(event.data));
       } else {
         this.playFrame(event.data as ArrayBuffer);
       }
     };
-    this.ws.onclose = () => {
-      if (!this.closed) this.events.onEnded?.("disconnected");
+    ws.onclose = () => {
+      if (this.closed) return;
+      // Auto-reconnect: the server keeps the call room alive, so a dropped
+      // socket (wifi blip, proxy timeout) shouldn't end the call for us.
+      if (this.reconnectAttempts < 3) {
+        this.reconnectAttempts += 1;
+        this.reconnectTimer = setTimeout(() => { void this.reconnect(); }, 1200 * this.reconnectAttempts);
+        return;
+      }
+      this.events.onEnded?.("disconnected");
       this.cleanup();
     };
-    this.ws.onerror = () => this.events.onError?.("Connection to the call server failed.");
+    ws.onerror = () => this.events.onError?.("Connection to the call server failed.");
+  }
 
-    await new Promise<void>((resolve, reject) => {
+  private waitOpen(ws: WebSocket): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Timed out connecting to the call.")), 10000);
-      const ws = this.ws!;
-      const onOpen = () => { clearTimeout(timer); ws.removeEventListener("error", onFail); ws.removeEventListener("close", onFail); resolve(); };
-      const onFail = () => { clearTimeout(timer); ws.removeEventListener("open", onOpen); reject(new Error("Could not connect to the call server.")); };
+      const onOpen = () => { clearTimeout(timer); cleanup(); resolve(); };
+      const onFail = () => { clearTimeout(timer); cleanup(); reject(new Error("Could not connect to the call server.")); };
+      const cleanup = () => {
+        ws.removeEventListener("open", onOpen);
+        ws.removeEventListener("error", onFail);
+        ws.removeEventListener("close", onFail);
+      };
       ws.addEventListener("open", onOpen, { once: true });
       ws.addEventListener("error", onFail, { once: true });
       ws.addEventListener("close", onFail, { once: true });
     });
+  }
+
+  private sendJoin() {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: "join", callId: this.callId }));
+    }
+  }
+
+  private async reconnect() {
+    if (this.closed) return;
+    try {
+      const url = await wsUrl();
+      const ws = new WebSocket(url);
+      this.attachSocket(ws);
+      this.ws = ws;
+      await this.waitOpen(ws);
+      this.sendJoin();
+      // Re-apply mute/deafen — the server registers a fresh socket as unmuted.
+      this.applyEffectiveMute();
+    } catch {
+      // Failed attempt — onclose/onerror will schedule the next retry.
+      if (this.ws) this.ws.close();
+    }
+  }
+
+  async start(): Promise<void> {
+    const url = await wsUrl();
+    this.ws = new WebSocket(url);
+    this.attachSocket(this.ws);
+    await this.waitOpen(this.ws);
 
     // AudioContext is created up-front for PLAYBACK even when the mic fails —
     // mic-less users must still hear the call. It starts 'suspended' under
@@ -197,7 +260,7 @@ export class CallSession {
       this.micDenied = true;
       this.events.onMicDenied?.();
     });
-    this.ws.send(JSON.stringify({ type: "join", callId: this.callId }));
+    this.sendJoin();
   }
 
   private scriptProcessor: ScriptProcessorNode | null = null;
@@ -296,6 +359,7 @@ export class CallSession {
   private handleSignal(msg: Record<string, unknown>) {
     switch (msg.type) {
       case "welcome":
+        this.reconnectAttempts = 0;
         this.participants = (msg.participants as CallParticipant[]) || [];
         this.events.onParticipants?.(this.participants);
         break;
@@ -308,9 +372,17 @@ export class CallSession {
       case "muted":
         this.events.onPeerMute?.(String(msg.userId), Boolean(msg.muted));
         break;
-      case "error":
-        this.events.onError?.(String(msg.message || "Call error."));
+      case "error": {
+        const message = String(msg.message || "Call error.");
+        this.events.onError?.(message);
+        // A rejected join means the room is gone — don't sit in a dead call.
+        if (/no longer active|not allowed/i.test(message)) {
+          this.events.onEnded?.("ended");
+          this.cleanup();
+          this.ws?.close();
+        }
         break;
+      }
     }
   }
 
@@ -360,6 +432,7 @@ export class CallSession {
   }
 
   leave() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       try { this.ws.send(JSON.stringify({ type: "leave" })); } catch { /* ignore */ }
     }
