@@ -37,11 +37,16 @@ export async function deliverPushNotification({ server, topic, title, message })
   return publish(server, topic, title, message);
 }
 
+// Android notification channel for call invites — created client-side via
+// PushNotifications.createChannel with IMPORTANCE_HIGH. Must match the id
+// the app registers so the system routes the alert to the loud call channel.
+const CALL_CHANNEL_ID = 'veyra_calls';
+
 // Incoming-call push: high-priority FCM to every registered device of the
 // given users. This is what notifies the phone when the app is closed —
 // Supabase Realtime call signals only reach a running app. Call invites
 // deliberately ignore ntfy prefs/DM mute: a ringing call is expected to notify.
-export async function sendCallInvitePush(userIds, { callId, conversationId, title, fromName }) {
+export async function sendCallInvitePush(userIds, { callId, conversationId, title, fromName, fromAvatar = '' }) {
   const ids = [...new Set((userIds || []).filter(Boolean))];
   if (!ids.length || !callId) return;
   const placeholders = ids.map(() => '?').join(',');
@@ -57,7 +62,8 @@ export async function sendCallInvitePush(userIds, { callId, conversationId, titl
         conversation_id: conversationId,
         title,
         from_name: fromName,
-      });
+        avatar_url: fromAvatar,
+      }, { notification: { channel_id: CALL_CHANNEL_ID } });
     }
   } catch (error) {
     console.warn('Call invite push failed:', error?.message || error);
@@ -119,7 +125,7 @@ async function getFcmAccessToken() {
   return fcmAccessToken;
 }
 
-async function sendFcmNotification(token, title, body, data = {}) {
+async function sendFcmNotification(token, title, body, data = {}, android = {}) {
   const account = fcmServiceAccount();
   if (!account || !token) return false;
   try {
@@ -132,7 +138,7 @@ async function sendFcmNotification(token, title, body, data = {}) {
           token,
           notification: { title, body },
           data: Object.fromEntries(Object.entries(data).map(([key, value]) => [key, String(value ?? '')])),
-          android: { priority: 'HIGH' },
+          android: { priority: 'HIGH', ...android },
         },
       }),
     });

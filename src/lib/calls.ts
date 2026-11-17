@@ -20,7 +20,7 @@ export type CallSignal = {
   callId: string;
   conversationId: string;
   title?: string;
-  from?: { id: string; username?: string; display_name?: string };
+  from?: { id: string; username?: string; display_name?: string; avatar_url?: string };
   userId?: string;
   reason?: string;
 };

@@ -23,6 +23,7 @@ type IncomingCall = {
   conversationId: string;
   title: string;
   fromName: string;
+  fromAvatar?: string;
 };
 
 type ActiveCall = {
@@ -177,6 +178,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
             conversationId: signal.conversationId,
             title: signal.title || "Voice call",
             fromName: signal.from?.display_name || signal.from?.username || "Someone",
+            fromAvatar: signal.from?.avatar_url || "",
           });
           if (ringTimerRef.current) clearTimeout(ringTimerRef.current);
           ringTimerRef.current = setTimeout(() => {
@@ -247,6 +249,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
             conversationId: invite.conversationId,
             title: invite.title,
             fromName: invite.fromName,
+            fromAvatar: invite.fromAvatar || "",
           });
           if (ringTimerRef.current) clearTimeout(ringTimerRef.current);
           ringTimerRef.current = setTimeout(() => {
@@ -392,31 +395,44 @@ function IncomingCallDialog({
 
   if (!call) return null;
   return (
-    <div className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-      <div className="w-full max-w-sm rounded-2xl border border-border bg-card p-6 shadow-2xl text-center animate-in fade-in zoom-in-95 duration-200">
-        <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-primary/15">
-          <Phone className="h-7 w-7 text-primary animate-pulse" />
+    // Messenger-style full-screen incoming call — opaque so it fully
+    // covers the app (and, via showWhenLocked, the lock screen).
+    <div className="fixed inset-0 z-[100] flex flex-col bg-gradient-to-b from-zinc-950 via-zinc-900 to-black text-white">
+      <div className="flex flex-1 flex-col items-center justify-center gap-6 px-6">
+        <CallAvatar name={call.fromName} avatarUrl={call.fromAvatar} size="xl" />
+        <div className="text-center">
+          <p className="text-2xl font-semibold tracking-tight">{call.fromName}</p>
+          <p className="mt-1 text-sm text-zinc-400">
+            {call.title !== call.fromName ? `${call.title} · ` : ""}Incoming voice call
+          </p>
         </div>
-        <p className="text-xs uppercase tracking-wide text-muted-foreground">Incoming voice call</p>
-        <p className="mt-1 text-lg font-semibold truncate">{call.title}</p>
-        <p className="text-sm text-muted-foreground truncate">{call.fromName}</p>
-        <div className="mt-6 flex items-center justify-center gap-4">
+        <div className="flex items-center gap-3 rounded-full bg-white/5 px-5 py-2.5">
+          <span className="h-2 w-2 animate-pulse rounded-full bg-green-400" />
+          <span className="text-sm text-zinc-300">Ringing…</span>
+        </div>
+      </div>
+      <div className="flex items-center justify-center gap-10 px-6 pb-14 sm:gap-16 sm:pb-20">
+        <div className="flex flex-col items-center gap-2">
           <button
             type="button"
             onClick={onDecline}
-            className="flex h-14 w-14 items-center justify-center rounded-full bg-destructive text-destructive-foreground shadow-lg transition-transform hover:scale-105 active:scale-95"
+            className="flex h-16 w-16 items-center justify-center rounded-full bg-red-500 text-white shadow-lg transition-transform hover:scale-105 active:scale-95"
             aria-label="Decline call"
           >
-            <PhoneOff className="h-6 w-6" />
+            <PhoneOff className="h-7 w-7" />
           </button>
+          <span className="text-xs text-zinc-400">Decline</span>
+        </div>
+        <div className="flex flex-col items-center gap-2">
           <button
             type="button"
             onClick={onAccept}
-            className="flex h-14 w-14 items-center justify-center rounded-full bg-green-600 text-white shadow-lg transition-transform hover:scale-105 active:scale-95"
+            className="flex h-16 w-16 items-center justify-center rounded-full bg-green-500 text-white shadow-lg transition-transform hover:scale-105 active:scale-95"
             aria-label="Accept call"
           >
-            <Phone className="h-6 w-6" />
+            <Phone className="h-7 w-7" />
           </button>
+          <span className="text-xs text-zinc-400">Accept</span>
         </div>
       </div>
     </div>

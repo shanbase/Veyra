@@ -52,6 +52,7 @@ export type CallInvitePush = {
   conversationId: string;
   title: string;
   fromName: string;
+  fromAvatar?: string;
 };
 
 // FCM call invites can arrive before CallProvider mounts (cold start from a
@@ -71,6 +72,7 @@ function handleCallInviteData(data: Record<string, string> | undefined) {
     conversationId: data.conversation_id,
     title: data.title || "Voice call",
     fromName: data.from_name || "Someone",
+    fromAvatar: data.avatar_url || "",
   };
   pendingCallInvite = invite;
   window.dispatchEvent(new CustomEvent("veyra:call-invite", { detail: invite }));
@@ -95,6 +97,19 @@ export async function registerNativePush(userId: string): Promise<void> {
       perm = await PushNotifications.requestPermissions();
     }
     if (perm.receive !== "granted") return;
+
+    // Dedicated loud channel for call invites (server sends channel_id
+    // "veyra_calls"). Default system sound + vibration, heads-up priority.
+    try {
+      await PushNotifications.createChannel({
+        id: "veyra_calls",
+        name: "Calls",
+        description: "Incoming voice calls",
+        importance: 4,
+        visibility: 1,
+        vibration: true,
+      });
+    } catch { /* channel may already exist */ }
 
     await PushNotifications.addListener("registration", ({ value }) => {
       const target = boundUserId;

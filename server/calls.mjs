@@ -381,7 +381,7 @@ export function registerCallRoutes(app, authenticate) {
     call.ringTimer.unref?.();
     calls.set(call.id, call);
     await broadcastToMembers(call, 'call.invite', {
-      from: { id: req.user.id, username: req.user.username, display_name: req.user.display_name },
+      from: { id: req.user.id, username: req.user.username, display_name: req.user.display_name, avatar_url: req.user.avatar_url || '' },
     });
     // FCM push so the phone rings even with the app closed — realtime only
     // reaches running apps.
@@ -391,6 +391,7 @@ export function registerCallRoutes(app, authenticate) {
         conversationId,
         title,
         fromName: req.user.display_name || req.user.username || 'Someone',
+        fromAvatar: req.user.avatar_url || '',
       }),
     ).catch(() => {});
     res.json({ callId: call.id, conversationId, state: call.state, title });

@@ -12,6 +12,10 @@ const REQUIRED_PERMISSIONS = [
   'android.permission.POST_NOTIFICATIONS',
   // Lets the in-app updater hand the downloaded APK to the system installer.
   'android.permission.REQUEST_INSTALL_PACKAGES',
+  // Allows high-priority call notifications to use a full-screen intent so an
+  // incoming call can cover the screen like Messenger (Android 14+ may still
+  // require the user to grant it under Settings → Apps → Special access).
+  'android.permission.USE_FULL_SCREEN_INTENT',
 ];
 
 const original = await readFile(manifestPath, 'utf8');
@@ -38,6 +42,16 @@ if (missing.length) {
   if (!anchor) throw new Error(`Could not find a uses-permission element in ${manifestPath}.`);
   manifest = manifest.replace(anchor[0], `${anchor[0]}\n${insert}`);
   changes.push(...missing);
+}
+
+// Incoming calls should appear over the lock screen and wake the
+// display — showWhenLocked/turnScreenOn on the launcher activity.
+if (!/android:showWhenLocked="true"/.test(manifest)) {
+  manifest = manifest.replace(
+    'android:name=".MainActivity"',
+    'android:name=".MainActivity" android:showWhenLocked="true" android:turnScreenOn="true"',
+  );
+  changes.push('showWhenLocked/turnScreenOn');
 }
 
 if (manifest !== original) {
