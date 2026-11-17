@@ -5,6 +5,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useAuth } from "@/hooks/useAuth";
 import { toast } from "@/hooks/use-toast";
 import { subscribeCallSignals } from "@/integrations/supabase/mariadb-realtime";
+import { consumePendingCallInvite, type CallInvitePush } from "@/lib/pushNotifications";
 import {
   CallSession,
   acceptCall,
@@ -219,6 +220,51 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     });
     return unsubscribe;
   }, [user?.id, endActiveCall]);
+
+  // FCM call invites — these fire when the app was closed/backgrounded and the
+  // user tapped the "Incoming voice call" notification. Verify the call is
+  // still ringing before ringing locally (the push may be stale).
+  useEffect(() => {
+    if (!user?.id) return;
+    const showInvite = (invite: CallInvitePush) => {
+      void callState(invite.conversationId)
+        .then((state) => {
+          const call = state.call;
+          if (!call || call.callId !== invite.callId) return;
+          if (call.state === "active") {
+            // Call already went live — surface it as joinable instead.
+            setLiveCalls((prev) => ({ ...prev, [invite.conversationId]: { callId: call.callId, title: call.title || invite.title } }));
+            return;
+          }
+          if (activeCallRef.current) {
+            void declineCall(invite.callId);
+            return;
+          }
+          setLiveCalls((prev) => ({ ...prev, [invite.conversationId]: { callId: invite.callId, title: invite.title } }));
+          setIncomingCall({
+            callId: invite.callId,
+            conversationId: invite.conversationId,
+            title: invite.title,
+            fromName: invite.fromName,
+          });
+          if (ringTimerRef.current) clearTimeout(ringTimerRef.current);
+          ringTimerRef.current = setTimeout(() => {
+            setIncomingCall((prev) => {
+              if (prev?.callId === invite.callId) void declineCall(invite.callId);
+              return null;
+            });
+            ringTimerRef.current = null;
+          }, INCOMING_RING_MS);
+        })
+        .catch(() => {});
+    };
+    const onInvite = (event: Event) => showInvite((event as CustomEvent<CallInvitePush>).detail);
+    window.addEventListener("veyra:call-invite", onInvite);
+    // Cold start: the notification tap may have fired before this mounted.
+    const pending = consumePendingCallInvite();
+    if (pending) showInvite(pending);
+    return () => window.removeEventListener("veyra:call-invite", onInvite);
+  }, [user?.id]);
 
   const markJoined = useCallback((conversationId: string, callId: string) => {
     setLiveCalls((prev) => {

@@ -7,6 +7,7 @@ Veyra supports self-hosted audio calls in 1:1 and group conversations. There is 
 - **Signalling** — invite / accept / decline / end events are broadcast over Supabase Realtime as `call-signal` messages on each member's user topic (`server/realtime.mjs` → `publishCallSignal`). This is why ringing works even when the conversation isn't open.
 - **Audio** — a WebSocket at `/api/calls/ws` (`server/calls.mjs`) carries raw PCM16 audio: 16 kHz mono, 20 ms frames (640 bytes). The server mixes all speakers each tick and sends every participant a single stream with their own voice subtracted.
 - **Client** — `src/lib/calls.ts` captures the mic via `AudioWorklet` (`public/call-capture-worklet.js`), downsamples to 16 kHz, and streams frames over the socket. `src/components/calls/CallProvider.tsx` owns call state, the incoming-call dialog, and the in-call panel.
+- **Closed-app ringing** � `POST /api/calls/start` also fires a high-priority FCM push (`sendCallInvitePush` in `server/notifications.mjs`) to every member's `native_push_tokens` devices with `{type:'call.invite', call_id, conversation_id, title, from_name}`. Requires `FCM_SERVICE_ACCOUNT_JSON` on whichever server handles `/start` (the call server) plus registered device tokens. Tapping the notification dispatches `veyra:call-invite` in the WebView; `CallProvider` re-checks `/api/calls/state` before ringing so stale pushes don't ghost-ring. Call invites ignore ntfy/DM notification preferences � a ringing call always notifies.
 
 ## Deployment requirements
 

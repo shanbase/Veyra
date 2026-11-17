@@ -47,6 +47,35 @@ async function saveToken(userId: string, token: string) {
 // the device token in native_push_tokens so the API can fan out notifications.
 // Safe to call repeatedly — listeners are attached once and always resolve the
 // CURRENT user, so signing in as a different account rebinds delivery.
+export type CallInvitePush = {
+  callId: string;
+  conversationId: string;
+  title: string;
+  fromName: string;
+};
+
+// FCM call invites can arrive before CallProvider mounts (cold start from a
+// notification tap) — buffer the newest one for it to consume.
+let pendingCallInvite: CallInvitePush | null = null;
+
+export function consumePendingCallInvite(): CallInvitePush | null {
+  const invite = pendingCallInvite;
+  pendingCallInvite = null;
+  return invite;
+}
+
+function handleCallInviteData(data: Record<string, string> | undefined) {
+  if (data?.type !== "call.invite" || !data.call_id || !data.conversation_id) return;
+  const invite: CallInvitePush = {
+    callId: data.call_id,
+    conversationId: data.conversation_id,
+    title: data.title || "Voice call",
+    fromName: data.from_name || "Someone",
+  };
+  pendingCallInvite = invite;
+  window.dispatchEvent(new CustomEvent("veyra:call-invite", { detail: invite }));
+}
+
 export async function registerNativePush(userId: string): Promise<void> {
   if (!Capacitor.isNativePlatform() || !userId) return;
 
@@ -76,6 +105,13 @@ export async function registerNativePush(userId: string): Promise<void> {
     });
     await PushNotifications.addListener("registrationError", (error) => {
       console.warn("Push registration failed:", error);
+    });
+    // Call invites: tap-to-answer payloads (cold start) and foreground pushes.
+    await PushNotifications.addListener("pushNotificationActionPerformed", (action) => {
+      handleCallInviteData(action.notification?.data as Record<string, string> | undefined);
+    });
+    await PushNotifications.addListener("pushNotificationReceived", (notification) => {
+      handleCallInviteData(notification.data as Record<string, string> | undefined);
     });
     await PushNotifications.register();
   } catch (error) {

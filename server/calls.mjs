@@ -4,6 +4,7 @@ import { pool } from './db.mjs';
 import { publishCallSignal } from './realtime.mjs';
 import { resolveSessionUser } from './auth.mjs';
 import { verifyCallTicket } from './call-tickets.mjs';
+import { sendCallInvitePush } from './notifications.mjs';
 
 // Voice calls carry raw PCM16 audio (16 kHz mono, 20 ms frames = 320 samples =
 // 640 bytes) over a WebSocket. The server keeps one pending frame per speaker
@@ -382,6 +383,16 @@ export function registerCallRoutes(app, authenticate) {
     await broadcastToMembers(call, 'call.invite', {
       from: { id: req.user.id, username: req.user.username, display_name: req.user.display_name },
     });
+    // FCM push so the phone rings even with the app closed — realtime only
+    // reaches running apps.
+    memberIdsQuery(conversationId).then((ids) =>
+      sendCallInvitePush(ids.filter((id) => id !== req.user.id), {
+        callId: call.id,
+        conversationId,
+        title,
+        fromName: req.user.display_name || req.user.username || 'Someone',
+      }),
+    ).catch(() => {});
     res.json({ callId: call.id, conversationId, state: call.state, title });
   });
 
@@ -442,11 +453,13 @@ export function registerCallRoutes(app, authenticate) {
     for (const call of calls.values()) {
       if (call.conversationId === conversationId && call.state !== 'ended') {
         return res.json({
-          callId: call.id,
-          conversationId,
-          state: call.state,
-          title: call.title,
-          participants: participantList(call),
+          call: {
+            callId: call.id,
+            conversationId,
+            state: call.state,
+            title: call.title,
+            participants: participantList(call),
+          },
         });
       }
     }

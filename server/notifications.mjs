@@ -37,6 +37,33 @@ export async function deliverPushNotification({ server, topic, title, message })
   return publish(server, topic, title, message);
 }
 
+// Incoming-call push: high-priority FCM to every registered device of the
+// given users. This is what notifies the phone when the app is closed —
+// Supabase Realtime call signals only reach a running app. Call invites
+// deliberately ignore ntfy prefs/DM mute: a ringing call is expected to notify.
+export async function sendCallInvitePush(userIds, { callId, conversationId, title, fromName }) {
+  const ids = [...new Set((userIds || []).filter(Boolean))];
+  if (!ids.length || !callId) return;
+  const placeholders = ids.map(() => '?').join(',');
+  try {
+    const [rows] = await pool.execute(
+      `SELECT user_id, token FROM native_push_tokens WHERE user_id IN (${placeholders}) AND enabled = TRUE`,
+      ids,
+    );
+    for (const row of rows) {
+      void sendFcmNotification(row.token, 'Incoming voice call', `${fromName} is calling — ${title}`, {
+        type: 'call.invite',
+        call_id: callId,
+        conversation_id: conversationId,
+        title,
+        from_name: fromName,
+      });
+    }
+  } catch (error) {
+    console.warn('Call invite push failed:', error?.message || error);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Firebase Cloud Messaging (Android/iOS native push)
 // ---------------------------------------------------------------------------
