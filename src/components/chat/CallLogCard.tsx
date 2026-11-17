@@ -1,5 +1,6 @@
 import { Phone, PhoneMissed } from "lucide-react";
 import { useCall } from "@/components/calls/CallProvider";
+import { useAuth } from "@/hooks/useAuth";
 
 // Call entries are stored as ordinary (encrypted) messages whose content is a
 // JSON marker written by server/calls.mjs when a call ends — same trick as
@@ -34,9 +35,12 @@ function formatDuration(totalSec: number): string {
   return `${m}:${String(s % 60).padStart(2, "0")}`;
 }
 
-export function CallLogCard({ payload, conversationId }: { payload: CallLogPayload; conversationId?: string | null }) {
+export function CallLogCard({ payload, conversationId, senderId }: { payload: CallLogPayload; conversationId?: string | null; senderId?: string | null }) {
   const call = useCall();
+  const { user } = useAuth();
   const missed = payload.outcome === "missed";
+  // The caller sees "Missed your call"; everyone else sees "Missed voice call".
+  const viewerIsCaller = Boolean(senderId && user?.id && senderId === user.id);
   const Icon = missed ? PhoneMissed : Phone;
 
   return (
@@ -46,7 +50,7 @@ export function CallLogCard({ payload, conversationId }: { payload: CallLogPaylo
       </span>
       <div className="min-w-0 flex-1">
         <p className="text-sm font-medium leading-tight">
-          {missed ? "Missed voice call" : "Voice call"}
+          {missed ? (viewerIsCaller ? "Missed your call" : "Missed voice call") : "Voice call"}
         </p>
         <p className="text-xs text-muted-foreground">
           {missed

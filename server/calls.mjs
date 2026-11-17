@@ -105,6 +105,7 @@ function endCall(call, reason) {
   call.endReason = reason || '';
   void writeCallLog(call).catch((error) => console.warn('Call log write failed:', error?.message || error));
   if (call.ringTimer) clearTimeout(call.ringTimer);
+  if (call.ringCancelTimer) clearTimeout(call.ringCancelTimer);
   if (call.emptyTimer) clearTimeout(call.emptyTimer);
   for (const socket of call.sockets.values()) {
     try { socket.close(1000, reason || 'call ended'); } catch { /* ignore */ }
@@ -122,7 +123,7 @@ function endCall(call, reason) {
 async function writeCallLog(call) {
   const connected = Boolean(call.activeAt);
   const someoneDeclined = call.declined.size > 0;
-  const rangOut = call.endReason === 'ring-timeout';
+  const rangOut = call.endReason === 'ring-timeout' || call.endReason === 'no-answer';
   // Skip pure caller-cancels before anyone interacted — no noise in chat.
   if (!connected && !someoneDeclined && !rangOut) return;
 
@@ -421,6 +422,7 @@ export function registerCallRoutes(app, authenticate) {
       sockets: new Map(),
       audio: new Map(),
       ringTimer: null,
+      ringCancelTimer: null,
       emptyTimer: null,
       activeAt: null,
       endedAt: null,
@@ -435,6 +437,19 @@ export function registerCallRoutes(app, authenticate) {
       }
     }, RING_TIMEOUT_MS);
     call.ringTimer.unref?.();
+    // 1:1 calls auto-cancel after 15s of ringing with no pickup so the
+    // caller isn't left hanging; group calls keep the longer window.
+    memberIdsQuery(conversationId).then((ids) => {
+      if (ids.length > 2) return;
+      call.ringCancelTimer = setTimeout(() => {
+        const c = getCall(call.id);
+        if (c && c.state === 'ringing' && c.sockets.size === 0 && c.accepted.size <= 1) {
+          endCall(c, 'no-answer');
+          broadcastToMembers(c, 'call.ended', { reason: 'no-answer' }).catch(() => {});
+        }
+      }, 15_000);
+      call.ringCancelTimer.unref?.();
+    }).catch(() => {});
     calls.set(call.id, call);
     await broadcastToMembers(call, 'call.invite', {
       from: { id: req.user.id, username: req.user.username, display_name: req.user.display_name, avatar_url: req.user.avatar_url || '' },

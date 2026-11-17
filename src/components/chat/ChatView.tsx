@@ -510,10 +510,10 @@ export function ChatView({ conversationId: conversationIdProp, onBack, isMobile 
     };
   }, [isActive, isDM, isAnnouncements, channel, conversationIdProp]);
 
-  const renderMessageBody = (msg: { id: string; content: string | null }, suffix?: React.ReactNode) => {
+  const renderMessageBody = (msg: { id: string; content: string | null; sender_id?: string | null }, suffix?: React.ReactNode) => {
     if (!msg.content) return null;
     const callLog = parseCallLog(msg.content);
-    if (callLog) return <CallLogCard payload={callLog} conversationId={isDM ? conversationIdProp : null} />;
+    if (callLog) return <CallLogCard payload={callLog} conversationId={isDM ? conversationIdProp : null} senderId={msg.sender_id} />;
     const pollMarker = msg.content.match(/^\[\[poll:([0-9a-f-]{36})\]\]\s*$/i);
     if (pollMarker) return <PollCard pollId={pollMarker[1]} />;
     if (pollByMsgId[msg.id]) return <PollCard pollId={pollByMsgId[msg.id]} />;
