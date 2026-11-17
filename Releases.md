@@ -4,6 +4,34 @@ GitHub Releases are the public update source for the Windows desktop and Android
 
 Both apps are web shells around the deployed site, so `latest.json` carries a `min_app_version` field (sourced from `minAppVersion` in `package.json`): apps only prompt for a native update when the installed shell is older than that floor. Bump `minAppVersion` only when the native shell itself changes (plugins, permissions, updater, failover) — website-only releases do not require an app update.
 
+## Veyra 1.2.10
+
+Calls get dramatically better audio and Messenger-style history, plus the biggest infrastructure upgrade yet: geographically distributed read replicas serving Vercel traffic.
+
+### Voice calls
+
+- **Opus codec for call audio** — browsers with WebCodecs encode/decode Opus at 48 kHz (~54-byte frames vs 640-byte PCM, roughly **12× less bandwidth**) with loss concealment for packet loss. Old clients and unsupported browsers automatically fall back to PCM16 — fully backward compatible.
+- **Smoother, louder calls:** server-side jitter buffer, ring-buffer mic capture, send-gate hysteresis, and saner frame pacing fix choppy/quiet audio reported on poor connections.
+- **Messenger-style call history:** ending a call posts an encrypted system message in the chat — "Audio call", duration, outcome — with a **Call again** button.
+- **Unanswered calls auto-cancel after 15 seconds** and the caller's history shows a missed-call entry.
+
+### Performance & infrastructure
+
+- **Regional read replicas:** two streaming PostgreSQL standbys (Los Angeles + Bishkek) replicate the Mongolia primary in real time. Vercel requests are geo-routed by `x-vercel-ip-country` — Americas read from LA, everyone else from Bishkek — cutting database read latency from ~250 ms to ~10–30 ms for global users. Writes, auth, and consistency-sensitive reads always stay on the primary; a dead replica automatically falls back instead of failing.
+- **Vercel is now the default app host** for Android and Windows (Altare remains as automatic fallback), so native users get edge functions near them plus the regional database path.
+- New `docs/regional-database.md` documents the full replica topology, provisioning, and routing.
+
+### Reliability
+
+- Read pools degrade gracefully: replica connection failures retry on the primary — latency degrades, availability never does.
+- Call server and docs updated for the new codec negotiation and auto-cancel behavior.
+
+### Downloads (once published)
+
+- Windows: `Veyra1.2.10.exe`
+- Android: `AndroidVeyra1.2.10.apk`
+- Update metadata: `latest.json`
+
 ## Veyra 1.2.9
 
 The biggest release since launch: fully self-hosted voice calls, closed-app call ringing on Android, GIF favorites, profile songs, and the unreleased 1.2.8 work (upload limits, presence modes, QR friend codes, richer profiles).
