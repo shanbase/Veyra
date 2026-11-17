@@ -8,6 +8,49 @@ import { apiFetch, getNativeSessionToken, isNativeVeyraApp } from "@/lib/nativeS
 export const CALL_FRAME_SAMPLES = 320;
 export const CALL_SAMPLE_RATE = 16000;
 
+// Opus transport: WebCodecs AudioEncoder/Decoder at 48 kHz (the only rate
+// Opus supports there), resampled from our 16 kHz mix rate. Packets are
+// ~12x smaller than PCM and conceal small losses. The server tags Opus
+// frames with a 0x01 prefix byte; raw 640-byte frames stay PCM for
+// backward compatibility with older clients/servers.
+const OPUS_TAG = 0x01;
+const OPUS_RATE = 48000;
+const OPUS_FRAME = 960; // 20 ms @ 48 kHz
+
+let opusSupportPromise: Promise<boolean> | null = null;
+function opusSupported(): Promise<boolean> {
+  if (!opusSupportPromise) {
+    opusSupportPromise = (async () => {
+      try {
+        if (typeof AudioEncoder === "undefined" || typeof AudioDecoder === "undefined") return false;
+        const [enc, dec] = await Promise.all([
+          AudioEncoder.isConfigSupported({ codec: "opus", sampleRate: OPUS_RATE, numberOfChannels: 1, bitrate: 24000 } as AudioEncoderConfig),
+          AudioDecoder.isConfigSupported({ codec: "opus", sampleRate: OPUS_RATE, numberOfChannels: 1 } as AudioDecoderConfig),
+        ]);
+        return Boolean(enc.supported && dec.supported);
+      } catch {
+        return false;
+      }
+    })();
+  }
+  return opusSupportPromise;
+}
+
+// 16 kHz Int16 -> 48 kHz Float32, linear interpolation (960 samples).
+function upsampleTo48k(pcm: Int16Array): Float32Array {
+  const out = new Float32Array(OPUS_FRAME);
+  const step = (CALL_FRAME_SAMPLES - 1) / (OPUS_FRAME - 1);
+  for (let i = 0; i < OPUS_FRAME; i++) {
+    const p = i * step;
+    const i0 = Math.min(Math.floor(p), CALL_FRAME_SAMPLES - 1);
+    const frac = p - i0;
+    const a = pcm[i0] / 0x8000;
+    const b = pcm[Math.min(i0 + 1, CALL_FRAME_SAMPLES - 1)] / 0x8000;
+    out[i] = a + (b - a) * frac;
+  }
+  return out;
+}
+
 export type CallParticipant = { userId: string; name: string; avatarUrl?: string; muted: boolean };
 
 export type CallSignal = {
@@ -161,6 +204,12 @@ export class CallSession {
   private deafened = false;   // deafen = self-mute + local playback mute
   private closed = false;
   private micDenied = false;
+  private opusCapable = false;
+  private opusActive = false;
+  private opusEncoder: AudioEncoder | null = null;
+  private opusDecoder: AudioDecoder | null = null;
+  private opusTxTs = 0;
+  private opusRxTs = 0;
   readonly callId: string;
   readonly conversationId: string;
   participants: CallParticipant[] = [];
@@ -221,7 +270,37 @@ export class CallSession {
 
   private sendJoin() {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "join", callId: this.callId }));
+      this.ws.send(JSON.stringify({ type: "join", callId: this.callId, codec: this.opusCapable ? "opus" : "pcm" }));
+    }
+  }
+
+  private async ensureOpus() {
+    if (this.opusEncoder || this.opusDecoder) return;
+    try {
+      const encoder = new AudioEncoder({
+        output: (chunk) => {
+          const data = new Uint8Array(chunk.byteLength);
+          chunk.copyTo(data);
+          chunk.close();
+          const tagged = new Uint8Array(1 + data.length);
+          tagged[0] = OPUS_TAG;
+          tagged.set(data, 1);
+          if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.muted) {
+            this.ws.send(tagged.buffer);
+          }
+        },
+        error: () => { this.opusActive = false; },
+      });
+      await encoder.configure({ codec: "opus", sampleRate: OPUS_RATE, numberOfChannels: 1, bitrate: 24000 } as AudioEncoderConfig);
+      const decoder = new AudioDecoder({
+        output: (audioData) => this.playOpusData(audioData),
+        error: () => {},
+      });
+      await decoder.configure({ codec: "opus", sampleRate: OPUS_RATE, numberOfChannels: 1 } as AudioDecoderConfig);
+      this.opusEncoder = encoder;
+      this.opusDecoder = decoder;
+    } catch {
+      this.opusActive = false;
     }
   }
 
@@ -253,6 +332,10 @@ export class CallSession {
     // autoplay policy; playFrame() keeps retrying resume() until it runs.
     this.audioCtx = new AudioContext();
     void this.audioCtx.resume().catch(() => {});
+
+    // Opus support check is cheap and cached — do it before join so the
+    // codec preference reaches the server in the join message.
+    this.opusCapable = await opusSupported();
 
     // Mic is optional: users without one (or who deny permission) still join
     // and hear the call — the server simply receives no frames from them.
@@ -297,9 +380,7 @@ export class CallSession {
     if (workletReady) {
       this.worklet = new AudioWorkletNode(this.audioCtx!, "call-capture");
       this.worklet.port.onmessage = (event) => {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.muted) {
-          this.ws.send(event.data as ArrayBuffer);
-        }
+        this.sendAudioFrame(new Int16Array(event.data as ArrayBuffer));
       };
       source.connect(this.worklet);
       // The worklet only feeds the socket — never connect it to destination or
@@ -328,7 +409,12 @@ export class CallSession {
         outPos += step;
         if (outLen === CALL_FRAME_SAMPLES) {
           outLen = 0;
-          this.sendPcmChunk(out);
+          const pcm = new Int16Array(CALL_FRAME_SAMPLES);
+          for (let i = 0; i < CALL_FRAME_SAMPLES; i++) {
+            const s = Math.max(-1, Math.min(1, out[i]));
+            pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+          }
+          this.sendAudioFrame(pcm);
         }
       }
       const consumed = Math.floor(outPos);
@@ -346,12 +432,24 @@ export class CallSession {
     this.scriptProcessor = processor;
   }
 
-  private sendPcmChunk(samples: Float32Array) {
+  private sendAudioFrame(pcm: Int16Array) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.muted) return;
-    const pcm = new Int16Array(CALL_FRAME_SAMPLES);
-    for (let i = 0; i < CALL_FRAME_SAMPLES; i++) {
-      const s = Math.max(-1, Math.min(1, samples[i]));
-      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    if (this.opusActive && this.opusEncoder) {
+      // Backpressure: if the encoder is backed up, drop the frame rather
+      // than queueing seconds of stale audio.
+      if (this.opusEncoder.encodeQueueSize > 12) return;
+      const audioData = new AudioData({
+        format: "f32",
+        sampleRate: OPUS_RATE,
+        numberOfFrames: OPUS_FRAME,
+        numberOfChannels: 1,
+        timestamp: this.opusTxTs,
+        data: upsampleTo48k(pcm).buffer,
+      });
+      this.opusTxTs += 20000;
+      try { this.opusEncoder.encode(audioData); } catch { /* encoder resetting */ }
+      audioData.close();
+      return;
     }
     this.ws.send(pcm.buffer);
   }
@@ -360,6 +458,8 @@ export class CallSession {
     switch (msg.type) {
       case "welcome":
         this.reconnectAttempts = 0;
+        this.opusActive = this.opusCapable && msg.codec === "opus";
+        if (this.opusActive) void this.ensureOpus();
         this.participants = (msg.participants as CallParticipant[]) || [];
         this.events.onParticipants?.(this.participants);
         break;
@@ -397,23 +497,64 @@ export class CallSession {
     // Autoplay policy keeps the context 'suspended' until a user gesture;
     // keep retrying on every frame — once it unblocks, audio starts flowing.
     if (this.audioCtx.state === "suspended") void this.audioCtx.resume().catch(() => {});
+    // Opus frames are tagged 0x01 and are never exactly 640 bytes; raw PCM
+    // frames are exactly FRAME_SAMPLES*2 with no tag.
+    if (buffer.byteLength !== CALL_FRAME_SAMPLES * 2) {
+      const view = new Uint8Array(buffer);
+      if (view.length > 1 && view[0] === OPUS_TAG && this.opusDecoder) {
+        const chunk = new EncodedAudioChunk({ type: "key", timestamp: this.opusRxTs, data: view.subarray(1) });
+        this.opusRxTs += 20000;
+        try { this.opusDecoder.decode(chunk); } catch { /* undecodable packet */ }
+      }
+      return;
+    }
     if (buffer.byteLength < CALL_FRAME_SAMPLES * 2) return;
     const pcm = new Int16Array(buffer);
     const audioBuffer = this.audioCtx.createBuffer(1, CALL_FRAME_SAMPLES, CALL_SAMPLE_RATE);
     const channel = audioBuffer.getChannelData(0);
     for (let i = 0; i < CALL_FRAME_SAMPLES; i++) channel[i] = pcm[i] / 0x8000;
-    const source = this.audioCtx.createBufferSource();
+    this.scheduleBuffer(audioBuffer);
+  }
+
+  private scheduleBuffer(audioBuffer: AudioBuffer) {
+    const source = this.audioCtx!.createBufferSource();
     source.buffer = audioBuffer;
-    source.connect(this.audioCtx.destination);
+    source.connect(this.audioCtx!.destination);
     // Jitter buffer: schedule ~180 ms ahead so network bursts don't cause
     // underruns (that was the choppy/cut-out sound). Two resync rules:
     //  - fell behind → restart the cushion
     //  - got too far ahead (>400 ms) → pull back, otherwise delay grows forever
-    const now = this.audioCtx.currentTime;
-    if (this.nextPlayTime < now + 0.05) this.nextPlayTime = now + 0.18;
-    else if (this.nextPlayTime > now + 0.4) this.nextPlayTime = now + 0.18;
+    const now = this.audioCtx!.currentTime;
+    if (this.nextPlayTime < now + 0.05 || this.nextPlayTime > now + 0.4) this.nextPlayTime = now + 0.18;
     source.start(this.nextPlayTime);
-    this.nextPlayTime += CALL_FRAME_SAMPLES / CALL_SAMPLE_RATE;
+    this.nextPlayTime += audioBuffer.duration;
+  }
+
+  private playOpusData(audioData: AudioData) {
+    if (!this.audioCtx || this.deafened) {
+      audioData.close();
+      return;
+    }
+    if (this.audioCtx.state === "suspended") void this.audioCtx.resume().catch(() => {});
+    const frames = audioData.numberOfFrames;
+    const rate = audioData.sampleRate || OPUS_RATE;
+    const samples = new Float32Array(frames);
+    try {
+      audioData.copyTo(samples, { planeIndex: 0, format: "f32" });
+    } catch {
+      try {
+        const i16 = new Int16Array(frames);
+        audioData.copyTo(i16, { planeIndex: 0, format: "s16" });
+        for (let i = 0; i < frames; i++) samples[i] = i16[i] / 0x8000;
+      } catch {
+        audioData.close();
+        return;
+      }
+    }
+    audioData.close();
+    const audioBuffer = this.audioCtx.createBuffer(1, frames, rate);
+    audioBuffer.getChannelData(0).set(samples);
+    this.scheduleBuffer(audioBuffer);
   }
 
   setMuted(muted: boolean) {
@@ -447,6 +588,11 @@ export class CallSession {
 
   private cleanup() {
     this.closed = true;
+    try { void this.opusEncoder?.close(); } catch { /* ignore */ }
+    try { void this.opusDecoder?.close(); } catch { /* ignore */ }
+    this.opusEncoder = null;
+    this.opusDecoder = null;
+    this.opusActive = false;
     for (const track of this.stream?.getTracks() || []) track.stop();
     this.stream = null;
     void this.worklet?.disconnect();

@@ -31,6 +31,75 @@ const EMPTY_GRACE_MS = 30_000;
 const STALE_FRAME_MS = 200;
 const MAX_AUDIO_PAYLOAD = 16 * 1024;
 
+// ---- Opus codec (optional, WASM — no native build) ----
+// Wire format: binary frames are tagged — 0x01 + Opus packet, or a raw
+// 640-byte PCM16 frame from peers that don't do Opus. Opus runs at 48 kHz
+// (WebCodecs requirement) while the mixer stays at 16 kHz, so frames are
+// resampled at the edges. ~54-byte packets vs 640-byte PCM = ~12x less
+// bandwidth and real loss concealment.
+let OPUS_OK = false;
+let OpusCtor = null;
+try {
+  const mod = await import('opusscript');
+  OpusCtor = mod.default || mod;
+  new OpusCtor(48000, 1, OpusCtor.Application?.VOIP ?? 2048).delete();
+  OPUS_OK = true;
+} catch { /* Opus unavailable — PCM path still works everywhere. */ }
+
+const OPUS_TAG = 0x01;
+const OPUS_RATE = 48000;
+const OPUS_FRAME = 960; // 20 ms @ 48 kHz
+
+function resampleLinear(src, srcLen, dstLen) {
+  const out = new Int16Array(dstLen);
+  const step = (srcLen - 1) / Math.max(1, dstLen - 1);
+  for (let i = 0; i < dstLen; i++) {
+    const p = i * step;
+    const i0 = Math.min(Math.floor(p), srcLen - 1);
+    const frac = p - i0;
+    const a = src[i0];
+    const b = src[Math.min(i0 + 1, srcLen - 1)];
+    out[i] = Math.round(a + (b - a) * frac);
+  }
+  return out;
+}
+const up48 = (pcm16) => resampleLinear(pcm16, FRAME_SAMPLES, OPUS_FRAME);
+const down16 = (pcm48) => resampleLinear(pcm48.subarray(0, OPUS_FRAME), OPUS_FRAME, FRAME_SAMPLES);
+
+function opusApp() { return OpusCtor.Application?.VOIP ?? 2048; }
+function opusDecoderFor(socket) {
+  if (!socket.opusDec) socket.opusDec = new OpusCtor(OPUS_RATE, 1, opusApp());
+  return socket.opusDec;
+}
+function opusEncoderFor(socket) {
+  if (!socket.opusEnc) {
+    socket.opusEnc = new OpusCtor(OPUS_RATE, 1, opusApp());
+    try { socket.opusEnc.setBitrate(24000); } catch { /* default bitrate */ }
+  }
+  return socket.opusEnc;
+}
+function destroyOpus(socket) {
+  try { socket.opusDec?.delete(); } catch { /* ignore */ }
+  try { socket.opusEnc?.delete(); } catch { /* ignore */ }
+  socket.opusDec = null;
+  socket.opusEnc = null;
+}
+
+function decodeIncomingOpus(socket, packet) {
+  try {
+    const bytes = opusDecoderFor(socket).decode(packet);
+    return down16(new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.length / 2)));
+  } catch { return null; }
+}
+
+function encodeOutgoingOpus(socket, pcm320) {
+  const pkt = opusEncoderFor(socket).encode(up48(pcm320), OPUS_FRAME);
+  const out = Buffer.allocUnsafe(1 + pkt.length);
+  out[0] = OPUS_TAG;
+  pkt.copy(out, 1);
+  return out;
+}
+
 const calls = new Map(); // callId -> call record
 const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_AUDIO_PAYLOAD });
 let mixTimer = null;
@@ -239,7 +308,10 @@ function mixCall(call, now) {
         view[i] = sample > 32767 ? 32767 : sample < -32768 ? -32768 : sample;
       }
       if (socket.bufferedAmount > 64 * 1024) continue; // slow consumer — drop
-      try { socket.send(Buffer.from(view.buffer, view.byteOffset, FRAME_BYTES)); } catch { /* socket closing */ }
+      const payload = socket.wantsOpus && OPUS_OK
+        ? encodeOutgoingOpus(socket, view)
+        : Buffer.from(view.buffer, view.byteOffset, FRAME_BYTES);
+      try { socket.send(payload); } catch { /* socket closing */ }
     }
 }
 
@@ -311,6 +383,7 @@ async function handleJoin(socket, call, user) {
     callId: call.id,
     conversationId: call.conversationId,
     state: call.state,
+    codec: socket.wantsOpus ? 'opus' : 'pcm',
     participants: participantList(call),
   });
   broadcastRoom(call, { type: 'peer-joined', userId: user.id, name: socket.displayName, avatarUrl: socket.avatarUrl }, user.id);
@@ -347,7 +420,12 @@ wss.on('connection', (socket) => {
     if (isBinary) {
       const call = socket.callId ? getCall(socket.callId) : null;
       if (!call || call.state !== 'active' || socket.muted) return;
-      const frame = parseAudioFrame(data);
+      const raw = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      // Opus packets are tagged 0x01 and are never 640 bytes; raw PCM frames
+      // are exactly FRAME_BYTES with no tag (legacy clients).
+      const frame = raw.length !== FRAME_BYTES && raw.length > 1 && raw[0] === OPUS_TAG && socket.wantsOpus && OPUS_OK
+        ? decodeIncomingOpus(socket, raw.subarray(1))
+        : parseAudioFrame(raw);
       if (!frame) return;
       // Small per-speaker jitter queue (max ~240 ms) — latest-wins made
       // bursty arrivals drop whole frames and sound robotic.
@@ -370,6 +448,7 @@ wss.on('connection', (socket) => {
         sendJson(socket, { type: 'error', message: 'You are not allowed to join this call.' });
         return;
       }
+      socket.wantsOpus = OPUS_OK && msg.codec === 'opus';
       await handleJoin(socket, call, user);
       return;
     }
@@ -386,8 +465,8 @@ wss.on('connection', (socket) => {
       handleLeave(socket);
     }
   });
-  socket.on('close', () => handleLeave(socket));
-  socket.on('error', () => handleLeave(socket));
+  socket.on('close', () => { destroyOpus(socket); handleLeave(socket); });
+  socket.on('error', () => { destroyOpus(socket); handleLeave(socket); });
 });
 
 // Reap dead sockets: proxies can hold a TCP connection open long after the
