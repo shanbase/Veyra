@@ -443,7 +443,10 @@ export function registerCallRoutes(app, authenticate) {
       if (ids.length > 2) return;
       call.ringCancelTimer = setTimeout(() => {
         const c = getCall(call.id);
-        if (c && c.state === 'ringing' && c.sockets.size === 0 && c.accepted.size <= 1) {
+        // accepted holds the starter plus anyone who accepted or joined —
+        // sockets.size can't be used because the caller's own WS is always
+        // connected while ringing.
+        if (c && c.state === 'ringing' && c.accepted.size <= 1) {
           endCall(c, 'no-answer');
           broadcastToMembers(c, 'call.ended', { reason: 'no-answer' }).catch(() => {});
         }
