@@ -4,6 +4,42 @@ GitHub Releases are the public update source for the Windows desktop and Android
 
 Both apps are web shells around the deployed site, so `latest.json` carries a `min_app_version` field (sourced from `minAppVersion` in `package.json`): apps only prompt for a native update when the installed shell is older than that floor. Bump `minAppVersion` only when the native shell itself changes (plugins, permissions, updater, failover) — website-only releases do not require an app update.
 
+## Veyra 1.2.9
+
+The biggest release since launch: fully self-hosted voice calls, closed-app call ringing on Android, GIF favorites, profile songs, and the unreleased 1.2.8 work (upload limits, presence modes, QR friend codes, richer profiles).
+
+### Voice calls (new)
+
+- **Self-hosted 1:1 and group voice calls** across web, Windows desktop, and Android — no third-party call provider. Audio is raw PCM16 streamed over WebSocket to a dedicated call server (`veyra-calls` on Altare) that mixes group audio server-side.
+- **Messenger-style call UI:** full-screen call view with your profile pinned on top and participants below, draggable minimized floating card on desktop and mobile, caller avatar and name on the incoming-call screen.
+- **Rings when the app is closed (Android):** call invites fire a high-priority FCM push to a dedicated "Calls" notification channel, so the phone alerts even with Veyra fully closed. Tapping opens a full-screen incoming-call screen (over the lock screen where Android permits) with the caller's photo and Accept/Decline.
+- **Call audio polish:** phone-style ringtone with haptics, ringback tone while connecting, echo cancellation + noise suppression + high-pass filtering, optional "deafen" mode (local mute-all), and calls work without a microphone — you can still hear and join.
+- **Reliable signaling:** invites route through shared realtime plus runtime call-server discovery, with auto-reconnect — fixes "call doesn't exist" errors when clients hit different backends.
+
+### Chat & media
+
+- **GIF favorites sync securely:** favorited GIFs persist per-account in the database, encrypted at rest with the same AES-256-GCM message key — they follow you across devices.
+- **Faster, lighter uploads:** images are compressed client-side (AVIF/WebP with fallbacks) before upload and media sends are quicker overall.
+- **Per-bucket upload limits** (from 1.2.8): chat media enforces real bucket caps — images/videos 50 MB, voice 45 MB — instead of one flat limit.
+
+### Profiles
+
+- **Profile songs:** add a song to your profile with free search, artwork, and a spinning vinyl player — autoplays for viewers with an opt-out, starts at half volume.
+- **Richer profiles (from 1.2.8):** interests, languages, social links, animated video banners, presence modes (online / idle / do-not-disturb), and section ordering.
+- **QR friend codes (from 1.2.8):** scan a QR or open a link to send a friend request — or auto-accept when enabled.
+
+### Reliability & operations
+
+- **Maintenance mode** with a runtime admin toggle.
+- **Native update controls:** updates are manual-only by default and gated on `min_app_version` — bump it only when the native shell changes. This release bumps it to 1.2.9 because the Android shell gained call permissions (`USE_FULL_SCREEN_INTENT`, lock-screen flags).
+- **Altare U3 storage provider** behind `USE_SUPABASESTORAGE=false`, with a migration script — Supabase Storage remains the default and existing media keeps working.
+- **Self-healing schema cache** and assorted correctness fixes (friend queries, forwarded-media URLs, Redis scan on v6 clients).
+
+### Downloads (once published)
+
+- Windows: `Veyra1.2.9.exe`
+- Android: `AndroidVeyra1.2.9.apk`
+- Update metadata: `latest.json`
 ## Veyra 1.2.8
 
 Reliability and profile-customization release on top of 1.2.7.
