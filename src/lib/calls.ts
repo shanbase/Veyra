@@ -8,7 +8,7 @@ import { apiFetch, getNativeSessionToken, isNativeVeyraApp } from "@/lib/nativeS
 export const CALL_FRAME_SAMPLES = 320;
 export const CALL_SAMPLE_RATE = 16000;
 
-export type CallParticipant = { userId: string; name: string; muted: boolean };
+export type CallParticipant = { userId: string; name: string; avatarUrl?: string; muted: boolean };
 
 export type CallSignal = {
   type:
@@ -33,7 +33,7 @@ export type CallInfo = {
 };
 
 type SessionEvents = {
-  onPeerJoin?: (userId: string, name: string) => void;
+  onPeerJoin?: (userId: string, name: string, avatarUrl?: string) => void;
   onPeerLeave?: (userId: string) => void;
   onPeerMute?: (userId: string, muted: boolean) => void;
   onParticipants?: (participants: CallParticipant[]) => void;
@@ -190,6 +190,8 @@ export class CallSession {
     this.ws.send(JSON.stringify({ type: "join", callId: this.callId }));
   }
 
+  private scriptProcessor: ScriptProcessorNode | null = null;
+
   private async startMic() {
     if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone API unavailable.");
     this.stream = await navigator.mediaDevices.getUserMedia({
@@ -197,25 +199,77 @@ export class CallSession {
       video: false,
     });
     this.audioCtx = new AudioContext();
-    try {
-      await this.audioCtx.audioWorklet.addModule("/call-capture-worklet.js");
-    } catch (error) {
-      for (const track of this.stream?.getTracks() || []) track.stop();
-      this.stream = null;
-      await this.audioCtx.close().catch(() => {});
-      this.audioCtx = null;
-      throw error;
-    }
     const source = this.audioCtx.createMediaStreamSource(this.stream);
-    this.worklet = new AudioWorkletNode(this.audioCtx, "call-capture");
-    this.worklet.port.onmessage = (event) => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.muted) {
-        this.ws.send(event.data as ArrayBuffer);
+
+    if (this.audioCtx.audioWorklet) {
+      try {
+        await this.audioCtx.audioWorklet.addModule("/call-capture-worklet.js");
+      } catch (error) {
+        for (const track of this.stream?.getTracks() || []) track.stop();
+        this.stream = null;
+        await this.audioCtx.close().catch(() => {});
+        this.audioCtx = null;
+        throw error;
       }
+      this.worklet = new AudioWorkletNode(this.audioCtx, "call-capture");
+      this.worklet.port.onmessage = (event) => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN && !this.muted) {
+          this.ws.send(event.data as ArrayBuffer);
+        }
+      };
+      source.connect(this.worklet);
+      // The worklet only feeds the socket — never connect it to destination or
+      // the user hears their own mic back.
+      return;
+    }
+
+    // Fallback for WebViews without AudioWorklet: ScriptProcessorNode is
+    // deprecated but universally supported. It must stay connected to pull
+    // audio, so route it through a zero-gain node to avoid feedback.
+    const step = this.audioCtx.sampleRate / CALL_SAMPLE_RATE;
+    const pending: number[] = [];
+    const out = new Float32Array(CALL_FRAME_SAMPLES);
+    let outPos = 0;
+    let outLen = 0;
+    const processor = this.audioCtx.createScriptProcessor(2048, 1, 1);
+    processor.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      for (let i = 0; i < input.length; i++) pending.push(input[i]);
+      while (outPos + step <= pending.length) {
+        const i0 = Math.floor(outPos);
+        const frac = outPos - i0;
+        const a = pending[i0];
+        const b = pending[i0 + 1] || a;
+        out[outLen++] = a + (b - a) * frac;
+        outPos += step;
+        if (outLen === CALL_FRAME_SAMPLES) {
+          outLen = 0;
+          this.sendPcmChunk(out);
+        }
+      }
+      const consumed = Math.floor(outPos);
+      if (consumed > 0) {
+        pending.splice(0, consumed);
+        outPos -= consumed;
+      }
+      if (pending.length > this.audioCtx!.sampleRate) pending.splice(0, pending.length - this.audioCtx!.sampleRate);
     };
-    source.connect(this.worklet);
-    // The worklet only feeds the socket — never connect it to destination or
-    // the user hears their own mic back.
+    const muteGain = this.audioCtx.createGain();
+    muteGain.gain.value = 0;
+    source.connect(processor);
+    processor.connect(muteGain);
+    muteGain.connect(this.audioCtx.destination);
+    this.scriptProcessor = processor;
+  }
+
+  private sendPcmChunk(samples: Float32Array) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || this.muted) return;
+    const pcm = new Int16Array(CALL_FRAME_SAMPLES);
+    for (let i = 0; i < CALL_FRAME_SAMPLES; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    this.ws.send(pcm.buffer);
   }
 
   private handleSignal(msg: Record<string, unknown>) {
@@ -225,7 +279,7 @@ export class CallSession {
         this.events.onParticipants?.(this.participants);
         break;
       case "peer-joined":
-        this.events.onPeerJoin?.(String(msg.userId), String(msg.name || ""));
+        this.events.onPeerJoin?.(String(msg.userId), String(msg.name || ""), String(msg.avatarUrl || ""));
         break;
       case "peer-left":
         this.events.onPeerLeave?.(String(msg.userId));
@@ -278,6 +332,8 @@ export class CallSession {
     this.stream = null;
     void this.worklet?.disconnect();
     this.worklet = null;
+    this.scriptProcessor?.disconnect();
+    this.scriptProcessor = null;
     void this.audioCtx?.close().catch(() => {});
     this.audioCtx = null;
   }

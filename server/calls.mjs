@@ -130,7 +130,17 @@ function ensureMixTimer() {
 function mixTick() {
   const now = Date.now();
   for (const call of calls.values()) {
-    if (call.state === 'ended' || call.sockets.size === 0) continue;
+    try {
+      mixCall(call, now);
+    } catch (error) {
+      // One bad room must never kill the mixer for everyone else.
+      console.warn('Call mix failed:', error?.message || error);
+    }
+  }
+}
+
+function mixCall(call, now) {
+    if (call.state === 'ended' || call.sockets.size === 0) return;
     // Consume each speaker's pending frame exactly once per tick.
     const speakers = [];
     for (const [userId, entry] of call.audio) {
@@ -140,27 +150,28 @@ function mixTick() {
       }
       speakers.push([userId, entry.frame]);
     }
-    if (!speakers.length) continue;
+    if (!speakers.length) return;
 
     const total = new Int32Array(FRAME_SAMPLES);
     for (const [, frame] of speakers) {
       for (let i = 0; i < FRAME_SAMPLES; i++) total[i] += frame[i];
     }
 
-    const out = Buffer.allocUnsafe(FRAME_BYTES);
-    const view = new Int16Array(out.buffer, out.byteOffset, FRAME_SAMPLES);
     for (const [userId, socket] of call.sockets) {
       if (socket.readyState !== WebSocket.OPEN) continue;
+      // Fresh buffer per recipient — reusing one Buffer across socket.send()
+      // calls lets later writes corrupt frames still queued for earlier
+      // recipients, which is what made audio arrive silent/garbled.
       const own = call.audio.get(userId);
+      const view = new Int16Array(FRAME_SAMPLES);
       for (let i = 0; i < FRAME_SAMPLES; i++) {
         const sample = total[i] - (own ? own.frame[i] : 0);
         view[i] = sample > 32767 ? 32767 : sample < -32768 ? -32768 : sample;
       }
       if (socket.bufferedAmount > 256 * 1024) continue; // slow consumer — drop
-      try { socket.send(out); } catch { /* socket closing */ }
+      try { socket.send(Buffer.from(view.buffer, view.byteOffset, FRAME_BYTES)); } catch { /* socket closing */ }
     }
     call.audio.clear();
-  }
 }
 
 function parseAudioFrame(data) {
@@ -179,6 +190,7 @@ function participantList(call) {
   return [...call.sockets.entries()].map(([userId, socket]) => ({
     userId,
     name: socket.displayName || '',
+    avatarUrl: socket.avatarUrl || '',
     muted: socket.muted === true,
   }));
 }
@@ -213,6 +225,7 @@ async function handleJoin(socket, call, user) {
   socket.userId = user.id;
   socket.muted = false;
   socket.displayName = user.display_name || user.username || '';
+  socket.avatarUrl = user.avatar_url || '';
   call.accepted.add(user.id);
   call.declined.delete(user.id);
   if (becameActive) call.state = 'active';
@@ -227,7 +240,7 @@ async function handleJoin(socket, call, user) {
     state: call.state,
     participants: participantList(call),
   });
-  broadcastRoom(call, { type: 'peer-joined', userId: user.id, name: socket.displayName }, user.id);
+  broadcastRoom(call, { type: 'peer-joined', userId: user.id, name: socket.displayName, avatarUrl: socket.avatarUrl }, user.id);
   if (becameActive) {
     // Notify members who haven't joined that the call just went live.
     broadcastToMembers(call, 'call.active', { userId: user.id }).catch(() => {});
@@ -451,7 +464,7 @@ export function callTicketAuth(req, res, next) {
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
   const userId = verifyCallTicket(token);
   if (!userId) return res.status(401).json({ error: 'Invalid or expired call ticket.' });
-  pool.execute('SELECT id, username, display_name FROM profiles WHERE id = ? LIMIT 1', [userId])
+  pool.execute('SELECT id, username, display_name, avatar_url FROM profiles WHERE id = ? LIMIT 1', [userId])
     .then(([rows]) => {
       if (!rows.length) return res.status(401).json({ error: 'Unknown user.' });
       req.user = rows[0];
@@ -467,7 +480,7 @@ async function resolveUpgradeUser(req) {
     const userId = verifyCallTicket(ticket);
     if (!userId) return null;
     const [rows] = await pool.execute(
-      'SELECT id, username, display_name FROM profiles WHERE id = ? LIMIT 1',
+      'SELECT id, username, display_name, avatar_url FROM profiles WHERE id = ? LIMIT 1',
       [userId],
     );
     return rows[0] || null;
@@ -486,7 +499,7 @@ export function handleCallUpgrade(req, socket, head) {
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      ws.user = { id: user.id, username: user.username, display_name: user.display_name };
+      ws.user = { id: user.id, username: user.username, display_name: user.display_name, avatar_url: user.avatar_url };
       ws.binaryType = 'nodebuffer';
       wss.emit('connection', ws, req);
     });

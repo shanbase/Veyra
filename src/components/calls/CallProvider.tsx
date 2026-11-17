@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { Phone, PhoneOff, Mic, MicOff, Minus } from "lucide-react";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { useAuth } from "@/hooks/useAuth";
 import { toast } from "@/hooks/use-toast";
 import { subscribeCallSignals } from "@/integrations/supabase/mariadb-realtime";
@@ -99,11 +100,11 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
       onParticipants: (participants) => {
         setActiveCall((prev) => (prev && prev.callId === callId ? { ...prev, participants, connecting: false } : prev));
       },
-      onPeerJoin: (userId, name) => {
+      onPeerJoin: (userId, name, avatarUrl) => {
         setActiveCall((prev) => {
           if (!prev || prev.callId !== callId) return prev;
           if (prev.participants.some((p) => p.userId === userId)) return prev;
-          return { ...prev, participants: [...prev.participants, { userId, name, muted: false }] };
+          return { ...prev, participants: [...prev.participants, { userId, name, avatarUrl, muted: false }] };
         });
       },
       onPeerLeave: (userId) => {
@@ -295,7 +296,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     >
       {children}
       <IncomingCallDialog call={incomingCall} onAccept={acceptIncoming} onDecline={declineIncoming} />
-      <CallOverlay call={activeCall} onHangUp={hangUp} onToggleMute={toggleMute} />
+      <CallOverlay call={activeCall} selfId={user?.id} onHangUp={hangUp} onToggleMute={toggleMute} />
     </CallContext.Provider>
   );
 }
@@ -309,6 +310,34 @@ function IncomingCallDialog({
   onAccept: () => void;
   onDecline: () => void;
 }) {
+  // Soft two-tone ring while the invite is up — WebAudio so no asset needed.
+  useEffect(() => {
+    if (!call) return;
+    const ctx = new AudioContext();
+    let stopped = false;
+    let ringTimer: ReturnType<typeof setInterval> | null = null;
+    const beep = (freq: number, at: number, dur: number) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime + at);
+      gain.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + at + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + at + dur);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(ctx.currentTime + at);
+      osc.stop(ctx.currentTime + at + dur + 0.05);
+    };
+    const ring = () => { if (!stopped) { beep(440, 0, 0.35); beep(480, 0.4, 0.35); beep(440, 0.8, 0.35); } };
+    ring();
+    ringTimer = setInterval(ring, 2400);
+    return () => {
+      stopped = true;
+      if (ringTimer) clearInterval(ringTimer);
+      void ctx.close().catch(() => {});
+    };
+  }, [call?.callId]);
+
   if (!call) return null;
   return (
     <div className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm p-4">
@@ -358,10 +387,12 @@ function loadWidgetPos(): { x: number; y: number } | null {
 
 function CallOverlay({
   call,
+  selfId,
   onHangUp,
   onToggleMute,
 }: {
   call: ActiveCall | null;
+  selfId?: string;
   onHangUp: () => void;
   onToggleMute: () => void;
 }) {
@@ -391,6 +422,10 @@ function CallOverlay({
   const ss = String(seconds % 60).padStart(2, "0");
   const duration = `${mm}:${ss}`;
   const others = call.participants.filter((p) => p.name);
+  const tiles = [
+    ...(selfId ? [{ userId: selfId, name: "You", avatarUrl: undefined as string | undefined, muted: call.muted }] : []),
+    ...others.filter((p) => p.userId !== selfId),
+  ];
 
   // ---- minimized floating widget ----
   if (!expanded) {
@@ -455,13 +490,13 @@ function CallOverlay({
     );
   }
 
-  // ---- full-screen call view ----
+  // ---- full-screen call view (Messenger-style) ----
   return (
-    <div className="fixed inset-0 z-[100] flex flex-col bg-background">
+    <div className="fixed inset-0 z-[100] flex flex-col bg-gradient-to-b from-zinc-950 via-zinc-900 to-black text-white">
       <div className="flex items-center justify-between px-4 pt-4 sm:px-8 sm:pt-6">
         <div className="min-w-0">
           <p className="truncate text-lg font-semibold sm:text-xl">{call.title}</p>
-          <p className="text-sm text-muted-foreground">
+          <p className="text-sm text-zinc-400">
             {call.connecting ? "Connecting…" : `Voice call · ${duration}`}
             {call.micDenied && " · no mic"}
           </p>
@@ -469,7 +504,7 @@ function CallOverlay({
         <button
           type="button"
           onClick={() => setExpanded(false)}
-          className="flex h-10 w-10 items-center justify-center rounded-full bg-muted/60 text-foreground transition-colors hover:bg-muted"
+          className="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white transition-colors hover:bg-white/20"
           aria-label="Minimize call"
           title="Minimize"
         >
@@ -477,43 +512,54 @@ function CallOverlay({
         </button>
       </div>
 
-      <div className="flex flex-1 flex-col items-center justify-center gap-6 px-6">
-        <div className="relative">
-          <div className="flex h-28 w-28 items-center justify-center rounded-full bg-green-600/15 sm:h-36 sm:w-36">
-            <Phone className="h-12 w-12 text-green-600 sm:h-16 sm:w-16" />
-          </div>
-          <span className="absolute bottom-1 right-1 h-4 w-4 animate-pulse rounded-full bg-green-500 ring-4 ring-background" />
-        </div>
-        <div className="text-center">
-          <p className="text-2xl font-bold tracking-tight">{call.title}</p>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {others.length === 0
-              ? call.connecting ? "Waiting for others to join…" : "Just you so far"
-              : `${others.length + 1} participant${others.length === 0 ? "" : "s"}`}
-          </p>
-        </div>
-        {others.length > 0 && (
-          <div className="w-full max-w-xs space-y-1.5">
-            {others.slice(0, 8).map((p) => (
-              <div key={p.userId} className="flex items-center justify-between rounded-xl bg-muted/50 px-4 py-2.5">
-                <span className="truncate text-sm font-medium">{p.name || "Participant"}</span>
-                {p.muted && <MicOff className="h-4 w-4 flex-shrink-0 text-muted-foreground" />}
+      <div className="flex flex-1 flex-col items-center justify-center gap-8 overflow-y-auto px-6 py-8">
+        {tiles.length > 0 ? (
+          <div className={`grid w-full max-w-lg gap-4 ${tiles.length === 1 ? "grid-cols-1" : tiles.length === 2 ? "grid-cols-2" : "grid-cols-2 sm:grid-cols-3"}`}>
+            {tiles.map((p) => (
+              <div key={p.userId} className="flex flex-col items-center gap-2">
+                <div className="relative">
+                  <Avatar className="h-20 w-20 border-2 border-white/20 sm:h-24 sm:w-24">
+                    <AvatarImage src={p.avatarUrl || undefined} />
+                    <AvatarFallback className="bg-zinc-700 text-xl text-white">
+                      {(p.name || "?")[0]?.toUpperCase()}
+                    </AvatarFallback>
+                  </Avatar>
+                  {p.muted && (
+                    <span className="absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full bg-red-500 ring-2 ring-black">
+                      <MicOff className="h-3.5 w-3.5 text-white" />
+                    </span>
+                  )}
+                </div>
+                <p className="max-w-full truncate text-sm font-medium text-zinc-200">
+                  {p.userId === selfId ? "You" : p.name}
+                </p>
               </div>
             ))}
-            {others.length > 8 && (
-              <p className="px-4 text-xs text-muted-foreground">+{others.length - 8} more</p>
-            )}
+          </div>
+        ) : (
+          <div className="flex h-24 w-24 items-center justify-center rounded-full bg-green-600/20">
+            <Phone className="h-10 w-10 text-green-400" />
           </div>
         )}
+        <div className="text-center">
+          <p className="text-xl font-semibold">{call.title}</p>
+          <p className="mt-1 text-sm text-zinc-400">
+            {call.connecting
+              ? "Connecting…"
+              : tiles.length <= 1
+                ? "Waiting for others to join…"
+                : `${tiles.length} in call`}
+          </p>
+        </div>
       </div>
 
-      <div className="flex items-center justify-center gap-6 px-6 pb-10 sm:gap-10 sm:pb-14">
+      <div className="flex items-center justify-center gap-8 px-6 pb-10 sm:gap-14 sm:pb-14">
         <button
           type="button"
           onClick={onToggleMute}
           disabled={call.micDenied}
-          className={`flex h-16 w-16 flex-col items-center justify-center gap-1 rounded-full text-xs font-medium transition-colors disabled:opacity-40 ${
-            call.muted ? "bg-destructive text-destructive-foreground" : "bg-muted hover:bg-muted/80"
+          className={`flex h-14 w-14 flex-col items-center justify-center gap-1 rounded-full text-xs font-medium transition-colors disabled:opacity-40 ${
+            call.muted ? "bg-red-500 text-white" : "bg-white/10 text-white hover:bg-white/20"
           }`}
         >
           {call.muted ? <MicOff className="h-6 w-6" /> : <Mic className="h-6 w-6" />}
@@ -522,7 +568,7 @@ function CallOverlay({
         <button
           type="button"
           onClick={onHangUp}
-          className="flex h-16 w-16 items-center justify-center rounded-full bg-destructive text-destructive-foreground shadow-lg transition-transform hover:scale-105 active:scale-95"
+          className="flex h-16 w-16 items-center justify-center rounded-full bg-red-500 text-white shadow-lg transition-transform hover:scale-105 active:scale-95"
           aria-label="End call"
         >
           <PhoneOff className="h-7 w-7" />
