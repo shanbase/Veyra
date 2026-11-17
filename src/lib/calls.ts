@@ -39,6 +39,7 @@ type SessionEvents = {
   onParticipants?: (participants: CallParticipant[]) => void;
   onEnded?: (reason: string) => void;
   onError?: (message: string) => void;
+  onMicDenied?: () => void;
 };
 
 // When VITE_CALL_SERVER_URL points at the dedicated call server (e.g. the
@@ -138,6 +139,7 @@ export class CallSession {
   private nextPlayTime = 0;
   private muted = false;
   private closed = false;
+  private micDenied = false;
   readonly callId: string;
   readonly conversationId: string;
   participants: CallParticipant[] = [];
@@ -149,6 +151,7 @@ export class CallSession {
 
   get isMuted() { return this.muted; }
   get isOpen() { return !this.closed && this.ws?.readyState === WebSocket.OPEN; }
+  get hasMic() { return !this.micDenied; }
 
   async start(): Promise<void> {
     const url = await wsUrl();
@@ -178,17 +181,31 @@ export class CallSession {
       ws.addEventListener("close", onFail, { once: true });
     });
 
-    await this.startMic();
+    // Mic is optional: users without one (or who deny permission) still join
+    // and hear the call — the server simply receives no frames from them.
+    await this.startMic().catch(() => {
+      this.micDenied = true;
+      this.events.onMicDenied?.();
+    });
     this.ws.send(JSON.stringify({ type: "join", callId: this.callId }));
   }
 
   private async startMic() {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone API unavailable.");
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       video: false,
     });
     this.audioCtx = new AudioContext();
-    await this.audioCtx.audioWorklet.addModule("/call-capture-worklet.js");
+    try {
+      await this.audioCtx.audioWorklet.addModule("/call-capture-worklet.js");
+    } catch (error) {
+      for (const track of this.stream?.getTracks() || []) track.stop();
+      this.stream = null;
+      await this.audioCtx.close().catch(() => {});
+      this.audioCtx = null;
+      throw error;
+    }
     const source = this.audioCtx.createMediaStreamSource(this.stream);
     this.worklet = new AudioWorkletNode(this.audioCtx, "call-capture");
     this.worklet.port.onmessage = (event) => {

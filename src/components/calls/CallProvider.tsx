@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { Phone, PhoneOff, Mic, MicOff } from "lucide-react";
+import { Phone, PhoneOff, Mic, MicOff, Minus } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { toast } from "@/hooks/use-toast";
 import { subscribeCallSignals } from "@/integrations/supabase/mariadb-realtime";
@@ -27,6 +27,7 @@ type ActiveCall = {
   title: string;
   connecting: boolean;
   muted: boolean;
+  micDenied: boolean;
   startedAt: number;
   participants: CallParticipant[];
 };
@@ -116,6 +117,10 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
           : prev));
       },
       onEnded: () => endActiveCall(false),
+      onMicDenied: () => {
+        setActiveCall((prev) => (prev && prev.callId === callId ? { ...prev, micDenied: true } : prev));
+        toast({ title: "Microphone unavailable", description: "You can hear the call but not speak." });
+      },
       onError: (message) => toast({ title: "Call", description: message, variant: "destructive" }),
     });
     sessionRef.current = session;
@@ -125,6 +130,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
       title,
       connecting: true,
       muted: false,
+      micDenied: false,
       startedAt: Date.now(),
       participants: [],
     });
@@ -289,7 +295,7 @@ export function CallProvider({ children }: { children: React.ReactNode }) {
     >
       {children}
       <IncomingCallDialog call={incomingCall} onAccept={acceptIncoming} onDecline={declineIncoming} />
-      <ActiveCallPanel call={activeCall} onHangUp={hangUp} onToggleMute={toggleMute} />
+      <CallOverlay call={activeCall} onHangUp={hangUp} onToggleMute={toggleMute} />
     </CallContext.Provider>
   );
 }
@@ -336,7 +342,21 @@ function IncomingCallDialog({
   );
 }
 
-function ActiveCallPanel({
+const WIDGET_POS_KEY = "veyra-call-widget-pos";
+const WIDGET_W = 64;
+const WIDGET_H = 96;
+
+function loadWidgetPos(): { x: number; y: number } | null {
+  try {
+    const raw = localStorage.getItem(WIDGET_POS_KEY);
+    if (!raw) return null;
+    const pos = JSON.parse(raw);
+    if (typeof pos?.x === "number" && typeof pos?.y === "number") return pos;
+  } catch { /* ignore */ }
+  return null;
+}
+
+function CallOverlay({
   call,
   onHangUp,
   onToggleMute,
@@ -345,52 +365,167 @@ function ActiveCallPanel({
   onHangUp: () => void;
   onToggleMute: () => void;
 }) {
+  const [expanded, setExpanded] = useState(true);
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
+  const dragRef = useRef<{ startX: number; startY: number; origX: number; origY: number; moved: boolean; last?: { x: number; y: number } } | null>(null);
   const callId = call?.callId;
   const [, forceTick] = useState(0);
+
   useEffect(() => {
     if (!callId) return;
     const timer = setInterval(() => forceTick((n) => n + 1), 1000);
     return () => clearInterval(timer);
   }, [callId]);
 
+  // New call always opens full-screen; reset when the call ends.
+  useEffect(() => {
+    if (callId) {
+      setExpanded(true);
+      setPos(loadWidgetPos());
+    }
+  }, [callId]);
+
   if (!call) return null;
   const seconds = Math.floor((Date.now() - call.startedAt) / 1000);
   const mm = String(Math.floor(seconds / 60)).padStart(2, "0");
   const ss = String(seconds % 60).padStart(2, "0");
-  const others = call.participants.filter((p) => !p.name || p.name !== "");
+  const duration = `${mm}:${ss}`;
+  const others = call.participants.filter((p) => p.name);
 
+  // ---- minimized floating widget ----
+  if (!expanded) {
+    const clamp = (value: number, max: number) => Math.min(Math.max(value, 0), Math.max(0, max));
+    const widgetPos = pos || {
+      x: clamp(window.innerWidth - WIDGET_W - 16, 0, window.innerWidth),
+      y: clamp(window.innerHeight - WIDGET_H - 90, 0, window.innerHeight),
+    };
+    return (
+      <div
+        className="fixed z-[95] flex cursor-grab flex-col items-center justify-between rounded-3xl border border-border bg-card/95 px-2 py-3 shadow-2xl backdrop-blur active:cursor-grabbing select-none"
+        style={{ left: widgetPos.x, top: widgetPos.y, width: WIDGET_W, height: WIDGET_H, touchAction: "none" }}
+        onPointerDown={(e) => {
+          dragRef.current = { startX: e.clientX, startY: e.clientY, origX: widgetPos.x, origY: widgetPos.y, moved: false };
+          (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
+        }}
+        onPointerMove={(e) => {
+          const drag = dragRef.current;
+          if (!drag) return;
+          const dx = e.clientX - drag.startX;
+          const dy = e.clientY - drag.startY;
+          if (!drag.moved && Math.hypot(dx, dy) > 6) drag.moved = true;
+          if (drag.moved) {
+            const next = {
+              x: clamp(drag.origX + dx, window.innerWidth - WIDGET_W),
+              y: clamp(drag.origY + dy, window.innerHeight - WIDGET_H),
+            };
+            drag.last = next;
+            setPos(next);
+          }
+        }}
+        onPointerUp={() => {
+          const drag = dragRef.current;
+          dragRef.current = null;
+          if (drag?.moved) {
+            if (drag.last) localStorage.setItem(WIDGET_POS_KEY, JSON.stringify(drag.last));
+          } else {
+            setExpanded(true); // tap to restore
+          }
+        }}
+        role="button"
+        aria-label="Restore call"
+        title="Voice call — tap to expand"
+      >
+        <span className="relative flex h-9 w-9 items-center justify-center rounded-full bg-green-600/15">
+          <Phone className="h-4 w-4 text-green-600" />
+          <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 animate-pulse rounded-full bg-green-500" />
+        </span>
+        <span className="text-[10px] font-semibold tracking-tight text-foreground [writing-mode:vertical-rl] rotate-180">
+          {call.connecting ? "connecting" : duration}
+        </span>
+        <button
+          type="button"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => { e.stopPropagation(); onHangUp(); }}
+          className="flex h-8 w-8 items-center justify-center rounded-full bg-destructive text-destructive-foreground"
+          aria-label="End call"
+        >
+          <PhoneOff className="h-4 w-4" />
+        </button>
+      </div>
+    );
+  }
+
+  // ---- full-screen call view ----
   return (
-    <div className="fixed bottom-4 right-4 z-[90] w-72 rounded-2xl border border-border bg-card/95 backdrop-blur shadow-2xl p-4">
-      <div className="flex items-center gap-3">
-        <div className="flex h-10 w-10 items-center justify-center rounded-full bg-green-600/15">
-          <Phone className="h-5 w-5 text-green-600" />
-        </div>
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-semibold">{call.title}</p>
-          <p className="text-xs text-muted-foreground">
-            {call.connecting ? "Connecting…" : `${mm}:${ss}`}
-            {others.length > 0 && ` · ${others.length + 1} in call`}
+    <div className="fixed inset-0 z-[100] flex flex-col bg-background">
+      <div className="flex items-center justify-between px-4 pt-4 sm:px-8 sm:pt-6">
+        <div className="min-w-0">
+          <p className="truncate text-lg font-semibold sm:text-xl">{call.title}</p>
+          <p className="text-sm text-muted-foreground">
+            {call.connecting ? "Connecting…" : `Voice call · ${duration}`}
+            {call.micDenied && " · no mic"}
           </p>
         </div>
+        <button
+          type="button"
+          onClick={() => setExpanded(false)}
+          className="flex h-10 w-10 items-center justify-center rounded-full bg-muted/60 text-foreground transition-colors hover:bg-muted"
+          aria-label="Minimize call"
+          title="Minimize"
+        >
+          <Minus className="h-5 w-5" />
+        </button>
       </div>
-      <div className="mt-3 flex items-center gap-2">
+
+      <div className="flex flex-1 flex-col items-center justify-center gap-6 px-6">
+        <div className="relative">
+          <div className="flex h-28 w-28 items-center justify-center rounded-full bg-green-600/15 sm:h-36 sm:w-36">
+            <Phone className="h-12 w-12 text-green-600 sm:h-16 sm:w-16" />
+          </div>
+          <span className="absolute bottom-1 right-1 h-4 w-4 animate-pulse rounded-full bg-green-500 ring-4 ring-background" />
+        </div>
+        <div className="text-center">
+          <p className="text-2xl font-bold tracking-tight">{call.title}</p>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {others.length === 0
+              ? call.connecting ? "Waiting for others to join…" : "Just you so far"
+              : `${others.length + 1} participant${others.length === 0 ? "" : "s"}`}
+          </p>
+        </div>
+        {others.length > 0 && (
+          <div className="w-full max-w-xs space-y-1.5">
+            {others.slice(0, 8).map((p) => (
+              <div key={p.userId} className="flex items-center justify-between rounded-xl bg-muted/50 px-4 py-2.5">
+                <span className="truncate text-sm font-medium">{p.name || "Participant"}</span>
+                {p.muted && <MicOff className="h-4 w-4 flex-shrink-0 text-muted-foreground" />}
+              </div>
+            ))}
+            {others.length > 8 && (
+              <p className="px-4 text-xs text-muted-foreground">+{others.length - 8} more</p>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="flex items-center justify-center gap-6 px-6 pb-10 sm:gap-10 sm:pb-14">
         <button
           type="button"
           onClick={onToggleMute}
-          className={`flex h-10 flex-1 items-center justify-center gap-2 rounded-xl text-sm font-medium transition-colors ${
-            call.muted ? "bg-destructive/15 text-destructive" : "bg-muted hover:bg-muted/80"
+          disabled={call.micDenied}
+          className={`flex h-16 w-16 flex-col items-center justify-center gap-1 rounded-full text-xs font-medium transition-colors disabled:opacity-40 ${
+            call.muted ? "bg-destructive text-destructive-foreground" : "bg-muted hover:bg-muted/80"
           }`}
         >
-          {call.muted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+          {call.muted ? <MicOff className="h-6 w-6" /> : <Mic className="h-6 w-6" />}
           {call.muted ? "Unmute" : "Mute"}
         </button>
         <button
           type="button"
           onClick={onHangUp}
-          className="flex h-10 flex-1 items-center justify-center gap-2 rounded-xl bg-destructive text-destructive-foreground text-sm font-medium transition-colors hover:bg-destructive/90"
+          className="flex h-16 w-16 items-center justify-center rounded-full bg-destructive text-destructive-foreground shadow-lg transition-transform hover:scale-105 active:scale-95"
+          aria-label="End call"
         >
-          <PhoneOff className="h-4 w-4" />
-          End
+          <PhoneOff className="h-7 w-7" />
         </button>
       </div>
     </div>
