@@ -1,6 +1,6 @@
 import express from 'express';
 import { createHash } from 'node:crypto';
-import { pool, isPostgres } from './db.mjs';
+import { pool, isPostgres, regionStore, regionForCountry } from './db.mjs';
 import { queryData } from './data.mjs';
 import { callRpc } from './rpc.mjs';
 import { sendTestNotification, deliverPushNotification } from './notifications.mjs';
@@ -128,6 +128,14 @@ export function createApp() {
     if (process.env.NODE_ENV === 'production' && String(process.env.APP_URL || '').startsWith('https://')) {
       res.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains');
     }
+    next();
+  });
+  // Geo routing for read replicas: Vercel injects x-vercel-ip-country on every
+  // request; map it to 'us'/'eu' so readPool() picks the nearest replica.
+  // Requests without the header (Altare API, direct) keep the default pool.
+  app.use((req, _res, next) => {
+    const region = regionForCountry(req.headers['x-vercel-ip-country']);
+    if (region) regionStore.enterWith(region);
     next();
   });
   app.use((req, _res, next) => {

@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import mysql from 'mysql2/promise';
 import pg from 'pg';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 dotenv.config({ path: ['.env.local', '.env'] });
 
@@ -334,13 +335,29 @@ export const pool = isPostgres
       decimalNumbers: true,
     });
 
-// Read replica: when POSTGRES_READ_URL is set (Postgres dialect only), user-
-// facing SELECTs go to the replica while writes/auth/consistency-sensitive
-// reads stay on the primary pool. Unset → poolRead is just `pool`.
-export const poolRead = (() => {
-  if (!isPostgres) return pool;
-  const url = String(process.env.POSTGRES_READ_URL || '').trim();
-  if (!url) return pool;
+// Read replicas: POSTGRES_READ_URL (default) plus optional per-region URLs
+// POSTGRES_READ_URL_US / POSTGRES_READ_URL_EU (Postgres dialect only).
+// app.mjs sets the request region from the Vercel geo header; user-facing
+// SELECTs go to the matching replica while writes/auth/consistency-sensitive
+// reads stay on the primary pool. Unset URLs degrade to the primary pool.
+export const regionStore = new AsyncLocalStorage();
+
+const US_REGIONS = new Set(
+  'US CA MX BZ GT SV HN NI CR PA CU DO HT JM PR TT BB BS AG DM GD KN LC VC AI MS TC VG KY BM GF FK BR AR CL CO PE VE EC BO PY UY GY SR'.split(' ')
+);
+export function regionForCountry(country) {
+  const c = String(country || '').toUpperCase();
+  if (!c) return null;
+  return US_REGIONS.has(c) ? 'us' : 'eu';
+}
+export function currentRegion() {
+  return regionStore.getStore() || null;
+}
+
+function makeReadPool(envVar) {
+  if (!isPostgres) return null;
+  const url = String(process.env[envVar] || '').trim();
+  if (!url) return null;
   try {
     const replica = createPgPool({
       connectionString: url,
@@ -352,7 +369,7 @@ export const poolRead = (() => {
       options: '-c timezone=UTC',
     });
     replica.query('SELECT 1').catch((error) =>
-      console.error('Postgres read replica unreachable:', error?.message || error));
+      console.error(`Postgres read replica (${envVar}) unreachable:`, error?.message || error));
     // A dead replica must not take down reads: connection-level failures fall
     // back to the primary pool. Query-level errors still propagate.
     const isConnError = (error) =>
@@ -367,6 +384,21 @@ export const poolRead = (() => {
       end: replica.end,
     };
   } catch {
-    return pool;
+    return null;
   }
-})();
+}
+
+const readPoolDefault = makeReadPool('POSTGRES_READ_URL');
+const readPoolUS = makeReadPool('POSTGRES_READ_URL_US');
+const readPoolEU = makeReadPool('POSTGRES_READ_URL_EU');
+
+// Back-compat: the original single-replica export.
+export const poolRead = readPoolDefault || pool;
+
+// Region-aware read pool for the current request. Falls back: region pool ?
+// default replica ? primary.
+export function readPool() {
+  const region = currentRegion();
+  const regional = region === 'us' ? readPoolUS : region === 'eu' ? readPoolEU : null;
+  return regional || readPoolDefault || pool;
+}

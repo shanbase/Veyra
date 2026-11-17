@@ -69,3 +69,8 @@ store, not a replica.
 When `POSTGRES_READ_URL` points at a streaming replica of the primary, `server/db.mjs` creates a second pool (`poolRead`) and `server/data.mjs` + `server/rpc.mjs` route user-facing SELECTs and read-only RPCs (DM/group lists, admin stats) to it. Writes, auth, membership checks, and receipt updates always use the primary pool. Replica lag is typically sub-second; clients still receive new rows instantly via Supabase Realtime broadcast, so brief replica lag does not lose messages.
 
 The replica itself is provisioned with `shanbase/postgresql` in replica mode (`PG_REPLICA_HOST` etc.) — see that repo for `pg_basebackup` bootstrap.
+
+## Regional read replicas
+
+`POSTGRES_READ_URL_US` and `POSTGRES_READ_URL_EU` create additional read pools. `server/app.mjs` maps the request's `x-vercel-ip-country` header (injected by Vercel) to `us` (Americas) or `eu` (everywhere else); `readPool()` then serves user-facing SELECTs from the nearest replica. Fallback order: region pool ? `POSTGRES_READ_URL` ? primary. Requests without a geo hint (Altare API, direct) use the default pool. Writes, auth, and consistency-sensitive reads always use the primary.
+

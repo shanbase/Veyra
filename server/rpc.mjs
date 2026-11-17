@@ -1,5 +1,5 @@
 import { randomUUID, randomBytes } from 'node:crypto';
-import { pool, poolRead, isPostgres } from './db.mjs';
+import { pool, readPool, isPostgres } from './db.mjs';
 import { encryptField } from './encryption.mjs';
 import { notifyNewMessage } from './notifications.mjs';
 import { cachedUserRoles } from './redis.mjs';
@@ -39,7 +39,7 @@ async function groupRole(userId, conversationId, connection = pool) {
 }
 
 async function userDmList(userId) {
-  const [rows] = await poolRead.execute(
+  const [rows] = await readPool().execute(
     `SELECT c.id AS conversation_id, other.user_id AS other_user_id,
       p.username AS other_username, p.display_name AS other_display_name,
       p.avatar_url AS other_avatar_url, p.status AS other_status,
@@ -64,7 +64,7 @@ async function userDmList(userId) {
 }
 
 async function userGroupList(userId) {
-  const [rows] = await poolRead.execute(
+  const [rows] = await readPool().execute(
     `SELECT c.id AS conversation_id, c.name, mine.role AS my_role,
       (SELECT COUNT(*) FROM conversation_members mc WHERE mc.conversation_id = c.id) AS member_count,
       (SELECT COUNT(*) FROM messages um WHERE um.conversation_id = c.id AND um.sender_id <> ? AND um.read_at IS NULL) AS unread_count,
@@ -87,12 +87,12 @@ export async function callRpc(userId, name, args = {}) {
     case 'get_user_group_list': return userGroupList(userId);
     case 'get_user_role_for_admin': {
       if (!await adminCheck(userId)) throw new Error('Admin access required.');
-      const [rows] = await poolRead.execute('SELECT role FROM user_roles WHERE user_id = ? ORDER BY role = \'super_admin\' DESC LIMIT 1', [args._target_user_id]);
+      const [rows] = await readPool().execute('SELECT role FROM user_roles WHERE user_id = ? ORDER BY role = \'super_admin\' DESC LIMIT 1', [args._target_user_id]);
       return rows[0]?.role ?? null;
     }
     case 'get_admin_analytics_counts': {
       if (!await adminCheck(userId)) throw new Error('Admin access required.');
-      const [rows] = await poolRead.query(`SELECT
+      const [rows] = await readPool().query(`SELECT
         (SELECT COUNT(*) FROM conversations WHERE is_group = 0) AS totalConversations,
         (SELECT COUNT(*) FROM messages) AS totalMessages,
         (SELECT COUNT(*) FROM friend_requests WHERE status = 'accepted') AS totalFriendships,
@@ -103,7 +103,7 @@ export async function callRpc(userId, name, args = {}) {
     case 'get_admin_daily_stats': {
       if (!await adminCheck(userId)) throw new Error('Admin access required.');
       const days = Math.min(Math.max(Number(args.days_count || 7), 1), 90);
-      const [rows] = await poolRead.query(`SELECT calendar.day,
+      const [rows] = await readPool().query(`SELECT calendar.day,
         COALESCE((SELECT COUNT(*) FROM messages WHERE DATE(created_at) = calendar.day), 0) AS messages,
         COALESCE((SELECT COUNT(*) FROM global_messages WHERE DATE(created_at) = calendar.day), 0) AS global_messages,
         COALESCE((SELECT COUNT(*) FROM profiles WHERE DATE(created_at) = calendar.day), 0) AS new_users
@@ -115,7 +115,7 @@ export async function callRpc(userId, name, args = {}) {
     case 'get_admin_top_users': {
       if (!await adminCheck(userId)) throw new Error('Admin access required.');
       const limit = Math.min(Math.max(Number(args.limit_count || 10), 1), 100);
-      const [rows] = await poolRead.execute(`SELECT p.id, p.username, p.display_name, p.avatar_url,
+      const [rows] = await readPool().execute(`SELECT p.id, p.username, p.display_name, p.avatar_url,
         COALESCE(m.message_count, 0) + COALESCE(gm.message_count, 0) AS message_count
         FROM profiles p
         LEFT JOIN (SELECT sender_id, COUNT(*) AS message_count FROM messages GROUP BY sender_id) m ON m.sender_id = p.id
