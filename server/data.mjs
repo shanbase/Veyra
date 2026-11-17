@@ -260,11 +260,12 @@ function filterSql(filters, columns) {
 
 function parseOr(raw, columns) {
   if (!raw) return { sql: '', args: [] };
-  if (String(raw).length > MAX_OR_LENGTH) throw new Error('OR filter is too long.');
-  const clauses = String(raw).split(',');
+  const text = String(raw);
+  if (text.length > MAX_OR_LENGTH) throw new Error('OR filter is too long.');
   const args = [];
-  const sql = clauses.map((clause) => {
-    const match = clause.match(/^([a-zA-Z_][a-zA-Z0-9_]*)\.(eq|neq|ilike)\.(.*)$/);
+
+  const parseCondition = (clause) => {
+    const match = clause.trim().match(/^([a-zA-Z_][a-zA-Z0-9_]*)\.(eq|neq|ilike)\.(.*)$/);
     if (!match) throw new Error('Unsupported OR filter.');
     const col = identifier(match[1], columns);
     const op = match[2];
@@ -272,8 +273,35 @@ function parseOr(raw, columns) {
     if (op === 'ilike') { args.push(escapeLike(value)); return `LOWER(${col}) LIKE LOWER(?)`; }
     args.push(normalizeTemporalValue(value, columns.get(match[1])));
     return `${col} ${op === 'eq' ? '=' : '<>'} ?`;
+  };
+
+  // Split on top-level commas only — and(col.op.val,...) groups contain
+  // commas of their own.
+  const topLevel = [];
+  let depth = 0;
+  let current = '';
+  for (const ch of text) {
+    if (ch === '(') depth += 1;
+    else if (ch === ')') depth = Math.max(0, depth - 1);
+    if (ch === ',' && depth === 0) {
+      topLevel.push(current);
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  topLevel.push(current);
+
+  const clauses = topLevel.map((clause) => {
+    const trimmed = clause.trim();
+    const andMatch = trimmed.match(/^and\((.*)\)$/is);
+    if (andMatch) {
+      return `(${andMatch[1].split(',').map(parseCondition).join(' AND ')})`;
+    }
+    return `(${parseCondition(trimmed)})`;
   });
-  return { sql: `(${sql.join(' OR ')})`, args };
+
+  return { sql: `(${clauses.join(' OR ')})`, args };
 }
 
 function selection(select, columns) {

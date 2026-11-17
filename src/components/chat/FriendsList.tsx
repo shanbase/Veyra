@@ -529,7 +529,6 @@ export function FriendsList({ onSelectConversation, selectedConversationId }: Fr
       const { data: existingRequest } = await supabase
         .from("friend_requests")
         .select("*")
-        .or(`sender_id.eq.${user.id},receiver_id.eq.${user.id}`)
         .or(`sender_id.eq.${targetUser.id},receiver_id.eq.${targetUser.id}`);
 
       // Only block if there's a pending or accepted relationship — a
