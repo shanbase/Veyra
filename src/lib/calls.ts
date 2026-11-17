@@ -405,9 +405,13 @@ export class CallSession {
     const source = this.audioCtx.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(this.audioCtx.destination);
-    // Jitter buffer: schedule ~120 ms ahead; if we fall behind, resync.
+    // Jitter buffer: schedule ~180 ms ahead so network bursts don't cause
+    // underruns (that was the choppy/cut-out sound). Two resync rules:
+    //  - fell behind → restart the cushion
+    //  - got too far ahead (>400 ms) → pull back, otherwise delay grows forever
     const now = this.audioCtx.currentTime;
-    if (this.nextPlayTime < now + 0.05) this.nextPlayTime = now + 0.12;
+    if (this.nextPlayTime < now + 0.05) this.nextPlayTime = now + 0.18;
+    else if (this.nextPlayTime > now + 0.4) this.nextPlayTime = now + 0.18;
     source.start(this.nextPlayTime);
     this.nextPlayTime += CALL_FRAME_SAMPLES / CALL_SAMPLE_RATE;
   }

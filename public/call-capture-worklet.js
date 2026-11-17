@@ -28,9 +28,12 @@ class CallCaptureProcessor extends AudioWorkletProcessor {
     // Adaptive noise gate: tracks a noise floor from frame RMS. The floor
     // drops instantly on quiet frames and creeps up slowly, so sustained
     // background noise (wind, distant voices, fans) gets gated while speech
-    // bursts pass through.
-    this.noiseFloor = 0.015;
+    // bursts pass through. Hysteresis (open/close thresholds) stops the gate
+    // fluttering on borderline speech — that flutter is what made voices
+    // sound choppy and "repeat" syllables.
+    this.noiseFloor = 0.01;
     this.gate = 1;
+    this.gateOpen = true;
   }
 
   emit() {
@@ -42,10 +45,17 @@ class CallCaptureProcessor extends AudioWorkletProcessor {
     if (rms < this.noiseFloor) this.noiseFloor = rms;
     else this.noiseFloor += (rms - this.noiseFloor) * 0.002;
 
-    const threshold = Math.max(this.noiseFloor * 3, 0.005);
-    const gateTarget = rms > threshold ? 1 : 0.1;
+    // Hysteresis: once open, only close when clearly below the floor; once
+    // closed, only open clearly above it. The gate floor is shallow (0.35)
+    // so quiet voices stay audible instead of being crushed to a whisper.
+    const openThresh = Math.max(this.noiseFloor * 2.5, 0.004);
+    const closeThresh = openThresh * 0.5;
+    if (this.gateOpen ? rms < closeThresh : rms > openThresh) {
+      this.gateOpen = !this.gateOpen;
+    }
+    const gateTarget = this.gateOpen ? 1 : 0.45;
     // Attack fast (open immediately on speech), release slow (no chopping).
-    this.gate += (gateTarget - this.gate) * (gateTarget > this.gate ? 0.6 : 0.015);
+    this.gate += (gateTarget - this.gate) * (gateTarget > this.gate ? 0.6 : 0.03);
 
     const pcm = new Int16Array(FRAME_SAMPLES);
     for (let i = 0; i < FRAME_SAMPLES; i++) {
@@ -53,7 +63,12 @@ class CallCaptureProcessor extends AudioWorkletProcessor {
       const y = x - this.hpX1 + this.HP_COEF * this.hpY1;
       this.hpX1 = x;
       this.hpY1 = y;
-      const s = Math.max(-1, Math.min(1, y * this.gate));
+      // Mild makeup gain for quiet mics, soft-clipped above ~0.7 so loud
+      // speech compresses instead of distorting.
+      let v = y * this.gate * 1.35;
+      if (v > 0.7) v = 0.7 + (v - 0.7) * 0.25;
+      else if (v < -0.7) v = -0.7 + (v + 0.7) * 0.25;
+      const s = Math.max(-1, Math.min(1, v));
       pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
     this.port.postMessage(pcm.buffer, [pcm.buffer]);

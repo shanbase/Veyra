@@ -28,7 +28,7 @@ const TICK_MS = 20;
 const MAX_PARTICIPANTS = 12;
 const RING_TIMEOUT_MS = 90_000;
 const EMPTY_GRACE_MS = 30_000;
-const STALE_FRAME_MS = 80;
+const STALE_FRAME_MS = 200;
 const MAX_AUDIO_PAYLOAD = 16 * 1024;
 
 const calls = new Map(); // callId -> call record
@@ -173,7 +173,17 @@ function scheduleEmptyCleanup(call) {
 
 function ensureMixTimer() {
   if (mixTimer) return;
-  mixTimer = setInterval(mixTick, TICK_MS);
+  // Drift-corrected scheduler: setInterval slips under load, which bunches
+  // frames and sounds like chopping. Schedule each tick relative to the
+  // previous deadline instead.
+  let expected = Date.now() + TICK_MS;
+  const tick = () => {
+    mixTick();
+    expected += TICK_MS;
+    mixTimer = setTimeout(tick, Math.max(0, expected - Date.now()));
+    mixTimer.unref?.();
+  };
+  mixTimer = setTimeout(tick, TICK_MS);
   mixTimer.unref?.();
 }
 
@@ -218,7 +228,7 @@ function mixCall(call, now) {
         const sample = total[i] - (own ? own.frame[i] : 0);
         view[i] = sample > 32767 ? 32767 : sample < -32768 ? -32768 : sample;
       }
-      if (socket.bufferedAmount > 256 * 1024) continue; // slow consumer — drop
+      if (socket.bufferedAmount > 64 * 1024) continue; // slow consumer — drop
       try { socket.send(Buffer.from(view.buffer, view.byteOffset, FRAME_BYTES)); } catch { /* socket closing */ }
     }
     call.audio.clear();
