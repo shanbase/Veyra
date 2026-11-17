@@ -6,6 +6,7 @@ import { useAuth } from "@/hooks/useAuth";
 import { toast } from "@/hooks/use-toast";
 import { subscribeCallSignals } from "@/integrations/supabase/mariadb-realtime";
 import { consumePendingCallInvite, type CallInvitePush } from "@/lib/pushNotifications";
+import { startRingback, startRingtone } from "@/lib/callTones";
 import {
   CallSession,
   acceptCall,
@@ -383,32 +384,10 @@ function IncomingCallDialog({
   onAccept: () => void;
   onDecline: () => void;
 }) {
-  // Soft two-tone ring while the invite is up — WebAudio so no asset needed.
+  // Phone-style ring while the invite is up (WebAudio, no asset needed).
   useEffect(() => {
     if (!call) return;
-    const ctx = new AudioContext();
-    let stopped = false;
-    let ringTimer: ReturnType<typeof setInterval> | null = null;
-    const beep = (freq: number, at: number, dur: number) => {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.0001, ctx.currentTime + at);
-      gain.gain.exponentialRampToValueAtTime(0.08, ctx.currentTime + at + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + at + dur);
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(ctx.currentTime + at);
-      osc.stop(ctx.currentTime + at + dur + 0.05);
-    };
-    const ring = () => { if (!stopped) { beep(440, 0, 0.35); beep(480, 0.4, 0.35); beep(440, 0.8, 0.35); } };
-    ring();
-    ringTimer = setInterval(ring, 2400);
-    return () => {
-      stopped = true;
-      if (ringTimer) clearInterval(ringTimer);
-      void ctx.close().catch(() => {});
-    };
+    return startRingtone();
   }, [call?.callId]);
 
   if (!call) return null;
@@ -519,6 +498,13 @@ function CallOverlay({
       setPos(loadWidgetPos());
     }
   }, [callId]);
+
+  // Ringback tone while the invite is unanswered; stops when someone joins.
+  const connecting = call?.connecting ?? false;
+  useEffect(() => {
+    if (!connecting) return;
+    return startRingback();
+  }, [connecting, callId]);
 
   if (!call) return null;
   const seconds = Math.floor((Date.now() - call.startedAt) / 1000);
