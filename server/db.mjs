@@ -353,7 +353,19 @@ export const poolRead = (() => {
     });
     replica.query('SELECT 1').catch((error) =>
       console.error('Postgres read replica unreachable:', error?.message || error));
-    return replica;
+    // A dead replica must not take down reads: connection-level failures fall
+    // back to the primary pool. Query-level errors still propagate.
+    const isConnError = (error) =>
+      ['ECONNREFUSED', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN'].includes(error?.code)
+      || /connection|timeout|terminated|unreachable/i.test(String(error?.message || ''));
+    const fallback = (fn) => (sql, params) =>
+      fn(sql, params).catch((error) => (isConnError(error) ? pool.query(sql, params) : Promise.reject(error)));
+    return {
+      query: fallback(replica.query),
+      execute: fallback(replica.execute),
+      getConnection: replica.getConnection,
+      end: replica.end,
+    };
   } catch {
     return pool;
   }
