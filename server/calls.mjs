@@ -107,7 +107,11 @@ function destroyOpus(socket) {
 function decodeIncomingOpus(socket, packet) {
   try {
     const bytes = opusDecoderFor(socket).decode(packet);
-    return down16(new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.length / 2)));
+    // decode() returns a pooled Buffer — slice() copies into a fresh,
+    // 2-byte-aligned ArrayBuffer before viewing as Int16Array.
+    const pcm48 = new Int16Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+    if (pcm48.length < OPUS_FRAME) return null;
+    return down16(pcm48.subarray(0, OPUS_FRAME));
   } catch { return null; }
 }
 

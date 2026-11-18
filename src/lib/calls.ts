@@ -270,7 +270,11 @@ export class CallSession {
 
   private sendJoin() {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: "join", callId: this.callId, codec: this.opusCapable ? "opus" : "pcm" }));
+      // Claim Opus only when encoder AND decoder were actually created —
+      // the server mirrors this in `welcome.codec` and will send Opus frames
+      // back, which we cannot decode without a live AudioDecoder.
+      const opusReady = Boolean(this.opusEncoder && this.opusDecoder);
+      this.ws.send(JSON.stringify({ type: "join", callId: this.callId, codec: opusReady ? "opus" : "pcm" }));
     }
   }
 
@@ -281,7 +285,6 @@ export class CallSession {
         output: (chunk) => {
           const data = new Uint8Array(chunk.byteLength);
           chunk.copyTo(data);
-          chunk.close();
           const tagged = new Uint8Array(1 + data.length);
           tagged[0] = OPUS_TAG;
           tagged.set(data, 1);
@@ -334,8 +337,12 @@ export class CallSession {
     void this.audioCtx.resume().catch(() => {});
 
     // Opus support check is cheap and cached — do it before join so the
-    // codec preference reaches the server in the join message.
+    // codec preference reaches the server in the join message. ensureOpus()
+    // must run BEFORE sendJoin: the codec we claim must reflect a decoder
+    // that actually exists, or the server sends Opus we can't play (total
+    // silence — this was the 1.2.10 audio outage).
     this.opusCapable = await opusSupported();
+    if (this.opusCapable) await this.ensureOpus();
 
     // Mic is optional: users without one (or who deny permission) still join
     // and hear the call — the server simply receives no frames from them.
@@ -444,7 +451,7 @@ export class CallSession {
         numberOfFrames: OPUS_FRAME,
         numberOfChannels: 1,
         timestamp: this.opusTxTs,
-        data: upsampleTo48k(pcm).buffer,
+        data: upsampleTo48k(pcm).buffer as ArrayBuffer,
       });
       this.opusTxTs += 20000;
       try { this.opusEncoder.encode(audioData); } catch { /* encoder resetting */ }
@@ -458,8 +465,9 @@ export class CallSession {
     switch (msg.type) {
       case "welcome":
         this.reconnectAttempts = 0;
-        this.opusActive = this.opusCapable && msg.codec === "opus";
-        if (this.opusActive) void this.ensureOpus();
+        // Server echoes the codec it will use; only trust it if our codec
+        // objects exist (guaranteed by the honest join above).
+        this.opusActive = msg.codec === "opus" && Boolean(this.opusEncoder && this.opusDecoder);
         this.participants = (msg.participants as CallParticipant[]) || [];
         this.events.onParticipants?.(this.participants);
         break;

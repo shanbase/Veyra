@@ -165,8 +165,8 @@ import com.getcapacitor.BridgeWebViewClient;
  * carry over; the app runs there as a regular web client.
  */
 public class FailoverWebViewClient extends BridgeWebViewClient {
-    private static final String PRIMARY = "https://veyra-pink-mu.vercel.app";
-    private static final String SECONDARY = "https://veyra.go.altare.global";
+    private static final String PRIMARY = "https://veyra.go.altare.global";
+    private static final String SECONDARY = "https://veyra-pink-mu.vercel.app";
 
     private boolean failedOver = false;
 

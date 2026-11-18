@@ -7,10 +7,10 @@ const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const crypto = require('node:crypto');
 
-// Vercel first (edge functions + regional read replicas), Altare as fallback.
-// Both serve the same app and backend; the window retries the next URL when
-// the current one fails to load, and the API/update checks try each origin.
-const APP_URLS = ['https://veyra-pink-mu.vercel.app', 'https://veyra.go.altare.global'];
+// Altare primary, Vercel as fallback. Both serve the same app and backend;
+// the window retries the next URL when the current one fails to load, and
+// the API/update checks try each origin in order.
+const APP_URLS = ['https://veyra.go.altare.global', 'https://veyra-pink-mu.vercel.app'];
 const APP_ORIGINS = new Set(APP_URLS.map((url) => new URL(url).origin));
 // Proxied through the Veyra API so the check works even when GitHub release
 // downloads are unreachable or redirect in ways fetch cannot follow.
