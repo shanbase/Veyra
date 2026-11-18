@@ -339,7 +339,7 @@ export class CallSession {
     // AudioContext is created up-front for PLAYBACK even when the mic fails —
     // mic-less users must still hear the call. It starts 'suspended' under
     // autoplay policy; playFrame() keeps retrying resume() until it runs.
-    this.audioCtx = new AudioContext();
+    this.audioCtx = new AudioContext({ latencyHint: "interactive" });
     void this.audioCtx.resume().catch(() => {});
 
     // Opus support check is cheap and cached — do it before join so the
@@ -526,7 +526,15 @@ export class CallSession {
     const pcm = new Int16Array(buffer);
     const audioBuffer = this.audioCtx.createBuffer(1, CALL_FRAME_SAMPLES, CALL_SAMPLE_RATE);
     const channel = audioBuffer.getChannelData(0);
-    for (let i = 0; i < CALL_FRAME_SAMPLES; i++) channel[i] = pcm[i] / 0x8000;
+    // ~0.5 ms fades at frame edges kill boundary clicks when buffers are
+    // scheduled back-to-back or after a jitter reset.
+    const FADE = 8;
+    for (let i = 0; i < CALL_FRAME_SAMPLES; i++) {
+      let v = pcm[i] / 0x8000;
+      if (i < FADE) v *= i / FADE;
+      else if (i >= CALL_FRAME_SAMPLES - FADE) v *= (CALL_FRAME_SAMPLES - i) / FADE;
+      channel[i] = v;
+    }
     this.scheduleBuffer(audioBuffer);
   }
 

@@ -327,8 +327,10 @@ function mixCall(call, now) {
       const own = chosen.get(userId);
       const view = new Int16Array(FRAME_SAMPLES);
       for (let i = 0; i < FRAME_SAMPLES; i++) {
+        // Soft-clip via tanh: loud mixes compress smoothly instead of the
+        // hard clamp's harsh digital distortion.
         const sample = total[i] - (own ? own.frame[i] : 0);
-        view[i] = sample > 32767 ? 32767 : sample < -32768 ? -32768 : sample;
+        view[i] = Math.round(Math.tanh(sample / 32768) * 32767);
       }
       if (socket.bufferedAmount > 256 * 1024) continue; // slow consumer — drop
       const payload = socket.wantsOpus && OPUS_OK
