@@ -58,18 +58,9 @@ class CallCaptureProcessor extends AudioWorkletProcessor {
     if (rms < this.noiseFloor) this.noiseFloor = rms;
     else this.noiseFloor += (rms - this.noiseFloor) * 0.002;
 
-    // Hysteresis: once open, only close when clearly below the floor; once
-    // closed, only open clearly above it. The gate floor is shallow (0.45)
-    // so quiet voices stay audible instead of being crushed to a whisper.
-    const openThresh = Math.max(this.noiseFloor * 2.5, 0.004);
-    const closeThresh = openThresh * 0.5;
-    if (this.gateOpen ? rms < closeThresh : rms > openThresh) {
-      this.gateOpen = !this.gateOpen;
-    }
-    const gateTarget = this.gateOpen ? 1 : 0.45;
-    // Attack fast (open immediately on speech), release slow (no chopping).
-    this.gate += (gateTarget - this.gate) * (gateTarget > this.gate ? 0.6 : 0.03);
-
+    // Adaptive gate disabled: its open/close flutter produced audible
+    // volume pumping ("zzz" stutter). The browser's own noiseSuppression
+    // constraint already handles background noise — keep the high-pass only.
     const pcm = new Int16Array(FRAME_SAMPLES);
     for (let i = 0; i < FRAME_SAMPLES; i++) {
       const x = this.out[i];
@@ -78,7 +69,7 @@ class CallCaptureProcessor extends AudioWorkletProcessor {
       this.hpY1 = y;
       // Mild makeup gain for quiet mics, soft-clipped above ~0.7 so loud
       // speech compresses instead of distorting.
-      let v = y * this.gate * 1.35;
+      let v = y * 1.35;
       if (v > 0.7) v = 0.7 + (v - 0.7) * 0.25;
       else if (v < -0.7) v = -0.7 + (v + 0.7) * 0.25;
       const s = Math.max(-1, Math.min(1, v));

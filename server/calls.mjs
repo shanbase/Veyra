@@ -124,7 +124,7 @@ function encodeOutgoingOpus(socket, pcm320) {
 }
 
 const calls = new Map(); // callId -> call record
-const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_AUDIO_PAYLOAD });
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_AUDIO_PAYLOAD, perMessageDeflate: false });
 let mixTimer = null;
 
 // In-memory fixed-window limit for call creation (broadcasts fan out to every
