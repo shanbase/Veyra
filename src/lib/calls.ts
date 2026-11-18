@@ -546,20 +546,33 @@ export class CallSession {
     if (this.audioCtx.state === "suspended") void this.audioCtx.resume().catch(() => {});
     const frames = audioData.numberOfFrames;
     const rate = audioData.sampleRate || OPUS_RATE;
-    const samples = new Float32Array(frames);
+    // Copy in the AudioData's NATIVE sample format, then convert ourselves —
+    // copyTo's format conversion is inconsistent across browsers and produced
+    // garbage (static) on some WebViews.
+    const fmt = String(audioData.format || "f32");
+    const bytesPer = fmt === "s16" ? 2 : fmt === "u8" ? 1 : 4;
+    const raw = new Uint8Array(frames * bytesPer);
     try {
-      audioData.copyTo(samples, { planeIndex: 0, format: "f32" });
+      audioData.copyTo(raw, { planeIndex: 0 });
     } catch {
-      try {
-        const i16 = new Int16Array(frames);
-        audioData.copyTo(i16, { planeIndex: 0, format: "s16" });
-        for (let i = 0; i < frames; i++) samples[i] = i16[i] / 0x8000;
-      } catch {
-        audioData.close();
-        return;
-      }
+      audioData.close();
+      return;
     }
     audioData.close();
+    const samples = new Float32Array(frames);
+    if (fmt === "f32") {
+      samples.set(new Float32Array(raw.buffer, raw.byteOffset, frames));
+    } else if (fmt === "s16") {
+      const v = new Int16Array(raw.buffer, raw.byteOffset, frames);
+      for (let i = 0; i < frames; i++) samples[i] = v[i] / 0x8000;
+    } else if (fmt === "s32") {
+      const v = new Int32Array(raw.buffer, raw.byteOffset, frames);
+      for (let i = 0; i < frames; i++) samples[i] = v[i] / 0x80000000;
+    } else if (fmt === "u8") {
+      for (let i = 0; i < frames; i++) samples[i] = (raw[i] - 128) / 128;
+    } else {
+      return;
+    }
     const audioBuffer = this.audioCtx.createBuffer(1, frames, rate);
     audioBuffer.getChannelData(0).set(samples);
     this.scheduleBuffer(audioBuffer);
