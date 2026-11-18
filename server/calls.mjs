@@ -31,7 +31,7 @@ const TICK_MS = 20;
 const MAX_PARTICIPANTS = 12;
 const RING_TIMEOUT_MS = 90_000;
 const EMPTY_GRACE_MS = 30_000;
-const STALE_FRAME_MS = 200;
+const STALE_FRAME_MS = 400;
 const MAX_AUDIO_PAYLOAD = 16 * 1024;
 
 // ---- Opus codec (optional, WASM — no native build) ----
@@ -296,7 +296,7 @@ function mixCall(call, now) {
     // Per-speaker jitter buffer: each tick picks the queued frame whose
     // arrival is closest to a ~30 ms playout target, so bursty network
     // delivery smooths out instead of chopping whole frames.
-    const PLAYOUT_AGE_MS = 30;
+    const PLAYOUT_AGE_MS = 60;
     const chosen = new Map();
     for (const [userId, queue] of call.audio) {
       while (queue.length && now - queue[0].at > STALE_FRAME_MS) queue.shift();
@@ -330,7 +330,7 @@ function mixCall(call, now) {
         const sample = total[i] - (own ? own.frame[i] : 0);
         view[i] = sample > 32767 ? 32767 : sample < -32768 ? -32768 : sample;
       }
-      if (socket.bufferedAmount > 64 * 1024) continue; // slow consumer — drop
+      if (socket.bufferedAmount > 256 * 1024) continue; // slow consumer — drop
       const payload = socket.wantsOpus && OPUS_OK
         ? encodeOutgoingOpus(socket, view)
         : Buffer.from(view.buffer, view.byteOffset, FRAME_BYTES);
@@ -455,7 +455,7 @@ wss.on('connection', (socket) => {
       let queue = call.audio.get(socket.userId);
       if (!queue) { queue = []; call.audio.set(socket.userId, queue); }
       queue.push({ frame, at: Date.now() });
-      if (queue.length > 8) queue.shift();
+      if (queue.length > 16) queue.shift();
       return;
     }
     let msg;

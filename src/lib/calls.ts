@@ -539,7 +539,7 @@ export class CallSession {
     //  - fell behind → restart the cushion
     //  - got too far ahead (>400 ms) → pull back, otherwise delay grows forever
     const now = this.audioCtx!.currentTime;
-    if (this.nextPlayTime < now + 0.05 || this.nextPlayTime > now + 0.4) this.nextPlayTime = now + 0.18;
+    if (this.nextPlayTime < now + 0.05 || this.nextPlayTime > now + 0.6) this.nextPlayTime = now + 0.22;
     source.start(this.nextPlayTime);
     this.nextPlayTime += audioBuffer.duration;
   }
