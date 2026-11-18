@@ -17,8 +17,14 @@ const OPUS_TAG = 0x01;
 const OPUS_RATE = 48000;
 const OPUS_FRAME = 960; // 20 ms @ 48 kHz
 
+// Opus transport is disabled until the WebCodecs chain is proven clean —
+// clients negotiate PCM16 which has worked reliably since 1.2.9. Flip to
+// true to re-enable once Opus audio is verified end-to-end.
+const OPUS_ENABLED = false;
+
 let opusSupportPromise: Promise<boolean> | null = null;
 function opusSupported(): Promise<boolean> {
+  if (!OPUS_ENABLED) return Promise.resolve(false);
   if (!opusSupportPromise) {
     opusSupportPromise = (async () => {
       try {
